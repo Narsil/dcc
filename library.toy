@@ -1,0 +1,12 @@
+fn square(x) {
+    return x * x;
+}
+
+fn cube(x) {
+    let squared = square(x);
+    return squared * x;
+}
+
+fn factorial(n) {
+    return n * (n - 1);
+} 
