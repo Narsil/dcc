@@ -1020,7 +1020,7 @@ pub const CodeGen = struct {
         const void_type = LLVMVoidTypeInContext(self.context);
         const int64_type = LLVMInt64TypeInContext(self.context);
         const syscall_asm_ty = LLVMFunctionType(void_type, &[_]LLVMTypeRef{int64_type}, 1, 0);
-        const asm_str = "mov $$60, %rax\nsyscall"; // rax=60 (SYS_exit), rdi=status
+        const asm_str = "mov $0, %rdi\n mov $$60, %rax\nsyscall"; // rax=60 (SYS_exit), rdi=status
 
         const syscall_inline = LLVMGetInlineAsm(syscall_asm_ty, asm_str, asm_str.len, "r", 1, // single general-purpose register input
             1, // has side effects
