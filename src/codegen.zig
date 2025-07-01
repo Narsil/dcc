@@ -1,210 +1,76 @@
 const std = @import("std");
 const parser = @import("parser.zig");
 const macho = std.macho;
+const LLVM = @cImport({
+    @cInclude("llvm-c/Core.h");
+    @cInclude("llvm-c/TargetMachine.h");
+    @cInclude("llvm-c/Target.h");
+    @cInclude("llvm-c/Support.h");
+    @cInclude("llvm-c/BitReader.h");
+    @cInclude("llvm-c/Object.h");
+});
 
 pub const CodeGenError = error{ InvalidTopLevelNode, InvalidStatement, InvalidExpression, InvalidCallee, UndefinedVariable, UndefinedFunction, TargetError, CodeGenError, MainFunctionNotFound, MissingMainFunction, LinkingFailed } || std.mem.Allocator.Error;
 
-// LLVM opaque types
-const LLVMContextRef = *opaque {};
-const LLVMModuleRef = *opaque {};
-const LLVMBuilderRef = *opaque {};
-const LLVMTypeRef = *opaque {};
-const LLVMValueRef = *opaque {};
-const LLVMBasicBlockRef = *opaque {};
-const LLVMTargetRef = *opaque {};
-const LLVMTargetMachineRef = *opaque {};
+// LLVM types are now available from the LLVM module
 
-// LLVM C API bindings - simplified for this toy compiler
-extern fn LLVMContextCreate() LLVMContextRef;
-extern fn LLVMContextDispose(ctx: LLVMContextRef) void;
-extern fn LLVMModuleCreateWithNameInContext(name: [*:0]const u8, ctx: LLVMContextRef) LLVMModuleRef;
-extern fn LLVMDisposeModule(module: LLVMModuleRef) void;
-extern fn LLVMCreateBuilderInContext(ctx: LLVMContextRef) LLVMBuilderRef;
-extern fn LLVMDisposeBuilder(builder: LLVMBuilderRef) void;
-extern fn LLVMInt64TypeInContext(ctx: LLVMContextRef) LLVMTypeRef;
-extern fn LLVMInt32TypeInContext(ctx: LLVMContextRef) LLVMTypeRef;
-extern fn LLVMVoidTypeInContext(ctx: LLVMContextRef) LLVMTypeRef;
-extern fn LLVMInt8TypeInContext(ctx: LLVMContextRef) LLVMTypeRef;
-extern fn LLVMArrayType(element_type: LLVMTypeRef, element_count: c_uint) LLVMTypeRef;
-extern fn LLVMFunctionType(return_type: LLVMTypeRef, param_types: ?[*]const LLVMTypeRef, param_count: c_uint, is_var_arg: c_int) LLVMTypeRef;
-extern fn LLVMAddFunction(module: LLVMModuleRef, name: [*:0]const u8, function_type: LLVMTypeRef) LLVMValueRef;
-extern fn LLVMAppendBasicBlockInContext(ctx: LLVMContextRef, function: LLVMValueRef, name: [*:0]const u8) LLVMBasicBlockRef;
-extern fn LLVMPositionBuilderAtEnd(builder: LLVMBuilderRef, block: LLVMBasicBlockRef) void;
-extern fn LLVMConstInt(int_type: LLVMTypeRef, value: c_ulonglong, sign_extend: c_int) LLVMValueRef;
-extern fn LLVMBuildAdd(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: [*:0]const u8) LLVMValueRef;
-extern fn LLVMBuildSub(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: [*:0]const u8) LLVMValueRef;
-extern fn LLVMBuildMul(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: [*:0]const u8) LLVMValueRef;
-extern fn LLVMBuildSDiv(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: [*:0]const u8) LLVMValueRef;
-extern fn LLVMBuildRet(builder: LLVMBuilderRef, value: LLVMValueRef) LLVMValueRef;
-extern fn LLVMBuildRetVoid(builder: LLVMBuilderRef) LLVMValueRef;
-extern fn LLVMBuildCall2(builder: LLVMBuilderRef, function_type: LLVMTypeRef, function: LLVMValueRef, args: ?[*]const LLVMValueRef, num_args: c_uint, name: [*:0]const u8) LLVMValueRef;
-extern fn LLVMTypeOf(val: LLVMValueRef) LLVMTypeRef;
-extern fn LLVMGetElementType(ty: LLVMTypeRef) LLVMTypeRef;
-extern fn LLVMBuildTrunc(builder: LLVMBuilderRef, val: LLVMValueRef, dest_ty: LLVMTypeRef, name: [*:0]const u8) LLVMValueRef;
-extern fn LLVMBuildUnreachable(builder: LLVMBuilderRef) LLVMValueRef;
-extern fn LLVMBuildBr(builder: LLVMBuilderRef, dest: LLVMBasicBlockRef) LLVMValueRef;
-extern fn LLVMSetFunctionCallConv(fn_: LLVMValueRef, cc: c_uint) void;
-extern fn LLVMAddGlobal(module: LLVMModuleRef, ty: LLVMTypeRef, name: [*:0]const u8) LLVMValueRef;
-extern fn LLVMSetInitializer(global_var: LLVMValueRef, constant_val: LLVMValueRef) void;
-extern fn LLVMBuildAlloca(builder: LLVMBuilderRef, type_: LLVMTypeRef, name: [*:0]const u8) LLVMValueRef;
-extern fn LLVMBuildStore(builder: LLVMBuilderRef, value: LLVMValueRef, ptr: LLVMValueRef) LLVMValueRef;
-extern fn LLVMBuildLoad2(builder: LLVMBuilderRef, type_: LLVMTypeRef, ptr: LLVMValueRef, name: [*:0]const u8) LLVMValueRef;
-extern fn LLVMSetAlignment(V: LLVMValueRef, Bytes: c_uint) void;
-extern fn LLVMGetParam(function: LLVMValueRef, index: c_uint) LLVMValueRef;
-extern fn LLVMPrintModuleToString(module: LLVMModuleRef) [*:0]u8;
-extern fn LLVMDisposeMessage(message: [*:0]u8) void;
-extern fn LLVMGetBasicBlockParent(BB: LLVMBasicBlockRef) LLVMValueRef;
-extern fn LLVMGetInsertBlock(Builder: LLVMBuilderRef) LLVMBasicBlockRef;
-extern fn LLVMGetValueName(Val: LLVMValueRef) [*:0]const u8;
-extern fn LLVMBuildSExt(builder: LLVMBuilderRef, val: LLVMValueRef, dest_ty: LLVMTypeRef, name: [*:0]const u8) LLVMValueRef;
+// LLVM functions are now available from the LLVM module
 
-// Function attribute management for stack alignment
-extern fn LLVMCreateEnumAttribute(ctx: LLVMContextRef, kind_id: c_uint, val: u64) LLVMAttributeRef;
-extern fn LLVMAddAttributeAtIndex(fn_: LLVMValueRef, idx: c_uint, attr: LLVMAttributeRef) void;
-extern fn LLVMGetEnumAttributeKindForName(name: [*:0]const u8, s_len: usize) c_uint;
+// Function attribute management functions are now available from the LLVM module
 
 // LLVM attribute types
-const LLVMAttributeRef = *opaque {};
-
 // Function attribute indices
-const LLVMAttributeFunctionIndex = 0xffffffff;
+// const LLVM.LLVMAttributeFunctionIndex = 0xffffffff;
 
-// Target and code generation - use target-specific functions
-extern fn LLVMInitializeX86TargetInfo() void;
-extern fn LLVMInitializeX86Target() void;
-extern fn LLVMInitializeX86TargetMC() void;
-extern fn LLVMInitializeX86AsmParser() void;
-extern fn LLVMInitializeX86AsmPrinter() void;
+// Target initialization functions are now available from the LLVM module
 
-// AArch64 target initialization functions
-extern fn LLVMInitializeAArch64TargetInfo() void;
-extern fn LLVMInitializeAArch64Target() void;
-extern fn LLVMInitializeAArch64TargetMC() void;
-extern fn LLVMInitializeAArch64AsmParser() void;
-extern fn LLVMInitializeAArch64AsmPrinter() void;
-
-extern fn LLVMGetDefaultTargetTriple() [*:0]u8;
-extern fn LLVMGetTargetFromTriple(triple: [*:0]const u8, target: *?LLVMTargetRef, error_message: *[*:0]u8) c_int;
-extern fn LLVMCreateTargetMachine(target: LLVMTargetRef, triple: [*:0]const u8, cpu: [*:0]const u8, features: [*:0]const u8, level: c_int, reloc: c_int, code_model: c_int) LLVMTargetMachineRef;
-extern fn LLVMDisposeTargetMachine(tm: LLVMTargetMachineRef) void;
-extern fn LLVMTargetMachineEmitToFile(tm: LLVMTargetMachineRef, module: LLVMModuleRef, filename: [*:0]const u8, codegen: c_int, error_message: *[*:0]u8) c_int;
-
-// Memory buffer and module reading/writing functions
-extern fn LLVMCreateMemoryBufferWithContentsOfFile(path: [*:0]const u8, out_buf: *?LLVMMemoryBufferRef, out_message: *[*:0]u8) c_int;
-extern fn LLVMDisposeMemoryBuffer(buf: LLVMMemoryBufferRef) void;
-extern fn LLVMWriteBitcodeToFile(module: LLVMModuleRef, path: [*:0]const u8) c_int;
-extern fn LLVMWriteBitcodeToMemoryBuffer(module: LLVMModuleRef) LLVMMemoryBufferRef;
-
-// Module linking functions
-extern fn LLVMLinkModules2(dest: LLVMModuleRef, src: LLVMModuleRef) c_int;
-
-// LLVM Object File and Binary Generation APIs
-extern fn LLVMCreateObjectFile(mem_buf: LLVMMemoryBufferRef) ?LLVMObjectFileRef;
-extern fn LLVMDisposeObjectFile(obj_file: LLVMObjectFileRef) void;
-extern fn LLVMGetSections(obj_file: LLVMObjectFileRef) LLVMSectionIteratorRef;
-extern fn LLVMDisposeSectionIterator(si: LLVMSectionIteratorRef) void;
-extern fn LLVMIsSectionIteratorAtEnd(obj_file: LLVMObjectFileRef, si: LLVMSectionIteratorRef) c_int;
-extern fn LLVMMoveToNextSection(si: LLVMSectionIteratorRef) void;
-extern fn LLVMGetSectionName(si: LLVMSectionIteratorRef) [*:0]const u8;
-extern fn LLVMGetSectionContents(si: LLVMSectionIteratorRef) [*:0]const u8;
-extern fn LLVMGetSectionSize(si: LLVMSectionIteratorRef) u64;
-extern fn LLVMGetNamedFunction(M: LLVMModuleRef, Name: [*:0]const u8) ?LLVMValueRef;
-extern fn LLVMCreateMemoryBufferWithMemoryRange(InputData: [*]const u8, InputDataLength: usize, BufferName: [*:0]const u8, RequiresNullTerminator: c_int) ?LLVMMemoryBufferRef;
-extern fn LLVMGlobalGetValueType(Global: LLVMValueRef) LLVMTypeRef;
+// Target, memory buffer, and object file functions are now available from the LLVM module
 
 // LLVM Inline Assembly APIs
-pub extern "c" fn LLVMGetInlineAsm(
-    Ty: LLVMTypeRef, // Function type of the inline assembly
-    AsmString: [*c]const u8, // The assembly code string
-    AsmStringSize: usize, // Length of the assembly string
-    Constraints: [*c]const u8, // Constraints string for operands
-    ConstraintsSize: usize, // Length of the constraints string
-    HasSideEffects: c_int, // Does the assembly have side effects? (0 for false, 1 for true)
-    IsAlignStack: c_int, // Does the assembly need stack alignment? (0 for false, 1 for true)
-    Dialect: c_int, // Assembly dialect (e.g., LLVMInlineAsmDialectATT)
-    CanThrow: c_int, // Can the assembly throw an exception? (0 for false, 1 for true)
-) LLVMValueRef;
-
 // LLD (LLVM Linker) C wrapper API
 extern fn lld_main(args: [*]const [*:0]const u8, argc: c_int) c_int;
 
 // Additional LLVM types for memory buffers and object files
-const LLVMMemoryBufferRef = *opaque {};
-const LLVMObjectFileRef = *opaque {};
-const LLVMSectionIteratorRef = *opaque {};
-
-const LLVMCodeGenFileType = enum(c_int) {
-    assembly = 0,
-    object = 1,
-};
-
-const LLVMOptLevel = enum(c_int) {
-    none = 0,
-    less = 1,
-    default = 2,
-    aggressive = 3,
-};
-
-const LLVMRelocMode = enum(c_int) {
-    default = 0,
-    static = 1,
-    pic = 2,
-    dynamic_no_pic = 3,
-    ropi = 4,
-    rwpi = 5,
-    ropi_rwpi = 6,
-};
-
-const LLVMCodeModel = enum(c_int) {
-    default = 0,
-    jit_default = 1,
-    tiny = 2,
-    small = 3,
-    kernel = 4,
-    medium = 5,
-    large = 6,
-};
-
 // Darwin ARM64 system call numbers
 const SYS_EXIT_DARWIN = 1; // exit() system call on Darwin
 
 pub const CodeGen = struct {
-    context: LLVMContextRef,
-    module: LLVMModuleRef,
-    builder: LLVMBuilderRef,
+    context: LLVM.LLVMContextRef,
+    module: LLVM.LLVMModuleRef,
+    builder: LLVM.LLVMBuilderRef,
     allocator: std.mem.Allocator,
-    variables: std.HashMap([]const u8, LLVMValueRef, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
-    functions: std.HashMap([]const u8, LLVMValueRef, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
+    variables: std.HashMap([]const u8, LLVM.LLVMValueRef, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
+    functions: std.HashMap([]const u8, LLVM.LLVMValueRef, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
 
     pub fn init(allocator: std.mem.Allocator, module_name: []const u8) !CodeGen {
         // Initialize LLVM X86 target (for x86_64 support)
-        LLVMInitializeX86TargetInfo();
-        LLVMInitializeX86Target();
-        LLVMInitializeX86TargetMC();
-        LLVMInitializeX86AsmParser();
-        LLVMInitializeX86AsmPrinter();
+        LLVM.LLVMInitializeX86TargetInfo();
+        LLVM.LLVMInitializeX86Target();
+        LLVM.LLVMInitializeX86TargetMC();
+        LLVM.LLVMInitializeX86AsmParser();
+        LLVM.LLVMInitializeX86AsmPrinter();
 
         // Initialize LLVM AArch64 target (for arm64 support)
-        LLVMInitializeAArch64TargetInfo();
-        LLVMInitializeAArch64Target();
-        LLVMInitializeAArch64TargetMC();
-        LLVMInitializeAArch64AsmParser();
-        LLVMInitializeAArch64AsmPrinter();
+        LLVM.LLVMInitializeAArch64TargetInfo();
+        LLVM.LLVMInitializeAArch64Target();
+        LLVM.LLVMInitializeAArch64TargetMC();
+        LLVM.LLVMInitializeAArch64AsmParser();
+        LLVM.LLVMInitializeAArch64AsmPrinter();
 
-        const context = LLVMContextCreate();
+        const context = LLVM.LLVMContextCreate();
         const module_name_z = try allocator.dupeZ(u8, module_name);
         defer allocator.free(module_name_z);
 
-        const module = LLVMModuleCreateWithNameInContext(module_name_z.ptr, context);
-        const builder = LLVMCreateBuilderInContext(context);
+        const module = LLVM.LLVMModuleCreateWithNameInContext(module_name_z.ptr, context);
+        const builder = LLVM.LLVMCreateBuilderInContext(context);
 
         return CodeGen{
             .context = context,
             .module = module,
             .builder = builder,
             .allocator = allocator,
-            .variables = std.HashMap([]const u8, LLVMValueRef, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
-            .functions = std.HashMap([]const u8, LLVMValueRef, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
+            .variables = std.HashMap([]const u8, LLVM.LLVMValueRef, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
+            .functions = std.HashMap([]const u8, LLVM.LLVMValueRef, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
         };
     }
 
@@ -220,9 +86,9 @@ pub const CodeGen = struct {
         self.variables.deinit();
 
         // Clean up LLVM resources
-        LLVMDisposeBuilder(self.builder);
-        LLVMDisposeModule(self.module);
-        LLVMContextDispose(self.context);
+        LLVM.LLVMDisposeBuilder(self.builder);
+        LLVM.LLVMDisposeModule(self.module);
+        LLVM.LLVMContextDispose(self.context);
     }
 
     pub fn generate(self: *CodeGen, ast: parser.ASTNode) CodeGenError!void {
@@ -251,15 +117,15 @@ pub const CodeGen = struct {
     }
 
     fn generateFunction(self: *CodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration)) CodeGenError!void {
-        const int64_type = LLVMInt64TypeInContext(self.context);
-        const int32_type = LLVMInt32TypeInContext(self.context);
+        const int64_type = LLVM.LLVMInt64TypeInContext(self.context);
+        const int32_type = LLVM.LLVMInt32TypeInContext(self.context);
 
         // Use i32 return type for main function to match C runtime expectations
         const is_main = std.mem.eql(u8, func.name, "main");
         const return_type = if (is_main) int32_type else int64_type;
 
         // Create parameter types array
-        const param_types = try self.allocator.alloc(LLVMTypeRef, func.parameters.len);
+        const param_types = try self.allocator.alloc(LLVM.LLVMTypeRef, func.parameters.len);
         defer self.allocator.free(param_types);
 
         for (param_types) |*param_type| {
@@ -267,13 +133,13 @@ pub const CodeGen = struct {
         }
 
         // Create function type
-        const function_type = LLVMFunctionType(return_type, param_types.ptr, @intCast(param_types.len), 0);
+        const function_type = LLVM.LLVMFunctionType(return_type, param_types.ptr, @intCast(param_types.len), 0);
 
         // Create function
         const name_z = try self.allocator.dupeZ(u8, func.name);
         defer self.allocator.free(name_z);
 
-        const llvm_function = LLVMAddFunction(self.module, name_z.ptr, function_type);
+        const llvm_function = LLVM.LLVMAddFunction(self.module, name_z.ptr, function_type);
 
         // Set proper stack alignment attributes for x86-64 System V ABI compliance
         self.setStackAlignmentAttributes(llvm_function);
@@ -281,30 +147,30 @@ pub const CodeGen = struct {
         try self.functions.put(try self.allocator.dupe(u8, func.name), llvm_function);
 
         // Create entry basic block
-        const entry_block = LLVMAppendBasicBlockInContext(self.context, llvm_function, "entry");
-        LLVMPositionBuilderAtEnd(self.builder, entry_block);
+        const entry_block = LLVM.LLVMAppendBasicBlockInContext(self.context, llvm_function, "entry");
+        LLVM.LLVMPositionBuilderAtEnd(self.builder, entry_block);
 
         // Create allocas for parameters
         for (func.parameters, 0..) |param_name, i| {
-            const param_value = LLVMGetParam(llvm_function, @intCast(i));
+            const param_value = LLVM.LLVMGetParam(llvm_function, @intCast(i));
             const param_name_z = try self.allocator.dupeZ(u8, param_name);
             defer self.allocator.free(param_name_z);
 
-            const alloca = LLVMBuildAlloca(self.builder, int64_type, param_name_z.ptr);
-            LLVMSetAlignment(alloca, 16); // 16-byte alignment for x86-64 System V ABI
-            const store_inst = LLVMBuildStore(self.builder, param_value, alloca);
-            LLVMSetAlignment(store_inst, 16); // Match alloca alignment
+            const alloca = LLVM.LLVMBuildAlloca(self.builder, int64_type, param_name_z.ptr);
+            LLVM.LLVMSetAlignment(alloca, 16); // 16-byte alignment for x86-64 System V ABI
+            const store_inst = LLVM.LLVMBuildStore(self.builder, param_value, alloca);
+            LLVM.LLVMSetAlignment(store_inst, 16); // Match alloca alignment
             try self.variables.put(try self.allocator.dupe(u8, param_name), alloca);
         }
 
         // Add dummy alloca for stack alignment in main
         if (is_main) {
             // Allocate 16 bytes of padding so total local size is multiple of 16 (2x i64 = 16 + padding = 32)
-            const int8_type = LLVMInt8TypeInContext(self.context);
-            const dummy_array_type = LLVMArrayType(int8_type, 16); // 16 bytes
+            const int8_type = LLVM.LLVMInt8TypeInContext(self.context);
+            const dummy_array_type = LLVM.LLVMArrayType(int8_type, 16); // 16 bytes
             const dummy_name = "dummy_padding";
-            const dummy_alloca = LLVMBuildAlloca(self.builder, dummy_array_type, dummy_name);
-            LLVMSetAlignment(dummy_alloca, 16);
+            const dummy_alloca = LLVM.LLVMBuildAlloca(self.builder, dummy_array_type, dummy_name);
+            LLVM.LLVMSetAlignment(dummy_alloca, 16);
         }
 
         // Generate function body
@@ -317,15 +183,15 @@ pub const CodeGen = struct {
     }
 
     fn generateVariableDeclaration(self: *CodeGen, var_decl: @TypeOf(@as(parser.ASTNode, undefined).variable_declaration)) CodeGenError!void {
-        const int64_type = LLVMInt64TypeInContext(self.context);
+        const int64_type = LLVM.LLVMInt64TypeInContext(self.context);
         const name_z = try self.allocator.dupeZ(u8, var_decl.name);
         defer self.allocator.free(name_z);
 
-        const alloca = LLVMBuildAlloca(self.builder, int64_type, name_z.ptr);
-        LLVMSetAlignment(alloca, 16); // 16-byte alignment for x86-64 System V ABI
+        const alloca = LLVM.LLVMBuildAlloca(self.builder, int64_type, name_z.ptr);
+        LLVM.LLVMSetAlignment(alloca, 16); // 16-byte alignment for x86-64 System V ABI
         const value = try self.generateExpression(var_decl.value.*);
-        const store_inst = LLVMBuildStore(self.builder, value, alloca);
-        LLVMSetAlignment(store_inst, 16); // Match alloca alignment
+        const store_inst = LLVM.LLVMBuildStore(self.builder, value, alloca);
+        LLVM.LLVMSetAlignment(store_inst, 16); // Match alloca alignment
 
         try self.variables.put(try self.allocator.dupe(u8, var_decl.name), alloca);
     }
@@ -335,35 +201,35 @@ pub const CodeGen = struct {
             const llvm_value = try self.generateExpression(value.*);
 
             // Check if we're in the main function and need to convert i64 to i32
-            const current_function = LLVMGetBasicBlockParent(LLVMGetInsertBlock(self.builder));
-            const function_name = std.mem.span(LLVMGetValueName(current_function));
+            const current_function = LLVM.LLVMGetBasicBlockParent(LLVM.LLVMGetInsertBlock(self.builder));
+            const function_name = std.mem.span(LLVM.LLVMGetValueName(current_function));
 
             if (std.mem.eql(u8, function_name, "main")) {
                 // Convert i64 to i32 for main function return
-                const int32_type = LLVMInt32TypeInContext(self.context);
-                const truncated_value = LLVMBuildTrunc(self.builder, llvm_value, int32_type, "main_return");
-                _ = LLVMBuildRet(self.builder, truncated_value);
+                const int32_type = LLVM.LLVMInt32TypeInContext(self.context);
+                const truncated_value = LLVM.LLVMBuildTrunc(self.builder, llvm_value, int32_type, "main_return");
+                _ = LLVM.LLVMBuildRet(self.builder, truncated_value);
             } else {
-                _ = LLVMBuildRet(self.builder, llvm_value);
+                _ = LLVM.LLVMBuildRet(self.builder, llvm_value);
             }
         } else {
-            _ = LLVMBuildRetVoid(self.builder);
+            _ = LLVM.LLVMBuildRetVoid(self.builder);
         }
     }
 
-    fn generateExpression(self: *CodeGen, node: parser.ASTNode) CodeGenError!LLVMValueRef {
+    fn generateExpression(self: *CodeGen, node: parser.ASTNode) CodeGenError!LLVM.LLVMValueRef {
         switch (node) {
             .number_literal => |num| {
-                const int64_type = LLVMInt64TypeInContext(self.context);
-                return LLVMConstInt(int64_type, @intCast(num.value), 0);
+                const int64_type = LLVM.LLVMInt64TypeInContext(self.context);
+                return LLVM.LLVMConstInt(int64_type, @intCast(num.value), 0);
             },
             .identifier => |ident| {
                 if (self.variables.get(ident.name)) |alloca| {
-                    const int64_type = LLVMInt64TypeInContext(self.context);
+                    const int64_type = LLVM.LLVMInt64TypeInContext(self.context);
                     const name_z = try self.allocator.dupeZ(u8, ident.name);
                     defer self.allocator.free(name_z);
-                    const load_inst = LLVMBuildLoad2(self.builder, int64_type, alloca, name_z.ptr);
-                    LLVMSetAlignment(load_inst, 16); // Match alloca alignment
+                    const load_inst = LLVM.LLVMBuildLoad2(self.builder, int64_type, alloca, name_z.ptr);
+                    LLVM.LLVMSetAlignment(load_inst, 16); // Match alloca alignment
                     return load_inst;
                 } else {
                     return error.UndefinedVariable;
@@ -374,10 +240,10 @@ pub const CodeGen = struct {
                 const right = try self.generateExpression(bin_expr.right.*);
 
                 return switch (bin_expr.operator) {
-                    .add => LLVMBuildAdd(self.builder, left, right, "add"),
-                    .subtract => LLVMBuildSub(self.builder, left, right, "sub"),
-                    .multiply => LLVMBuildMul(self.builder, left, right, "mul"),
-                    .divide => LLVMBuildSDiv(self.builder, left, right, "div"),
+                    .add => LLVM.LLVMBuildAdd(self.builder, left, right, "add"),
+                    .subtract => LLVM.LLVMBuildSub(self.builder, left, right, "sub"),
+                    .multiply => LLVM.LLVMBuildMul(self.builder, left, right, "mul"),
+                    .divide => LLVM.LLVMBuildSDiv(self.builder, left, right, "div"),
                 };
             },
             .call_expression => |call| {
@@ -387,24 +253,24 @@ pub const CodeGen = struct {
                 };
 
                 if (self.functions.get(callee_name)) |function| {
-                    const args = try self.allocator.alloc(LLVMValueRef, call.arguments.len);
+                    const args = try self.allocator.alloc(LLVM.LLVMValueRef, call.arguments.len);
                     defer self.allocator.free(args);
 
                     for (call.arguments, 0..) |arg, i| {
                         args[i] = try self.generateExpression(arg);
                     }
 
-                    const int64_type = LLVMInt64TypeInContext(self.context);
-                    const param_types = try self.allocator.alloc(LLVMTypeRef, call.arguments.len);
+                    const int64_type = LLVM.LLVMInt64TypeInContext(self.context);
+                    const param_types = try self.allocator.alloc(LLVM.LLVMTypeRef, call.arguments.len);
                     defer self.allocator.free(param_types);
 
                     for (param_types) |*param_type| {
                         param_type.* = int64_type;
                     }
 
-                    const function_type = LLVMFunctionType(int64_type, param_types.ptr, @intCast(param_types.len), 0);
+                    const function_type = LLVM.LLVMFunctionType(int64_type, param_types.ptr, @intCast(param_types.len), 0);
 
-                    return LLVMBuildCall2(self.builder, function_type, function, args.ptr, @intCast(args.len), "call");
+                    return LLVM.LLVMBuildCall2(self.builder, function_type, function, args.ptr, @intCast(args.len), "call");
                 } else {
                     return error.UndefinedFunction;
                 }
@@ -418,8 +284,8 @@ pub const CodeGen = struct {
         const final_triple = if (target_triple) |triple| blk: {
             break :blk triple;
         } else blk: {
-            const default_triple = LLVMGetDefaultTargetTriple();
-            // defer LLVMDisposeMessage(default_triple);
+            const default_triple = LLVM.LLVMGetDefaultTargetTriple();
+            // defer LLVM.LLVMDisposeMessage(default_triple);
 
             // Normalize the target triple for known platforms
             const triple_str = std.mem.span(default_triple);
@@ -440,11 +306,11 @@ pub const CodeGen = struct {
         const triple_z = try self.allocator.dupeZ(u8, final_triple);
         defer self.allocator.free(triple_z);
 
-        var target: ?LLVMTargetRef = null;
-        var error_message: [*:0]u8 = undefined;
+        var target: LLVM.LLVMTargetRef = null;
+        var error_message: [*c]u8 = undefined;
 
-        if (LLVMGetTargetFromTriple(triple_z.ptr, &target, &error_message) != 0) {
-            defer LLVMDisposeMessage(error_message);
+        if (LLVM.LLVMGetTargetFromTriple(triple_z.ptr, &target, &error_message) != 0) {
+            defer LLVM.LLVMDisposeMessage(error_message);
             std.debug.print("Error getting target: {s}\n", .{error_message});
             std.debug.print("Tried target triple: {s}\n", .{final_triple});
             return error.TargetError;
@@ -457,9 +323,9 @@ pub const CodeGen = struct {
         }
 
         // Create target machine optimized for executables
-        const target_machine = LLVMCreateTargetMachine(target.?, triple_z.ptr, "generic", "", @intFromEnum(LLVMOptLevel.default), @intFromEnum(LLVMRelocMode.static), // Static relocation for executables
-            @intFromEnum(LLVMCodeModel.default));
-        defer LLVMDisposeTargetMachine(target_machine);
+        const target_machine = LLVM.LLVMCreateTargetMachine(target.?, triple_z.ptr, "generic", "", LLVM.LLVMCodeGenLevelDefault, LLVM.LLVMRelocDefault, // Static relocation for executables
+            LLVM.LLVMCodeModelDefault);
+        defer LLVM.LLVMDisposeTargetMachine(target_machine);
 
         // Generate object file
         const obj_path = try std.fmt.allocPrint(self.allocator, "{s}.o", .{output_path});
@@ -468,8 +334,8 @@ pub const CodeGen = struct {
         const obj_path_z = try self.allocator.dupeZ(u8, obj_path);
         defer self.allocator.free(obj_path_z);
 
-        if (LLVMTargetMachineEmitToFile(target_machine, self.module, obj_path_z.ptr, @intFromEnum(LLVMCodeGenFileType.object), &error_message) != 0) {
-            defer LLVMDisposeMessage(error_message);
+        if (LLVM.LLVMTargetMachineEmitToFile(target_machine, self.module, obj_path_z.ptr, LLVM.LLVMObjectFile, &error_message) != 0) {
+            defer LLVM.LLVMDisposeMessage(error_message);
             std.debug.print("Error generating object file: {s}\n", .{error_message});
             return error.CodeGenError;
         }
@@ -551,8 +417,8 @@ pub const CodeGen = struct {
         const final_triple = if (target_triple) |triple| blk: {
             break :blk triple;
         } else blk: {
-            const default_triple = LLVMGetDefaultTargetTriple();
-            defer LLVMDisposeMessage(default_triple);
+            const default_triple = LLVM.LLVMGetDefaultTargetTriple();
+            defer LLVM.LLVMDisposeMessage(default_triple);
 
             // Normalize the target triple for known platforms
             const triple_str = std.mem.span(default_triple);
@@ -573,20 +439,20 @@ pub const CodeGen = struct {
         const triple_z = try self.allocator.dupeZ(u8, final_triple);
         defer self.allocator.free(triple_z);
 
-        var target: ?LLVMTargetRef = null;
-        var error_message: [*:0]u8 = undefined;
+        var target: LLVM.LLVMTargetRef = null;
+        var error_message: [*c]u8 = undefined;
 
-        if (LLVMGetTargetFromTriple(triple_z.ptr, &target, &error_message) != 0) {
-            defer LLVMDisposeMessage(error_message);
+        if (LLVM.LLVMGetTargetFromTriple(triple_z.ptr, &target, &error_message) != 0) {
+            defer LLVM.LLVMDisposeMessage(error_message);
             std.debug.print("Error getting target: {s}\n", .{error_message});
             std.debug.print("Tried target triple: {s}\n", .{final_triple});
             return error.TargetError;
         }
 
         // Create target machine optimized for shared libraries
-        const target_machine = LLVMCreateTargetMachine(target.?, triple_z.ptr, "generic", "", @intFromEnum(LLVMOptLevel.default), @intFromEnum(LLVMRelocMode.pic), // Position Independent Code for shared libraries
-            @intFromEnum(LLVMCodeModel.default));
-        defer LLVMDisposeTargetMachine(target_machine);
+        const target_machine = LLVM.LLVMCreateTargetMachine(target.?, triple_z.ptr, "generic", "", LLVM.LLVMCodeGenLevelDefault, LLVM.LLVMRelocPIC, // Position Independent Code for shared libraries
+            LLVM.LLVMCodeModelDefault);
+        defer LLVM.LLVMDisposeTargetMachine(target_machine);
 
         // Generate object file
         const obj_path = try std.fmt.allocPrint(self.allocator, "{s}.o", .{output_path});
@@ -595,8 +461,8 @@ pub const CodeGen = struct {
         const obj_path_z = try self.allocator.dupeZ(u8, obj_path);
         defer self.allocator.free(obj_path_z);
 
-        if (LLVMTargetMachineEmitToFile(target_machine, self.module, obj_path_z.ptr, @intFromEnum(LLVMCodeGenFileType.object), &error_message) != 0) {
-            defer LLVMDisposeMessage(error_message);
+        if (LLVM.LLVMTargetMachineEmitToFile(target_machine, self.module, obj_path_z.ptr, LLVM.LLVMObjectFile, &error_message) != 0) {
+            defer LLVM.LLVMDisposeMessage(error_message);
             std.debug.print("Error generating object file: {s}\n", .{error_message});
             return error.CodeGenError;
         }
@@ -740,11 +606,11 @@ pub const CodeGen = struct {
         var text_size: u32 = 0;
 
         // Create a memory buffer from object data
-        const memory_buffer = LLVMCreateMemoryBufferWithMemoryRange(object_data.ptr, object_data.len, "object_buffer", 0 // don't require null termination
+        const memory_buffer = LLVM.LLVMCreateMemoryBufferWithMemoryRange(object_data.ptr, object_data.len, "object_buffer", 0 // don't require null termination
         );
         defer if (memory_buffer != null) {
             // Skip disposal to avoid potential crashes with LLVM memory management
-            // LLVMDisposeMemoryBuffer(memory_buffer);
+            // LLVM.LLVMDisposeMemoryBuffer(memory_buffer);
         };
 
         if (memory_buffer == null) {
@@ -753,9 +619,9 @@ pub const CodeGen = struct {
         }
 
         // Create an object file from the memory buffer
-        const object_file = LLVMCreateObjectFile(memory_buffer.?);
+        const object_file = LLVM.LLVMCreateObjectFile(memory_buffer.?);
         defer if (object_file != null) {
-            LLVMDisposeObjectFile(object_file.?);
+            LLVM.LLVMDisposeObjectFile(object_file.?);
         };
 
         if (object_file == null) {
@@ -764,24 +630,24 @@ pub const CodeGen = struct {
         }
 
         // Get sections iterator
-        const sections_iterator = LLVMGetSections(object_file.?);
-        defer LLVMDisposeSectionIterator(sections_iterator);
+        const sections_iterator = LLVM.LLVMGetSections(object_file.?);
+        defer LLVM.LLVMDisposeSectionIterator(sections_iterator);
 
         // Find the __text section
-        while (LLVMIsSectionIteratorAtEnd(object_file.?, sections_iterator) == 0) {
-            const section_name_ptr = LLVMGetSectionName(sections_iterator);
+        while (LLVM.LLVMIsSectionIteratorAtEnd(object_file.?, sections_iterator) == 0) {
+            const section_name_ptr = LLVM.LLVMGetSectionName(sections_iterator);
             const section_name = std.mem.span(section_name_ptr);
 
             if (std.mem.eql(u8, section_name, "__text")) {
-                const section_size = LLVMGetSectionSize(sections_iterator);
-                const section_contents = LLVMGetSectionContents(sections_iterator);
+                const section_size = LLVM.LLVMGetSectionSize(sections_iterator);
+                const section_contents = LLVM.LLVMGetSectionContents(sections_iterator);
 
                 text_size = @intCast(section_size);
                 object_code = section_contents[0..text_size];
                 break;
             }
 
-            LLVMMoveToNextSection(sections_iterator);
+            LLVM.LLVMMoveToNextSection(sections_iterator);
         }
 
         if (text_size == 0) {
@@ -940,8 +806,8 @@ pub const CodeGen = struct {
         const final_triple = if (target_triple) |triple| blk: {
             break :blk triple;
         } else blk: {
-            const default_triple = LLVMGetDefaultTargetTriple();
-            defer LLVMDisposeMessage(default_triple);
+            const default_triple = LLVM.LLVMGetDefaultTargetTriple();
+            defer LLVM.LLVMDisposeMessage(default_triple);
 
             // Normalize the target triple for known platforms
             const triple_str = std.mem.span(default_triple);
@@ -962,32 +828,32 @@ pub const CodeGen = struct {
         const triple_z = try self.allocator.dupeZ(u8, final_triple);
         defer self.allocator.free(triple_z);
 
-        var target: ?LLVMTargetRef = null;
+        var target: LLVM.LLVMTargetRef = null;
         var error_message: [*:0]u8 = undefined;
 
-        if (LLVMGetTargetFromTriple(triple_z.ptr, &target, &error_message) != 0) {
-            defer LLVMDisposeMessage(error_message);
+        if (LLVM.LLVMGetTargetFromTriple(triple_z.ptr, &target, &error_message) != 0) {
+            defer LLVM.LLVMDisposeMessage(error_message);
             std.debug.print("Error getting target: {s}\n", .{error_message});
             std.debug.print("Tried target triple: {s}\n", .{final_triple});
             return error.TargetError;
         }
 
-        const target_machine = LLVMCreateTargetMachine(target.?, triple_z.ptr, "generic", "", @intFromEnum(LLVMOptLevel.default), @intFromEnum(LLVMRelocMode.pic), @intFromEnum(LLVMCodeModel.default));
-        defer LLVMDisposeTargetMachine(target_machine);
+        const target_machine = LLVM.LLVMCreateTargetMachine(target.?, triple_z.ptr, "generic", "", @intFromEnum(LLVM.LLVMOptLevel.default), @intFromEnum(LLVM.LLVMRelocMode.pic), @intFromEnum(LLVM.LLVMCodeModel.default));
+        defer LLVM.LLVMDisposeTargetMachine(target_machine);
 
         const output_path_z = try self.allocator.dupeZ(u8, output_path);
         defer self.allocator.free(output_path_z);
 
-        if (LLVMTargetMachineEmitToFile(target_machine, self.module, output_path_z.ptr, @intFromEnum(LLVMCodeGenFileType.object), &error_message) != 0) {
-            defer LLVMDisposeMessage(error_message);
+        if (LLVM.LLVMTargetMachineEmitToFile(target_machine, self.module, output_path_z.ptr, @intFromEnum(LLVM.LLVMCodeGenFileType.object), &error_message) != 0) {
+            defer LLVM.LLVMDisposeMessage(error_message);
             std.debug.print("Error generating object file: {s}\n", .{error_message});
             return error.CodeGenError;
         }
     }
 
     pub fn printIR(self: *CodeGen) void {
-        const ir_string = LLVMPrintModuleToString(self.module);
-        defer LLVMDisposeMessage(ir_string);
+        const ir_string = LLVM.LLVMPrintModuleToString(self.module);
+        defer LLVM.LLVMDisposeMessage(ir_string);
         std.debug.print("Generated LLVM IR:\n{s}\n", .{ir_string});
     }
 
@@ -995,27 +861,27 @@ pub const CodeGen = struct {
         // Create _start function for Linux ELF executables
         // This function calls main() and returns the exit code
 
-        const i32_type = LLVMInt32TypeInContext(self.context);
-        const start_function_type = LLVMFunctionType(i32_type, null, 0, 0);
-        const start_function = LLVMAddFunction(self.module, "_start", start_function_type);
+        const i32_type = LLVM.LLVMInt32TypeInContext(self.context);
+        const start_function_type = LLVM.LLVMFunctionType(i32_type, null, 0, 0);
+        const start_function = LLVM.LLVMAddFunction(self.module, "_start", start_function_type);
 
         // Set proper stack alignment attributes for x86-64 System V ABI compliance
         self.setStackAlignmentAttributes(start_function);
 
         // Create basic block
-        const entry_block = LLVMAppendBasicBlockInContext(self.context, start_function, "entry");
-        LLVMPositionBuilderAtEnd(self.builder, entry_block);
+        const entry_block = LLVM.LLVMAppendBasicBlockInContext(self.context, start_function, "entry");
+        LLVM.LLVMPositionBuilderAtEnd(self.builder, entry_block);
 
         // Add dummy alloca for stack alignment in _start (accounts for call instruction push)
         // Allocate 8 bytes of padding to help ensure 16-byte alignment before calling main
-        const int8_type = LLVMInt8TypeInContext(self.context);
-        const dummy_array_type = LLVMArrayType(int8_type, 8); // 8 bytes
+        const int8_type = LLVM.LLVMInt8TypeInContext(self.context);
+        const dummy_array_type = LLVM.LLVMArrayType(int8_type, 8); // 8 bytes
         const dummy_name_start = "dummy_padding_start";
-        const dummy_alloca_start = LLVMBuildAlloca(self.builder, dummy_array_type, dummy_name_start);
-        LLVMSetAlignment(dummy_alloca_start, 16);
+        const dummy_alloca_start = LLVM.LLVMBuildAlloca(self.builder, dummy_array_type, dummy_name_start);
+        LLVM.LLVMSetAlignment(dummy_alloca_start, 16);
 
         // Get the main function
-        const main_function_ = LLVMGetNamedFunction(self.module, "main");
+        const main_function_ = LLVM.LLVMGetNamedFunction(self.module, "main");
         if (main_function_ == null) {
             std.debug.print("Error: main function not found when generating _start\n", .{});
             return error.CodeGenError;
@@ -1023,32 +889,33 @@ pub const CodeGen = struct {
         const main_function = main_function_.?;
 
         // Call main() - main now returns i32
-        const main_function_type = LLVMFunctionType(i32_type, null, 0, 0);
-        const exit_code = LLVMBuildCall2(self.builder, main_function_type, main_function, null, 0, "main_result");
+        const main_function_type = LLVM.LLVMFunctionType(i32_type, null, 0, 0);
+        const exit_code = LLVM.LLVMBuildCall2(self.builder, main_function_type, main_function, null, 0, "main_result");
 
         // Store the exit code in a global variable for inspection
-        const exit_code_global = LLVMAddGlobal(self.module, i32_type, "program_exit_code");
-        LLVMSetInitializer(exit_code_global, LLVMConstInt(i32_type, 0, 0));
-        _ = LLVMBuildStore(self.builder, exit_code, exit_code_global);
+        const exit_code_global = LLVM.LLVMAddGlobal(self.module, i32_type, "program_exit_code");
+        LLVM.LLVMSetInitializer(exit_code_global, LLVM.LLVMConstInt(i32_type, 0, 0));
+        _ = LLVM.LLVMBuildStore(self.builder, exit_code, exit_code_global);
 
         // --- Exit the process via Linux x86_64 syscall ---
-        const void_type = LLVMVoidTypeInContext(self.context);
-        const int64_type = LLVMInt64TypeInContext(self.context);
-        const syscall_asm_ty = LLVMFunctionType(void_type, &[_]LLVMTypeRef{int64_type}, 1, 0);
+        const void_type = LLVM.LLVMVoidTypeInContext(self.context);
+        const int64_type = LLVM.LLVMInt64TypeInContext(self.context);
+        const param_types = [_]LLVM.LLVMTypeRef{int64_type};
+        const syscall_asm_ty = LLVM.LLVMFunctionType(void_type, @constCast(&param_types[0]), 1, 0);
         const asm_str = "mov $0, %rdi\n mov $$60, %rax\nsyscall"; // rax=60 (SYS_exit), rdi=status
 
-        const syscall_inline = LLVMGetInlineAsm(syscall_asm_ty, asm_str, asm_str.len, "r", 1, // single general-purpose register input
+        const syscall_inline = LLVM.LLVMGetInlineAsm(syscall_asm_ty, asm_str, asm_str.len, "r", 1, // single general-purpose register input
             1, // has side effects
             0, // align stack
             0, // ATT dialect
             0 // can throw
         );
 
-        const exit_code_64 = LLVMBuildSExt(self.builder, exit_code, int64_type, "exit_code64");
-        _ = LLVMBuildCall2(self.builder, syscall_asm_ty, syscall_inline, &[_]LLVMValueRef{exit_code_64}, 1, "");
+        const exit_code_64 = LLVM.LLVMBuildSExt(self.builder, exit_code, int64_type, "exit_code64");
+        _ = LLVM.LLVMBuildCall2(self.builder, syscall_asm_ty, syscall_inline, @constCast(&[_]LLVM.LLVMValueRef{exit_code_64}), 1, "");
 
         // Mark unreachable as the syscall terminates the program
-        _ = LLVMBuildUnreachable(self.builder);
+        _ = LLVM.LLVMBuildUnreachable(self.builder);
 
         self.printIR();
     }
@@ -1063,88 +930,88 @@ pub const CodeGen = struct {
     }
 
     // Helper function to set stack alignment attributes on functions
-    fn setStackAlignmentAttributes(self: *CodeGen, function: LLVMValueRef) void {
+    fn setStackAlignmentAttributes(self: *CodeGen, function: LLVM.LLVMValueRef) void {
         // Set stack realignment for x86-64 System V ABI compliance
         const stackrealign_attr_name = "stackrealign";
-        const stackrealign_kind = LLVMGetEnumAttributeKindForName(stackrealign_attr_name.ptr, stackrealign_attr_name.len);
-        const stackrealign_attr = LLVMCreateEnumAttribute(self.context, stackrealign_kind, 0);
-        LLVMAddAttributeAtIndex(function, LLVMAttributeFunctionIndex, stackrealign_attr);
+        const stackrealign_kind = LLVM.LLVMGetEnumAttributeKindForName(stackrealign_attr_name.ptr, stackrealign_attr_name.len);
+        const stackrealign_attr = LLVM.LLVMCreateEnumAttribute(self.context, stackrealign_kind, 0);
+        LLVM.LLVMAddAttributeAtIndex(function, 0xffffffff, stackrealign_attr);
 
         // Set unwind table for proper exception handling and debugging
         const uwtable_attr_name = "uwtable";
-        const uwtable_kind = LLVMGetEnumAttributeKindForName(uwtable_attr_name.ptr, uwtable_attr_name.len);
-        const uwtable_attr = LLVMCreateEnumAttribute(self.context, uwtable_kind, 2); // sync uwtable
-        LLVMAddAttributeAtIndex(function, LLVMAttributeFunctionIndex, uwtable_attr);
+        const uwtable_kind = LLVM.LLVMGetEnumAttributeKindForName(uwtable_attr_name.ptr, uwtable_attr_name.len);
+        const uwtable_attr = LLVM.LLVMCreateEnumAttribute(self.context, uwtable_kind, 2); // sync uwtable
+        LLVM.LLVMAddAttributeAtIndex(function, 0xffffffff, uwtable_attr);
 
         // Set proper calling convention for System V ABI
-        LLVMSetFunctionCallConv(function, 0); // C calling convention (System V ABI)
+        LLVM.LLVMSetFunctionCallConv(function, 0); // C calling convention (System V ABI)
 
         // Ensure the backend maintains at least 16-byte stack alignment
         const alignstack_attr_name = "alignstack"; // LLVM attribute: alignstack(<alignment>)
-        const alignstack_kind = LLVMGetEnumAttributeKindForName(alignstack_attr_name.ptr, alignstack_attr_name.len);
+        const alignstack_kind = LLVM.LLVMGetEnumAttributeKindForName(alignstack_attr_name.ptr, alignstack_attr_name.len);
         if (alignstack_kind != 0) { // only add if LLVM recognises the attribute
-            const alignstack_attr = LLVMCreateEnumAttribute(self.context, alignstack_kind, 16);
-            LLVMAddAttributeAtIndex(function, LLVMAttributeFunctionIndex, alignstack_attr);
+            const alignstack_attr = LLVM.LLVMCreateEnumAttribute(self.context, alignstack_kind, 16);
+            LLVM.LLVMAddAttributeAtIndex(function, 0xffffffff, alignstack_attr);
         }
     }
 };
 
-fn generateSimpleEntryPoint(module: LLVMModuleRef, context: LLVMContextRef, builder: LLVMBuilderRef, main_func: LLVMValueRef) !LLVMValueRef {
+fn generateSimpleEntryPoint(module: LLVM.LLVMModuleRef, context: LLVM.LLVMContextRef, builder: LLVM.LLVMBuilderRef, main_func: LLVM.LLVMValueRef) !LLVM.LLVMValueRef {
     // Create an entry point function that calls main() and then exits properly
-    const i32_type = LLVMInt32TypeInContext(context);
-    const i64_type = LLVMInt64TypeInContext(context);
-    const void_type = LLVMVoidTypeInContext(context);
-    const entry_type = LLVMFunctionType(i32_type, null, 0, 0);
-    const entry_func = LLVMAddFunction(module, "_start", entry_type);
+    const i32_type = LLVM.LLVMInt32TypeInContext(context);
+    const i64_type = LLVM.LLVMInt64TypeInContext(context);
+    const void_type = LLVM.LLVMVoidTypeInContext(context);
+    const entry_type = LLVM.LLVMFunctionType(i32_type, null, 0, 0);
+    const entry_func = LLVM.LLVMAddFunction(module, "_start", entry_type);
 
     // Declare the external exit function from libSystem
-    const exit_type = LLVMFunctionType(void_type, &[_]LLVMTypeRef{i32_type}, 1, 0);
-    const exit_func = LLVMAddFunction(module, "exit", exit_type);
+    const exit_type = LLVM.LLVMFunctionType(void_type, &[_]LLVM.LLVMTypeRef{i32_type}, 1, 0);
+    const exit_func = LLVM.LLVMAddFunction(module, "exit", exit_type);
 
-    const entry_block = LLVMAppendBasicBlockInContext(context, entry_func, "entry");
-    LLVMPositionBuilderAtEnd(builder, entry_block);
+    const entry_block = LLVM.LLVMAppendBasicBlockInContext(context, entry_func, "entry");
+    LLVM.LLVMPositionBuilderAtEnd(builder, entry_block);
 
     // Get the main function type (should be i64 () )
-    const main_type = LLVMFunctionType(i64_type, null, 0, 0);
+    const main_type = LLVM.LLVMFunctionType(i64_type, null, 0, 0);
 
     // Call main function
-    const main_call = LLVMBuildCall2(builder, main_type, main_func, null, 0, "main_result");
+    const main_call = LLVM.LLVMBuildCall2(builder, main_type, main_func, null, 0, "main_result");
 
     // Convert the exit code from main (i64) to i32
-    const exit_code = LLVMBuildTrunc(builder, main_call, i32_type, "exit_code");
+    const exit_code = LLVM.LLVMBuildTrunc(builder, main_call, i32_type, "exit_code");
 
     // Call exit() from libSystem
-    _ = LLVMBuildCall2(builder, exit_type, exit_func, &[_]LLVMValueRef{exit_code}, 1, "");
+    _ = LLVM.LLVMBuildCall2(builder, exit_type, exit_func, &[_]LLVM.LLVMValueRef{exit_code}, 1, "");
 
     // This should never be reached, but add unreachable just in case
-    _ = LLVMBuildUnreachable(builder);
+    _ = LLVM.LLVMBuildUnreachable(builder);
 
     return entry_func;
 }
 
-fn generateEntryPoint(module: LLVMModuleRef, context: LLVMContextRef, builder: LLVMBuilderRef, main_func: LLVMValueRef) !LLVMValueRef {
+fn generateEntryPoint(module: LLVM.LLVMModuleRef, context: LLVM.LLVMContextRef, builder: LLVM.LLVMBuilderRef, main_func: LLVM.LLVMValueRef) !LLVM.LLVMValueRef {
     // Create entry point function that calls main() and then exits
-    const i32_type = LLVMInt32TypeInContext(context);
-    const i64_type = LLVMInt64TypeInContext(context);
-    const entry_type = LLVMFunctionType(i32_type, null, 0, 0);
-    const entry_func = LLVMAddFunction(module, "_start", entry_type);
+    const i32_type = LLVM.LLVMInt32TypeInContext(context);
+    const i64_type = LLVM.LLVMInt64TypeInContext(context);
+    const entry_type = LLVM.LLVMFunctionType(i32_type, null, 0, 0);
+    const entry_func = LLVM.LLVMAddFunction(module, "_start", entry_type);
 
-    const entry_block = LLVMAppendBasicBlockInContext(context, entry_func, "entry");
-    LLVMPositionBuilderAtEnd(builder, entry_block);
+    const entry_block = LLVM.LLVMAppendBasicBlockInContext(context, entry_func, "entry");
+    LLVM.LLVMPositionBuilderAtEnd(builder, entry_block);
 
     // Get the main function type (should be i64 () )
-    const main_type = LLVMFunctionType(i64_type, null, 0, 0);
+    const main_type = LLVM.LLVMFunctionType(i64_type, null, 0, 0);
 
     // Call main function
-    const main_call = LLVMBuildCall2(builder, main_type, main_func, null, 0, "main_result");
+    const main_call = LLVM.LLVMBuildCall2(builder, main_type, main_func, null, 0, "main_result");
 
     // Convert the exit code from main (i64) to i32 for the exit syscall
-    const exit_code = LLVMBuildTrunc(builder, main_call, i32_type, "exit_code");
+    const exit_code = LLVM.LLVMBuildTrunc(builder, main_call, i32_type, "exit_code");
 
     // Create Darwin ARM64 system call for exit
     // Darwin uses svc #0x80 instead of svc #0
-    const inline_asm_type = LLVMFunctionType(LLVMVoidTypeInContext(context), &[_]LLVMTypeRef{i32_type}, 1, 0);
-    const inline_asm = LLVMGetInlineAsm(inline_asm_type, "mov x16, #1\nmov x0, $0\nsvc #0x80", // Darwin ARM64 exit syscall
+    const inline_asm_type = LLVM.LLVMFunctionType(LLVM.LLVMVoidTypeInContext(context), &[_]LLVM.LLVMTypeRef{i32_type}, 1, 0);
+    const inline_asm = LLVM.LLVMGetInlineAsm(inline_asm_type, "mov x16, #1\nmov x0, $0\nsvc #0x80", // Darwin ARM64 exit syscall
         "r", // input constraint: general register
         1, // has side effects
         0, // align stack
@@ -1153,10 +1020,10 @@ fn generateEntryPoint(module: LLVMModuleRef, context: LLVMContextRef, builder: L
     );
 
     // Call the inline assembly with exit code
-    _ = LLVMBuildCall2(builder, inline_asm_type, inline_asm, &[_]LLVMValueRef{exit_code}, 1, "");
+    _ = LLVM.LLVMBuildCall2(builder, inline_asm_type, inline_asm, &[_]LLVM.LLVMValueRef{exit_code}, 1, "");
 
     // Add unreachable instruction (should never be reached)
-    _ = LLVMBuildUnreachable(builder);
+    _ = LLVM.LLVMBuildUnreachable(builder);
 
     return entry_func;
 }
