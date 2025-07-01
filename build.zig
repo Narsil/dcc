@@ -205,4 +205,22 @@ pub fn build(b: *std.Build) !void {
     // running the unit tests.
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_unit_tests.step);
+
+    // Integration tests that require the dcc binary
+    const integration_tests = b.addTest(.{
+        .name = "integration-tests",
+        .root_source_file = b.path("src/integration_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Add integration tests step
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+    run_integration_tests.step.dependOn(b.getInstallStep()); // Ensure dcc binary is built first
+
+    const integration_test_step = b.step("test-integration", "Run integration tests");
+    integration_test_step.dependOn(&run_integration_tests.step);
+
+    // Make the main test step depend on both unit and integration tests
+    test_step.dependOn(&run_integration_tests.step);
 }
