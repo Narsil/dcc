@@ -3,8 +3,13 @@ const builtin = @import("builtin");
 
 // Add this function to your build.zig file
 fn buildLldWrapper(b: *std.Build, llvm_include_dir: []u8, lld_include_dir: []u8, lld_lib_dir: []u8) *std.Build.Step {
-    const libstdcxx_path = std.process.getEnvVarOwned(b.allocator, "LIBSTDCXX_PATH") catch "/nix/store/sa7j7cddyblhcb3ch3ds10w7nw75yjj1-gcc-14.3.0/lib/gcc/x86_64-unknown-linux-gnu/14.3.0/../../../libstdc++.a";
-    defer if (!std.mem.eql(u8, libstdcxx_path, "/nix/store/sa7j7cddyblhcb3ch3ds10w7nw75yjj1-gcc-14.3.0/lib/gcc/x86_64-unknown-linux-gnu/14.3.0/../../../libstdc++.a")) b.allocator.free(libstdcxx_path);
+    const command_args = [_][]const u8{
+        "gcc", "-print-file-name=libstdc++.a",
+    };
+    // Use builder.run() which handles spawning and waiting, and gives you the Child result
+    // This is the cleanest way to run a child process and get its output within build.zig.
+    const result = b.run(&command_args);
+    const libstdcxx_path = std.mem.trim(u8, result, "\n");
 
     // Step 1: Compile lld_wrapper.cpp to object file using g++ directly
     const wrapper_obj_cmd = b.addSystemCommand(&.{ "g++", "-c", "-std=c++17", "-fPIC", "-O2", "-o", "lld_wrapper.o", "src/lld_wrapper.cpp" });
