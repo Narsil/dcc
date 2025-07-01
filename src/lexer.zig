@@ -28,28 +28,50 @@ pub const TokenType = enum {
     // Special
     eof,
     invalid,
+    
+    /// Returns the fixed length for tokens that have a known length
+    /// Returns 0 for variable-length tokens (number, identifier, keywords)
+    pub fn length(self: TokenType) usize {
+        return switch (self) {
+            .plus, .minus, .multiply, .divide, .assign => 1,
+            .left_paren, .right_paren, .left_brace, .right_brace, .comma, .semicolon => 1,
+            .let => 3,
+            .fn_ => 2,
+            .return_ => 6,
+            .number, .identifier, .eof, .invalid => 0, // Variable length
+        };
+    }
+    
+    /// Returns true if this token type has a fixed length
+    pub fn hasFixedLength(self: TokenType) bool {
+        return self.length() > 0;
+    }
 };
 
 pub const Token = struct {
     type: TokenType,
-    lexeme: []const u8,
-    line: u32,
-    column: u32,
+    offset: usize,
+    length: usize, // Only used for variable-length tokens
+    
+    /// Get the actual length of this token
+    pub fn getLength(self: Token) usize {
+        if (self.type.hasFixedLength()) {
+            return self.type.length();
+        } else {
+            return self.length;
+        }
+    }
 };
 
 pub const Lexer = struct {
     source: []const u8,
     current: usize,
-    line: u32,
-    column: u32,
     allocator: std.mem.Allocator,
     
     pub fn init(allocator: std.mem.Allocator, source: []const u8) Lexer {
         return Lexer{
             .source = source,
             .current = 0,
-            .line = 1,
-            .column = 1,
             .allocator = allocator,
         };
     }
@@ -62,15 +84,16 @@ pub const Lexer = struct {
             const token = self.nextToken();
             try tokens.append(token);
             if (token.type == .invalid) {
-                std.debug.print("Invalid token at line {}, column {}: '{s}'\n", .{ token.line, token.column, token.lexeme });
+                const pos = Lexer.offsetToLineColumn(self.source, token.offset);
+                const lexeme = self.source[token.offset .. token.offset + token.getLength()];
+                std.debug.print("Invalid token at line {}, column {}: '{s}'\n", .{ pos.line, pos.column, lexeme });
             }
         }
         
         try tokens.append(Token{
             .type = .eof,
-            .lexeme = "",
-            .line = self.line,
-            .column = self.column,
+            .offset = self.current,
+            .length = 0,
         });
         
         return tokens.toOwnedSlice();
@@ -82,55 +105,50 @@ pub const Lexer = struct {
         if (self.isAtEnd()) {
             return Token{
                 .type = .eof,
-                .lexeme = "",
-                .line = self.line,
-                .column = self.column,
+                .offset = self.current,
+                .length = 0,
             };
         }
         
-        const start_line = self.line;
-        const start_column = self.column;
         const start = self.current;
-        
         const c = self.advance();
         
         return switch (c) {
-            '+' => self.makeToken(.plus, start, start_line, start_column),
-            '-' => self.makeToken(.minus, start, start_line, start_column),
-            '*' => self.makeToken(.multiply, start, start_line, start_column),
-            '/' => self.makeToken(.divide, start, start_line, start_column),
-            '=' => self.makeToken(.assign, start, start_line, start_column),
-            '(' => self.makeToken(.left_paren, start, start_line, start_column),
-            ')' => self.makeToken(.right_paren, start, start_line, start_column),
-            '{' => self.makeToken(.left_brace, start, start_line, start_column),
-            '}' => self.makeToken(.right_brace, start, start_line, start_column),
-            ',' => self.makeToken(.comma, start, start_line, start_column),
-            ';' => self.makeToken(.semicolon, start, start_line, start_column),
+            '+' => self.makeToken(.plus, start),
+            '-' => self.makeToken(.minus, start),
+            '*' => self.makeToken(.multiply, start),
+            '/' => self.makeToken(.divide, start),
+            '=' => self.makeToken(.assign, start),
+            '(' => self.makeToken(.left_paren, start),
+            ')' => self.makeToken(.right_paren, start),
+            '{' => self.makeToken(.left_brace, start),
+            '}' => self.makeToken(.right_brace, start),
+            ',' => self.makeToken(.comma, start),
+            ';' => self.makeToken(.semicolon, start),
             else => {
                 if (std.ascii.isDigit(c)) {
-                    return self.number(start, start_line, start_column);
+                    return self.number(start);
                 } else if (std.ascii.isAlphabetic(c) or c == '_') {
-                    return self.identifier(start, start_line, start_column);
+                    return self.identifier(start);
                 } else {
                     return Token{
                         .type = .invalid,
-                        .lexeme = self.source[start..self.current],
-                        .line = start_line,
-                        .column = start_column,
+                        .offset = start,
+                        .length = self.current - start,
                     };
                 }
             },
         };
     }
     
-    fn number(self: *Lexer, start: usize, start_line: u32, start_column: u32) Token {
+    fn number(self: *Lexer, start: usize) Token {
         while (!self.isAtEnd() and std.ascii.isDigit(self.peek())) {
             _ = self.advance();
         }
-        return self.makeToken(.number, start, start_line, start_column);
+        return self.makeToken(.number, start);
     }
     
-    fn identifier(self: *Lexer, start: usize, start_line: u32, start_column: u32) Token {
+    fn identifier(self: *Lexer, start: usize) Token {
         while (!self.isAtEnd() and (std.ascii.isAlphanumeric(self.peek()) or self.peek() == '_')) {
             _ = self.advance();
         }
@@ -139,9 +157,8 @@ pub const Lexer = struct {
         const token_type = self.identifierType(text);
         return Token{
             .type = token_type,
-            .lexeme = text,
-            .line = start_line,
-            .column = start_column,
+            .offset = start,
+            .length = self.current - start,
         };
     }
     
@@ -153,12 +170,11 @@ pub const Lexer = struct {
         return .identifier;
     }
     
-    fn makeToken(self: *Lexer, token_type: TokenType, start: usize, start_line: u32, start_column: u32) Token {
+    fn makeToken(self: *Lexer, token_type: TokenType, start: usize) Token {
         return Token{
             .type = token_type,
-            .lexeme = self.source[start..self.current],
-            .line = start_line,
-            .column = start_column,
+            .offset = start,
+            .length = if (token_type.hasFixedLength()) 0 else self.current - start,
         };
     }
     
@@ -166,12 +182,7 @@ pub const Lexer = struct {
         while (!self.isAtEnd()) {
             const c = self.peek();
             switch (c) {
-                ' ', '\r', '\t' => {
-                    _ = self.advance();
-                },
-                '\n' => {
-                    self.line += 1;
-                    self.column = 1;
+                ' ', '\r', '\t', '\n' => {
                     _ = self.advance();
                 },
                 else => break,
@@ -187,13 +198,30 @@ pub const Lexer = struct {
         if (self.isAtEnd()) return 0;
         const c = self.source[self.current];
         self.current += 1;
-        self.column += 1;
         return c;
     }
     
     fn peek(self: *Lexer) u8 {
         if (self.isAtEnd()) return 0;
         return self.source[self.current];
+    }
+    
+    /// Convert an offset back to line and column numbers
+    /// This is useful for error reporting when you need human-readable positions
+    pub fn offsetToLineColumn(source: []const u8, offset: usize) struct { line: u32, column: u32 } {
+        var line: u32 = 1;
+        var column: u32 = 1;
+        
+        for (source[0..@min(offset, source.len)]) |c| {
+            if (c == '\n') {
+                line += 1;
+                column = 1;
+            } else {
+                column += 1;
+            }
+        }
+        
+        return .{ .line = line, .column = column };
     }
 };
 
@@ -212,4 +240,48 @@ test "lexer basic tokens" {
     try std.testing.expect(tokens[3].type == .number);
     try std.testing.expect(tokens[4].type == .semicolon);
     try std.testing.expect(tokens[5].type == .eof);
+}
+
+test "offset to line column conversion" {
+    const source = "hello\nworld\ntest";
+    
+    // Test offset 0 (start of file)
+    var pos = Lexer.offsetToLineColumn(source, 0);
+    try std.testing.expect(pos.line == 1);
+    try std.testing.expect(pos.column == 1);
+    
+    // Test offset 3 (middle of first line)
+    pos = Lexer.offsetToLineColumn(source, 3);
+    try std.testing.expect(pos.line == 1);
+    try std.testing.expect(pos.column == 4);
+    
+    // Test offset 5 (newline character)
+    pos = Lexer.offsetToLineColumn(source, 5);
+    try std.testing.expect(pos.line == 1);
+    try std.testing.expect(pos.column == 6);
+    
+    // Test offset 6 (start of second line)
+    pos = Lexer.offsetToLineColumn(source, 6);
+    try std.testing.expect(pos.line == 2);
+    try std.testing.expect(pos.column == 1);
+    
+    // Test offset 10 (middle of second line)
+    pos = Lexer.offsetToLineColumn(source, 10);
+    try std.testing.expect(pos.line == 2);
+    try std.testing.expect(pos.column == 5);
+    
+    // Test offset 11 (newline character)
+    pos = Lexer.offsetToLineColumn(source, 11);
+    try std.testing.expect(pos.line == 2);
+    try std.testing.expect(pos.column == 6);
+    
+    // Test offset 12 (start of third line)
+    pos = Lexer.offsetToLineColumn(source, 12);
+    try std.testing.expect(pos.line == 3);
+    try std.testing.expect(pos.column == 1);
+    
+    // Test offset 15 (end of file)
+    pos = Lexer.offsetToLineColumn(source, 15);
+    try std.testing.expect(pos.line == 3);
+    try std.testing.expect(pos.column == 4);
 } 

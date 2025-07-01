@@ -62,13 +62,148 @@ pub const Parser = struct {
     tokens: []lexer.Token,
     current: usize,
     allocator: std.mem.Allocator,
+    source: []const u8,
     
-    pub fn init(allocator: std.mem.Allocator, tokens: []lexer.Token) Parser {
+    pub fn init(allocator: std.mem.Allocator, tokens: []lexer.Token, source: []const u8) Parser {
         return Parser{
             .tokens = tokens,
             .current = 0,
             .allocator = allocator,
+            .source = source,
         };
+    }
+    
+    /// Get the source line at a given offset
+    fn getSourceLine(self: *Parser, offset: usize) []const u8 {
+        var line_start: usize = offset;
+        while (line_start > 0 and self.source[line_start - 1] != '\n') : (line_start -= 1) {}
+        
+        var line_end: usize = offset;
+        while (line_end < self.source.len and self.source[line_end] != '\n') : (line_end += 1) {}
+        
+        return self.source[line_start..line_end];
+    }
+    
+    /// Report error with source line context
+    fn reportError(self: *Parser, offset: usize, message: []const u8) void {
+        const pos = lexer.Lexer.offsetToLineColumn(self.source, offset);
+        const source_line = self.getSourceLine(offset);
+        
+        std.debug.print("Error at line {}, column {}: {s}\n", .{ pos.line, pos.column, message });
+        std.debug.print("  {s}\n", .{source_line});
+        
+        // Add caret pointing to the exact position
+        var caret_line = std.ArrayList(u8).init(self.allocator);
+        defer caret_line.deinit();
+        
+        // Calculate the column position within the line
+        var line_start: usize = offset;
+        while (line_start > 0 and self.source[line_start - 1] != '\n') : (line_start -= 1) {}
+        const column_in_line = offset - line_start;
+        
+        // Build the caret line
+        for (0..column_in_line) |_| {
+            caret_line.append(' ') catch {};
+        }
+        caret_line.append('^') catch {};
+        
+        std.debug.print("  {s}\n", .{caret_line.items});
+    }
+    
+    /// Clean up a single AST node and its children (const version)
+    fn cleanupASTNode(self: *Parser, node: *const ASTNode) void {
+        switch (node.*) {
+            .binary_expression => |bin_expr| {
+                self.cleanupASTNode(bin_expr.left);
+                self.allocator.destroy(bin_expr.left);
+                self.cleanupASTNode(bin_expr.right);
+                self.allocator.destroy(bin_expr.right);
+            },
+            .call_expression => |call| {
+                self.cleanupASTNode(call.callee);
+                self.allocator.destroy(call.callee);
+                for (call.arguments) |arg| {
+                    self.cleanupASTNode(&arg);
+                }
+                self.allocator.free(call.arguments);
+            },
+            .variable_declaration => |var_decl| {
+                self.cleanupASTNode(var_decl.value);
+                self.allocator.destroy(var_decl.value);
+            },
+            .return_statement => |ret| {
+                if (ret.value) |val| {
+                    self.cleanupASTNode(val);
+                    self.allocator.destroy(val);
+                }
+            },
+            .expression_statement => |expr_stmt| {
+                self.cleanupASTNode(expr_stmt.expression);
+                self.allocator.destroy(expr_stmt.expression);
+            },
+            .function_declaration => |func| {
+                self.allocator.free(func.parameters);
+                for (func.body) |stmt| {
+                    self.cleanupASTNode(&stmt);
+                }
+                self.allocator.free(func.body);
+            },
+            .program => |prog| {
+                for (prog.statements) |stmt| {
+                    self.cleanupASTNode(&stmt);
+                }
+                self.allocator.free(prog.statements);
+            },
+            .identifier, .number_literal => {},
+        }
+    }
+    
+    /// Clean up a single AST node and its children (non-const version)
+    fn cleanupASTNodeMut(self: *Parser, node: *ASTNode) void {
+        switch (node.*) {
+            .binary_expression => |bin_expr| {
+                self.cleanupASTNode(bin_expr.left);
+                self.allocator.destroy(bin_expr.left);
+                self.cleanupASTNode(bin_expr.right);
+                self.allocator.destroy(bin_expr.right);
+            },
+            .call_expression => |call| {
+                self.cleanupASTNode(call.callee);
+                self.allocator.destroy(call.callee);
+                for (call.arguments) |arg| {
+                    self.cleanupASTNode(&arg);
+                }
+                self.allocator.free(call.arguments);
+            },
+            .variable_declaration => |var_decl| {
+                self.cleanupASTNode(var_decl.value);
+                self.allocator.destroy(var_decl.value);
+            },
+            .return_statement => |ret| {
+                if (ret.value) |val| {
+                    self.cleanupASTNode(val);
+                    self.allocator.destroy(val);
+                }
+            },
+            .expression_statement => |expr_stmt| {
+                self.cleanupASTNode(expr_stmt.expression);
+                self.allocator.destroy(expr_stmt.expression);
+            },
+            .function_declaration => |func| {
+                self.allocator.free(func.parameters);
+                for (func.body) |stmt| {
+                    self.cleanupASTNode(&stmt);
+                }
+                self.allocator.free(func.body);
+            },
+            .program => |prog| {
+                for (prog.statements) |stmt| {
+                    self.cleanupASTNode(&stmt);
+                }
+                self.allocator.free(prog.statements);
+            },
+            .identifier, .number_literal => {},
+        }
     }
     
     pub fn parse(self: *Parser) ParseError!ASTNode {
@@ -106,7 +241,14 @@ pub const Parser = struct {
     fn parseFunctionDeclaration(self: *Parser) ParseError!ASTNode {
         const name = try self.consume(.identifier, "Expected function name");
         
-        _ = try self.consume(.left_paren, "Expected '(' after function name");
+        if (!self.match(.left_paren)) {
+            const pos = lexer.Lexer.offsetToLineColumn(self.source, self.peek().offset);
+            std.debug.print("Error at line {}, column {}: Expected '(' after function name '{s}'\n", .{ 
+                pos.line, pos.column, 
+                self.source[name.offset .. name.offset + name.getLength()]
+            });
+            return error.ParseError;
+        }
         
         var params = std.ArrayList([]const u8).init(self.allocator);
         defer params.deinit();
@@ -114,14 +256,22 @@ pub const Parser = struct {
         if (!self.check(.right_paren)) {
             repeat: while (true) {
                 const param = try self.consume(.identifier, "Expected parameter name");
-                try params.append(param.lexeme);
+                const param_lexeme = self.source[param.offset .. param.offset + param.getLength()];
+                try params.append(param_lexeme);
                 
                 if (!self.match(.comma)) break :repeat;
             }
         }
         
-        _ = try self.consume(.right_paren, "Expected ')' after parameters");
-        _ = try self.consume(.left_brace, "Expected '{' before function body");
+        if (!self.match(.right_paren)) {
+            self.reportError(self.peek().offset, "Expected ')' after function parameters");
+            return error.ParseError;
+        }
+        
+        if (!self.match(.left_brace)) {
+            self.reportError(self.peek().offset, "Expected '{' before function body");
+            return error.ParseError;
+        }
         
         var body = std.ArrayList(ASTNode).init(self.allocator);
         defer body.deinit();
@@ -131,11 +281,19 @@ pub const Parser = struct {
             try body.append(stmt);
         }
         
-        _ = try self.consume(.right_brace, "Expected '}' after function body");
+        if (!self.match(.right_brace)) {
+            // Clean up all the statements that were successfully parsed
+            for (body.items) |stmt| {
+                self.cleanupASTNode(&stmt);
+            }
+            self.reportError(self.peek().offset, "Expected '}' after function body");
+            return error.ParseError;
+        }
         
+        const name_lexeme = self.source[name.offset .. name.offset + name.getLength()];
         return ASTNode{
             .function_declaration = .{
-                .name = name.lexeme,
+                .name = name_lexeme,
                 .parameters = try params.toOwnedSlice(),
                 .body = try body.toOwnedSlice(),
             },
@@ -144,16 +302,26 @@ pub const Parser = struct {
     
     fn parseVariableDeclaration(self: *Parser) ParseError!ASTNode {
         const name = try self.consume(.identifier, "Expected variable name");
-        _ = try self.consume(.assign, "Expected '=' after variable name");
+        
+        if (!self.match(.assign)) {
+            self.reportError(self.peek().offset, "Expected '=' after variable name");
+            return error.ParseError;
+        }
         
         const value = try self.allocator.create(ASTNode);
+        errdefer self.allocator.destroy(value);
         value.* = try self.parseExpression();
         
-        _ = try self.consume(.semicolon, "Expected ';' after variable declaration");
+        if (!self.match(.semicolon)) {
+            self.cleanupASTNodeMut(value);
+            self.reportError(self.peek().offset, "Expected ';' after variable declaration");
+            return error.ParseError;
+        }
         
+        const name_lexeme = self.source[name.offset .. name.offset + name.getLength()];
         return ASTNode{
             .variable_declaration = .{
-                .name = name.lexeme,
+                .name = name_lexeme,
                 .value = value,
             },
         };
@@ -164,11 +332,19 @@ pub const Parser = struct {
         
         if (!self.check(.semicolon)) {
             const expr = try self.allocator.create(ASTNode);
+            errdefer self.allocator.destroy(expr);
             expr.* = try self.parseExpression();
             value = expr;
         }
         
-        _ = try self.consume(.semicolon, "Expected ';' after return statement");
+        if (!self.match(.semicolon)) {
+            if (value) |val| {
+                self.cleanupASTNodeMut(val);
+                self.allocator.destroy(val);
+            }
+            self.reportError(self.peek().offset, "Expected ';' after return statement");
+            return error.ParseError;
+        }
         
         return ASTNode{
             .return_statement = .{
@@ -179,9 +355,14 @@ pub const Parser = struct {
     
     fn parseExpressionStatement(self: *Parser) ParseError!ASTNode {
         const expr = try self.allocator.create(ASTNode);
+        errdefer self.allocator.destroy(expr);
         expr.* = try self.parseExpression();
         
-        _ = try self.consume(.semicolon, "Expected ';' after expression");
+        if (!self.match(.semicolon)) {
+            self.cleanupASTNodeMut(expr);
+            self.reportError(self.peek().offset, "Expected ';' after expression");
+            return error.ParseError;
+        }
         
         return ASTNode{
             .expression_statement = .{
@@ -206,9 +387,11 @@ pub const Parser = struct {
             };
             
             const right = try self.allocator.create(ASTNode);
+            errdefer self.allocator.destroy(right);
             right.* = try self.parseMultiplication();
             
             const left = try self.allocator.create(ASTNode);
+            errdefer self.allocator.destroy(left);
             left.* = expr;
             
             expr = ASTNode{
@@ -235,9 +418,11 @@ pub const Parser = struct {
             };
             
             const right = try self.allocator.create(ASTNode);
+            errdefer self.allocator.destroy(right);
             right.* = try self.parseCall();
             
             const left = try self.allocator.create(ASTNode);
+            errdefer self.allocator.destroy(left);
             left.* = expr;
             
             expr = ASTNode{
@@ -271,7 +456,18 @@ pub const Parser = struct {
             _ = try self.consume(.right_paren, "Expected ')' after arguments");
             
             const callee = try self.allocator.create(ASTNode);
+            errdefer self.allocator.destroy(callee);
             callee.* = expr;
+            
+            switch (callee.*) {
+                .identifier => {},
+                .call_expression => {},
+                else => {
+                    self.cleanupASTNodeMut(&expr);
+                    self.reportError(self.peek().offset, "Cannot call non-function");
+                    return error.ParseError;
+                }
+            }
             
             expr = ASTNode{
                 .call_expression = .{
@@ -287,7 +483,8 @@ pub const Parser = struct {
     fn parsePrimary(self: *Parser) ParseError!ASTNode {
         if (self.match(.number)) {
             const token = self.previous();
-            const value = try std.fmt.parseInt(i64, token.lexeme, 10);
+            const lexeme = self.source[token.offset .. token.offset + token.getLength()];
+            const value = try std.fmt.parseInt(i64, lexeme, 10);
             return ASTNode{
                 .number_literal = .{
                     .value = value,
@@ -297,19 +494,27 @@ pub const Parser = struct {
         
         if (self.match(.identifier)) {
             const token = self.previous();
+            const lexeme = self.source[token.offset .. token.offset + token.getLength()];
             return ASTNode{
                 .identifier = .{
-                    .name = token.lexeme,
+                    .name = lexeme,
                 },
             };
         }
         
         if (self.match(.left_paren)) {
             const expr = try self.parseExpression();
-            _ = try self.consume(.right_paren, "Expected ')' after expression");
+            
+            if (!self.match(.right_paren)) {
+                self.cleanupASTNode(&expr);
+                self.reportError(self.peek().offset, "Expected ')' after expression");
+                return error.ParseError;
+            }
+            
             return expr;
         }
         
+        self.reportError(self.peek().offset, "Unexpected token");
         return error.ParseError;
     }
     
@@ -347,7 +552,7 @@ pub const Parser = struct {
         if (self.check(token_type)) return self.advance();
         
         const current_token = self.peek();
-        std.debug.print("Parse error at line {}, column {}: {s}. Got: {}\n", .{ current_token.line, current_token.column, message, current_token.type });
+        self.reportError(current_token.offset, message);
         return error.ParseError;
     }
 };
@@ -360,13 +565,130 @@ test "parser simple variable" {
     const tokens = try lex.tokenize();
     defer allocator.free(tokens);
     
-    var parser = Parser.init(allocator, tokens);
+    var parser = Parser.init(allocator, tokens, source);
     const ast = try parser.parse();
     defer freeAST(allocator, ast);
     
     try std.testing.expect(ast == .program);
     try std.testing.expect(ast.program.statements.len == 1);
     try std.testing.expect(ast.program.statements[0] == .variable_declaration);
+}
+
+test "parser error - calling non-function" {
+    const allocator = std.testing.allocator;
+    const source = "fn main() { 42(); }";
+    
+    var lex = lexer.Lexer.init(allocator, source);
+    const tokens = try lex.tokenize();
+    defer allocator.free(tokens);
+    
+    var parser = Parser.init(allocator, tokens, source);
+    const result = parser.parse();
+    try std.testing.expectError(error.ParseError, result);
+}
+
+test "parser error - missing function parentheses" {
+    const allocator = std.testing.allocator;
+    const source = "fn main { return 42; }";
+    
+    var lex = lexer.Lexer.init(allocator, source);
+    const tokens = try lex.tokenize();
+    defer allocator.free(tokens);
+    
+    var parser = Parser.init(allocator, tokens, source);
+    const result = parser.parse();
+    try std.testing.expectError(error.ParseError, result);
+}
+
+test "parser error - missing closing parenthesis" {
+    const allocator = std.testing.allocator;
+    const source = "fn main( { return 42; }";
+    
+    var lex = lexer.Lexer.init(allocator, source);
+    const tokens = try lex.tokenize();
+    defer allocator.free(tokens);
+    
+    var parser = Parser.init(allocator, tokens, source);
+    const result = parser.parse();
+    try std.testing.expectError(error.ParseError, result);
+}
+
+test "parser error - missing opening brace" {
+    const allocator = std.testing.allocator;
+    const source = "fn main() return 42; }";
+    
+    var lex = lexer.Lexer.init(allocator, source);
+    const tokens = try lex.tokenize();
+    defer allocator.free(tokens);
+    
+    var parser = Parser.init(allocator, tokens, source);
+    const result = parser.parse();
+    try std.testing.expectError(error.ParseError, result);
+}
+
+test "parser error - missing closing brace" {
+    const allocator = std.testing.allocator;
+    const source = "fn main() { return 42;";
+    
+    var lex = lexer.Lexer.init(allocator, source);
+    const tokens = try lex.tokenize();
+    defer allocator.free(tokens);
+    
+    var parser = Parser.init(allocator, tokens, source);
+    const result = parser.parse();
+    try std.testing.expectError(error.ParseError, result);
+}
+
+test "parser error - missing assignment operator" {
+    const allocator = std.testing.allocator;
+    const source = "let x 42;";
+    
+    var lex = lexer.Lexer.init(allocator, source);
+    const tokens = try lex.tokenize();
+    defer allocator.free(tokens);
+    
+    var parser = Parser.init(allocator, tokens, source);
+    const result = parser.parse();
+    try std.testing.expectError(error.ParseError, result);
+}
+
+test "parser error - missing semicolon after variable" {
+    const allocator = std.testing.allocator;
+    const source = "let x = 42";
+    
+    var lex = lexer.Lexer.init(allocator, source);
+    const tokens = try lex.tokenize();
+    defer allocator.free(tokens);
+    
+    var parser = Parser.init(allocator, tokens, source);
+    const result = parser.parse();
+    try std.testing.expectError(error.ParseError, result);
+}
+
+test "parser error - missing closing parenthesis in expression" {
+    const allocator = std.testing.allocator;
+    const source = "let x = (5 + 3;";
+    
+    var lex = lexer.Lexer.init(allocator, source);
+    const tokens = try lex.tokenize();
+    defer allocator.free(tokens);
+    
+    var parser = Parser.init(allocator, tokens, source);
+    const result = parser.parse();
+    try std.testing.expectError(error.ParseError, result);
+}
+
+test "parser error - calling expression" {
+    const allocator = std.testing.allocator;
+    const source = "fn main() { (5 + 3)(); }";
+    
+    var lex = lexer.Lexer.init(allocator, source);
+    const tokens = try lex.tokenize();
+    defer allocator.free(tokens);
+    
+    var parser = Parser.init(allocator, tokens, source);
+    const result = parser.parse();
+    try std.testing.expectError(error.ParseError, result);
 }
 
 pub fn freeAST(allocator: std.mem.Allocator, node: ASTNode) void {

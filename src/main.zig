@@ -145,11 +145,12 @@ pub fn main() !void {
     
     std.debug.print("Tokens:\n", .{});
     for (tokens) |token| {
-        std.debug.print("  {} '{s}' ({}:{})\n", .{ token.type, token.lexeme, token.line, token.column });
+        const lexeme = source[token.offset .. token.offset + token.getLength()];
+        std.debug.print("  {} '{s}' (offset: {})\n", .{ token.type, lexeme, token.offset });
     }
     
     // Parse
-    var parse = parser.Parser.init(allocator, tokens);
+    var parse = parser.Parser.init(allocator, tokens, source);
     const ast = try parse.parse();
     defer parser.freeAST(allocator, ast);
     
@@ -200,7 +201,7 @@ test "integration test" {
     defer allocator.free(tokens);
     
     // Parse
-    var parse = parser.Parser.init(allocator, tokens);
+    var parse = parser.Parser.init(allocator, tokens, source);
     const ast = try parse.parse();
     defer parser.freeAST(allocator, ast);
     
