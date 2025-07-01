@@ -177,46 +177,48 @@ pub fn build(b: *std.Build) !void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
-    // // Creates a step for unit testing. This only builds the test executable
-    // // but does not run it.
-    // const exe_unit_tests = b.addTest(.{
-    //     .root_module = exe_mod,
-    // });
+    // Creates a step for unit testing. This only builds the test executable
+    // but does not run it.
+    const exe_unit_tests = b.addTest(.{
+        .root_module = exe_mod,
+    });
 
-    // // Copy build configuration to tests
-    // exe_unit_tests.linkLibC();
-    // exe_unit_tests.linkLibCpp();
+    // Copy build configuration to tests
+    exe_unit_tests.linkLibC();
+    exe_unit_tests.linkLibCpp();
 
-    // const test_llvm_include_dir = std.process.getEnvVarOwned(b.allocator, "LLVM_INCLUDE_DIR") catch null;
-    // const test_llvm_lib_dir = std.process.getEnvVarOwned(b.allocator, "LLVM_LIB_DIR") catch null;
-    // const test_lld_include_dir = std.process.getEnvVarOwned(b.allocator, "LLD_INCLUDE_DIR") catch null;
-    // const test_lld_lib_dir = std.process.getEnvVarOwned(b.allocator, "LLD_LIB_DIR") catch null;
-    // defer if (test_llvm_include_dir) |dir| b.allocator.free(dir);
-    // defer if (test_llvm_lib_dir) |dir| b.allocator.free(dir);
-    // defer if (test_lld_include_dir) |dir| b.allocator.free(dir);
-    // defer if (test_lld_lib_dir) |dir| b.allocator.free(dir);
+    exe_unit_tests.addIncludePath(.{ .cwd_relative = llvm_include_dir });
+    exe_unit_tests.addLibraryPath(.{ .cwd_relative = llvm_lib_dir });
 
-    // exe_unit_tests.addIncludePath(.{ .cwd_relative = test_llvm_include_dir orelse "/usr/include" });
-    // exe_unit_tests.addIncludePath(.{ .cwd_relative = test_lld_include_dir orelse "/usr/include" });
-    // exe_unit_tests.addLibraryPath(.{ .cwd_relative = test_llvm_lib_dir orelse "/usr/lib" });
+    // Link essential LLD libraries for tests (static linking)
+    exe_unit_tests.addIncludePath(.{ .cwd_relative = lld_include_dir });
+    if (builtin.target.os.tag == .linux) {
+        const lld_wrapper_step = buildLldWrapper(b, llvm_include_dir, lld_include_dir, lld_lib_dir);
+        // Link with our comprehensive static library (depends on lld_wrapper_step)
+        exe_unit_tests.addObjectFile(b.path("liblldwrapper.a"));
+        exe_unit_tests.step.dependOn(lld_wrapper_step); // Main exe depends on LLD wrapper
+    } else {
 
-    // // Link essential LLD libraries for tests (static linking)
-    // if (test_lld_lib_dir) |lib_dir| {
-    //     exe_unit_tests.addLibraryPath(.{ .cwd_relative = lib_dir });
-    //     exe_unit_tests.linkSystemLibrary2("lldCommon", .{ .preferred_link_mode = .static });
-    //     exe_unit_tests.linkSystemLibrary2("lldELF", .{ .preferred_link_mode = .static });
-    //     exe_unit_tests.linkSystemLibrary2("lldMachO", .{ .preferred_link_mode = .static });
-    //     exe_unit_tests.linkSystemLibrary2("lldCOFF", .{ .preferred_link_mode = .static });
-    //     exe_unit_tests.linkSystemLibrary2("lldWasm", .{ .preferred_link_mode = .static });
-    //     exe_unit_tests.linkSystemLibrary2("lldMinGW", .{ .preferred_link_mode = .static });
-    //     exe_unit_tests.linkSystemLibrary2("z", .{ .preferred_link_mode = .static });
-    // }
+        // Link essential LLD libraries (static linking approach)
+        exe_unit_tests.addLibraryPath(.{ .cwd_relative = lld_lib_dir });
+        exe_unit_tests.linkSystemLibrary2("lldCommon", .{ .preferred_link_mode = .static });
+        exe_unit_tests.linkSystemLibrary2("lldELF", .{ .preferred_link_mode = .static });
+        exe_unit_tests.linkSystemLibrary2("lldMachO", .{ .preferred_link_mode = .static });
+        exe_unit_tests.linkSystemLibrary2("lldCOFF", .{ .preferred_link_mode = .static });
+        exe_unit_tests.linkSystemLibrary2("lldWasm", .{ .preferred_link_mode = .static });
+        exe_unit_tests.linkSystemLibrary2("lldMinGW", .{ .preferred_link_mode = .static });
+        exe_unit_tests.linkSystemLibrary2("z", .{ .preferred_link_mode = .static }); // zlib for compression
+        exe_unit_tests.addCSourceFile(.{
+            .file = b.path("src/lld_wrapper.cpp"),
+            .flags = &.{"-std=c++17"},
+        });
+    }
 
-    // const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
+    const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 
-    // // Similar to creating the run step earlier, this exposes a `test` step to
-    // // the `zig build --help` menu, providing a way for the user to request
-    // // running the unit tests.
-    // const test_step = b.step("test", "Run unit tests");
-    // test_step.dependOn(&run_exe_unit_tests.step);
+    // Similar to creating the run step earlier, this exposes a `test` step to
+    // the `zig build --help` menu, providing a way for the user to request
+    // running the unit tests.
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_exe_unit_tests.step);
 }
