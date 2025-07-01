@@ -503,7 +503,14 @@ pub const CodeGen = struct {
         if (is_darwin) {
             // Mach-O executable arguments
             try args.append(try self.allocator.dupeZ(u8, "-arch"));
-            try args.append(try self.allocator.dupeZ(u8, if (std.mem.indexOf(u8, target_triple, "arm64") != null) "arm64" else "x86_64"));
+            // Extract architecture from target_triple (e.g., "aarch64-apple-darwin" -> "arm64")
+            var arch_end: usize = 0;
+            while (arch_end < target_triple.len and target_triple[arch_end] != '-') : (arch_end += 1) {}
+            var arch = target_triple[0..arch_end];
+            if (std.mem.eql(u8, arch, "aarch64")) {
+                arch = "arm64";
+            }
+            try args.append(try self.allocator.dupeZ(u8, arch));
             try args.append(try self.allocator.dupeZ(u8, "-platform_version"));
             try args.append(try self.allocator.dupeZ(u8, "macos"));
             try args.append(try self.allocator.dupeZ(u8, "10.15"));
@@ -528,6 +535,7 @@ pub const CodeGen = struct {
         try args.append(try self.allocator.dupeZ(u8, obj_path));
 
         // Call lld_main with all arguments
+        std.debug.print("Arguments {s}", .{args.items});
         const result = lld_main(args.items.ptr, @intCast(args.items.len));
 
         if (result != 0) {
@@ -630,7 +638,14 @@ pub const CodeGen = struct {
         if (is_darwin) {
             // Mach-O shared library (dylib) arguments
             try args.append(try self.allocator.dupeZ(u8, "-arch"));
-            try args.append(try self.allocator.dupeZ(u8, if (std.mem.indexOf(u8, target_triple, "arm64") != null) "arm64" else "x86_64"));
+            // Extract architecture from target_triple (e.g., "arm64-apple-darwin" -> "arm64")
+            var arch_end: usize = 0;
+            while (arch_end < target_triple.len and target_triple[arch_end] != '-') : (arch_end += 1) {}
+            var arch = target_triple[0..arch_end];
+            if (std.mem.eql(u8, arch, "aarch64")) {
+                arch = "arm64";
+            }
+            try args.append(try self.allocator.dupeZ(u8, arch));
             try args.append(try self.allocator.dupeZ(u8, "-platform_version"));
             try args.append(try self.allocator.dupeZ(u8, "macos"));
             try args.append(try self.allocator.dupeZ(u8, "10.15"));
