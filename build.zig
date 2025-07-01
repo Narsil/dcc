@@ -2,15 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 // Add this function to your build.zig file
-fn buildLldWrapper(b: *std.Build) *std.Build.Step {
-    // Get environment variables for library paths
-    const llvm_include_dir = std.process.getEnvVarOwned(b.allocator, "LLVM_INCLUDE_DIR") catch "/usr/include";
-    const lld_include_dir = std.process.getEnvVarOwned(b.allocator, "LLD_INCLUDE_DIR") catch "/usr/include";
-    const lld_lib_dir = std.process.getEnvVarOwned(b.allocator, "LLD_LIB_DIR") catch "/usr/lib";
+fn buildLldWrapper(b: *std.Build, llvm_include_dir: []u8, lld_include_dir: []u8, lld_lib_dir: []u8) *std.Build.Step {
     const libstdcxx_path = std.process.getEnvVarOwned(b.allocator, "LIBSTDCXX_PATH") catch "/nix/store/sa7j7cddyblhcb3ch3ds10w7nw75yjj1-gcc-14.3.0/lib/gcc/x86_64-unknown-linux-gnu/14.3.0/../../../libstdc++.a";
-    defer if (!std.mem.eql(u8, llvm_include_dir, "/usr/include")) b.allocator.free(llvm_include_dir);
-    defer if (!std.mem.eql(u8, lld_include_dir, "/usr/include")) b.allocator.free(lld_include_dir);
-    defer if (!std.mem.eql(u8, lld_lib_dir, "/usr/lib")) b.allocator.free(lld_lib_dir);
     defer if (!std.mem.eql(u8, libstdcxx_path, "/nix/store/sa7j7cddyblhcb3ch3ds10w7nw75yjj1-gcc-14.3.0/lib/gcc/x86_64-unknown-linux-gnu/14.3.0/../../../libstdc++.a")) b.allocator.free(libstdcxx_path);
 
     // Step 1: Compile lld_wrapper.cpp to object file using g++ directly
@@ -69,7 +62,7 @@ fn buildLldWrapper(b: *std.Build) *std.Build.Step {
 // Although this function looks imperative, note that its job is to
 // declaratively construct a build graph that will be executed by an external
 // runner.
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) !void {
     // Standard target options allows the person running `zig build` to choose
     // what target to build for. Here we do not override the defaults, which
     // means any target is allowed, and the default is native. Other options
@@ -103,18 +96,18 @@ pub fn build(b: *std.Build) void {
     exe.linkLibCpp();
 
     // Get library directories from environment
-    const llvm_include_dir = std.process.getEnvVarOwned(b.allocator, "LLVM_INCLUDE_DIR") catch null;
-    const llvm_lib_dir = std.process.getEnvVarOwned(b.allocator, "LLVM_LIB_DIR") catch null;
-    const lld_include_dir = std.process.getEnvVarOwned(b.allocator, "LLD_INCLUDE_DIR") catch null;
-    const lld_lib_dir = std.process.getEnvVarOwned(b.allocator, "LLD_LIB_DIR") catch null;
-    defer if (llvm_include_dir) |dir| b.allocator.free(dir);
-    defer if (llvm_lib_dir) |dir| b.allocator.free(dir);
-    defer if (lld_include_dir) |dir| b.allocator.free(dir);
-    defer if (lld_lib_dir) |dir| b.allocator.free(dir);
+    const llvm_include_dir = try std.process.getEnvVarOwned(b.allocator, "LLVM_INCLUDE_DIR");
+    const llvm_lib_dir = try std.process.getEnvVarOwned(b.allocator, "LLVM_LIB_DIR");
+    const lld_include_dir = try std.process.getEnvVarOwned(b.allocator, "LLD_INCLUDE_DIR");
+    const lld_lib_dir = try std.process.getEnvVarOwned(b.allocator, "LLD_LIB_DIR");
+    defer b.allocator.free(llvm_include_dir);
+    defer b.allocator.free(llvm_lib_dir);
+    defer b.allocator.free(lld_include_dir);
+    defer b.allocator.free(lld_lib_dir);
 
-    exe.addIncludePath(.{ .cwd_relative = llvm_include_dir orelse "/usr/include" });
-    exe.addIncludePath(.{ .cwd_relative = lld_include_dir orelse "/usr/include" });
-    exe.addLibraryPath(.{ .cwd_relative = llvm_lib_dir orelse "/usr/lib" });
+    exe.addIncludePath(.{ .cwd_relative = llvm_include_dir });
+    exe.addLibraryPath(.{ .cwd_relative = llvm_lib_dir });
+    // exe.addIncludePath(.{ .cwd_relative = lld_include_dir });
     exe.addLibraryPath(.{ .cwd_relative = "./" });
 
     exe.linkSystemLibrary2("LLVM", .{ .preferred_link_mode = .static });
@@ -123,7 +116,7 @@ pub fn build(b: *std.Build) void {
     exe.linkSystemLibrary("pthread"); // threading library
     // exe.addCSourceFile(.{ .file = b.path("src/llvm_c_api.h") });
     if (builtin.target.os.tag == .linux) {
-        const lld_wrapper_step = buildLldWrapper(b);
+        const lld_wrapper_step = buildLldWrapper(b, llvm_include_dir, lld_include_dir, lld_lib_dir);
 
         // Link with our comprehensive static library (depends on lld_wrapper_step)
         exe.addObjectFile(b.path("liblldwrapper.a"));
@@ -131,20 +124,18 @@ pub fn build(b: *std.Build) void {
     } else {
 
         // Link essential LLD libraries (static linking approach)
-        if (lld_lib_dir) |lib_dir| {
-            exe.addLibraryPath(.{ .cwd_relative = lib_dir });
-            exe.linkSystemLibrary2("lldCommon", .{ .preferred_link_mode = .static });
-            exe.linkSystemLibrary2("lldELF", .{ .preferred_link_mode = .static });
-            exe.linkSystemLibrary2("lldMachO", .{ .preferred_link_mode = .static });
-            exe.linkSystemLibrary2("lldCOFF", .{ .preferred_link_mode = .static });
-            exe.linkSystemLibrary2("lldWasm", .{ .preferred_link_mode = .static });
-            exe.linkSystemLibrary2("lldMinGW", .{ .preferred_link_mode = .static });
-            exe.linkSystemLibrary2("z", .{ .preferred_link_mode = .static }); // zlib for compression
-            exe.addCSourceFile(.{
-                .file = b.path("src/lld_wrapper.cpp"),
-                .flags = &.{"-std=c++17"},
-            });
-        }
+        exe.addLibraryPath(.{ .cwd_relative = lld_lib_dir });
+        exe.linkSystemLibrary2("lldCommon", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("lldELF", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("lldMachO", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("lldCOFF", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("lldWasm", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("lldMinGW", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("z", .{ .preferred_link_mode = .static }); // zlib for compression
+        exe.addCSourceFile(.{
+            .file = b.path("src/lld_wrapper.cpp"),
+            .flags = &.{"-std=c++17"},
+        });
     }
 
     // Add C++ wrapper for lld
