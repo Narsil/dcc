@@ -1,11 +1,66 @@
-//! By convention, main.zig is where your main function lives in the case that
-//! you are building an executable. If you are making a library, the convention
-//! is to delete this file and start with root.zig instead.
+//! By convention, main.zig is where your main function lives when building 
+//! an executable. This is the main entry point for the toy compiler.
 
 const std = @import("std");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const codegen = @import("codegen.zig");
+
+/// Target information parsed from target triplet
+const TargetInfo = struct {
+    arch: []const u8,
+    os: []const u8,
+    abi: ?[]const u8,
+    
+    fn parseFromTriple(allocator: std.mem.Allocator, triple: []const u8) !TargetInfo {
+        var parts = std.mem.splitSequence(u8, triple, "-");
+        
+        const arch = parts.next() orelse return error.InvalidTargetTriple;
+        const vendor_or_os = parts.next() orelse return error.InvalidTargetTriple;
+        
+        // Handle different triplet formats:
+        // arm64-apple-darwin, x86_64-pc-linux-gnu, x86_64-linux-gnu, etc.
+        var os: []const u8 = undefined;
+        var abi: ?[]const u8 = null;
+        
+        if (std.mem.eql(u8, vendor_or_os, "apple")) {
+            os = parts.next() orelse return error.InvalidTargetTriple;
+        } else if (std.mem.eql(u8, vendor_or_os, "pc")) {
+            os = parts.next() orelse return error.InvalidTargetTriple;
+            abi = parts.next(); // Optional ABI like "gnu"
+        } else {
+            // Assume vendor_or_os is actually the OS (like x86_64-linux-gnu)
+            os = vendor_or_os;
+            abi = parts.next(); // Optional ABI
+        }
+        
+        return TargetInfo{
+            .arch = try allocator.dupe(u8, arch),
+            .os = try allocator.dupe(u8, os),
+            .abi = if (abi) |a| try allocator.dupe(u8, a) else null,
+        };
+    }
+    
+    fn deinit(self: *const TargetInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.arch);
+        allocator.free(self.os);
+        if (self.abi) |abi| {
+            allocator.free(abi);
+        }
+    }
+    
+    fn getOsTag(self: *const TargetInfo) std.Target.Os.Tag {
+        if (std.mem.eql(u8, self.os, "darwin") or std.mem.eql(u8, self.os, "macos")) {
+            return .macos;
+        } else if (std.mem.eql(u8, self.os, "linux")) {
+            return .linux;
+        } else if (std.mem.eql(u8, self.os, "windows")) {
+            return .windows;
+        } else {
+            return .other;
+        }
+    }
+};
 
 fn hasMainFunction(ast: parser.ASTNode) bool {
     switch (ast) {
@@ -23,6 +78,8 @@ fn hasMainFunction(ast: parser.ASTNode) bool {
     return false;
 }
 
+
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -32,11 +89,47 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
     
     if (args.len < 2) {
-        std.debug.print("Usage: {s} <source_file>\n", .{args[0]});
+        std.debug.print("Usage: {s} <source_file> [--target <target_triplet>]\n", .{args[0]});
+        std.debug.print("Example: {s} program.toy --target x86_64-pc-linux-gnu\n", .{args[0]});
         return;
     }
     
-    const source_file = args[1];
+    var source_file: []const u8 = undefined;
+    var target_triple: ?[]const u8 = null;
+    
+    // Parse arguments
+    var i: usize = 1;
+    while (i < args.len) {
+        const arg = args[i];
+        
+        if (std.mem.eql(u8, arg, "--target")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: --target requires a target triplet\n", .{});
+                return;
+            }
+            target_triple = args[i];
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            std.debug.print("Error: Unknown option: {s}\n", .{arg});
+            return;
+        } else {
+            source_file = arg;
+        }
+        i += 1;
+    }
+    
+    // Parse target information if provided
+    var target_info: ?TargetInfo = null;
+    defer if (target_info) |*info| info.deinit(allocator);
+    
+    if (target_triple) |triple| {
+        target_info = TargetInfo.parseFromTriple(allocator, triple) catch |err| {
+            std.debug.print("Error: Invalid target triplet '{s}': {}\n", .{ triple, err });
+            return;
+        };
+        std.debug.print("Cross-compiling for target: {s} ({s}-{s})\n", .{ triple, target_info.?.arch, target_info.?.os });
+    }
+    
     std.debug.print("Compiling: {s}\n", .{source_file});
     
     // Read source file
@@ -72,45 +165,18 @@ pub fn main() !void {
     try code_gen.generate(ast);
     code_gen.printIR();
     
-    // Generate object file
-    const obj_file = "output.o";
-    try code_gen.generateObjectFile(obj_file);
-    std.debug.print("Generated object file: {s}\n", .{obj_file});
+    // Use LLVM directly for linking (no need for external linker detection)
+    const actual_target_triple = if (target_triple) |triple| triple else null;
     
     if (has_main) {
-        // Create executable binary
+        // Generate executable binary
         const bin_file = "output";
-        const result = try std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = &[_][]const u8{ "gcc", obj_file, "-o", bin_file },
-        });
-        defer allocator.free(result.stdout);
-        defer allocator.free(result.stderr);
-        
-        if (result.term.Exited == 0) {
-            std.debug.print("Generated executable binary: {s}\n", .{bin_file});
-        } else {
-            std.debug.print("Error creating executable:\n{s}\n", .{result.stderr});
-        }
+        try code_gen.generateExecutable(bin_file, actual_target_triple);
     } else {
-        // Create shared library
-        const so_file = "output.so";
-        const result = try std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = &[_][]const u8{ "gcc", "-shared", "-fPIC", obj_file, "-o", so_file },
-        });
-        defer allocator.free(result.stdout);
-        defer allocator.free(result.stderr);
-        
-        if (result.term.Exited == 0) {
-            std.debug.print("Generated shared library: {s}\n", .{so_file});
-        } else {
-            std.debug.print("Error creating shared library:\n{s}\n", .{result.stderr});
-        }
+        // Generate shared library
+        const lib_file = "output";
+        try code_gen.generateSharedLibrary(lib_file, actual_target_triple);
     }
-    
-    // Clean up object file
-    std.fs.cwd().deleteFile(obj_file) catch {};
     
     std.debug.print("Compilation complete!\n", .{});
 }
@@ -152,10 +218,6 @@ test "simple test" {
     try std.testing.expectEqual(@as(i32, 42), list.pop());
 }
 
-test "use other module" {
-    try std.testing.expectEqual(@as(i32, 150), lib.add(100, 50));
-}
-
 test "fuzz example" {
     const Context = struct {
         fn testOne(context: @This(), input: []const u8) anyerror!void {
@@ -167,5 +229,4 @@ test "fuzz example" {
     try std.testing.fuzz(Context{}, Context.testOne, .{});
 }
 
-/// This imports the separate module containing `root.zig`. Take a look in `build.zig` for details.
-const lib = @import("dcc_lib");
+

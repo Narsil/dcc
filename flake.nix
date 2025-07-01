@@ -28,12 +28,17 @@
             buildInputs = with pkgs; [
               zig
               llvm
+              lld
               gemini-cli
+              zls
+              zlib
             ];
 
             # Set LLVM environment variables for build.zig
             LLVM_INCLUDE_DIR = "${llvm.dev}/include";
             LLVM_LIB_DIR = "${llvm.lib}/lib";
+            LLD_INCLUDE_DIR = "${lld.dev}/include";
+            LLD_LIB_DIR = "${lld.lib}/lib";
           };
       });
     };
