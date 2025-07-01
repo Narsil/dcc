@@ -64,6 +64,45 @@ fn buildLldWrapper(b: *std.Build, llvm_include_dir: []u8, lld_include_dir: []u8,
     return &cleanup_cmd.step;
 }
 
+fn createLinking(b: *std.Build, exe: *std.Build.Step.Compile, llvm_include_dir: []u8, llvm_lib_dir: []u8, lld_include_dir: []u8, lld_lib_dir: []u8, use_wrapper: bool) void {
+    // Copy build configuration to tests
+    exe.linkLibC();
+    exe.linkLibCpp();
+    exe.linkSystemLibrary2("LLVM", .{ .preferred_link_mode = .static });
+    exe.linkSystemLibrary("z"); // zlib for compression (required by LLD)
+    exe.linkSystemLibrary("dl"); // dynamic linking library
+    exe.linkSystemLibrary("pthread"); // threading library
+
+    exe.addIncludePath(.{ .cwd_relative = llvm_include_dir });
+    exe.addLibraryPath(.{ .cwd_relative = llvm_lib_dir });
+
+    // Link essential LLD libraries for tests (static linking)
+    exe.addIncludePath(.{ .cwd_relative = lld_include_dir });
+    if (builtin.target.os.tag == .linux) {
+        const lld_wrapper_step = buildLldWrapper(b, llvm_include_dir, lld_include_dir, lld_lib_dir);
+        // Link with our comprehensive static library (depends on lld_wrapper_step)
+        exe.addObjectFile(b.path("liblldwrapper.a"));
+        exe.step.dependOn(lld_wrapper_step); // Main exe depends on LLD wrapper
+    } else {
+
+        // Link essential LLD libraries (static linking approach)
+        exe.addLibraryPath(.{ .cwd_relative = lld_lib_dir });
+        exe.linkSystemLibrary2("lldCommon", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("lldELF", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("lldMachO", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("lldCOFF", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("lldWasm", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("lldMinGW", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("z", .{ .preferred_link_mode = .static }); // zlib for compression
+        if (use_wrapper) {
+            exe.addCSourceFile(.{
+                .file = b.path("src/lld_wrapper.cpp"),
+                .flags = &.{"-std=c++17"},
+            });
+        }
+    }
+}
+
 // Although this function looks imperative, note that its job is to
 // declaratively construct a build graph that will be executed by an external
 // runner.
@@ -115,33 +154,7 @@ pub fn build(b: *std.Build) !void {
     // exe.addIncludePath(.{ .cwd_relative = lld_include_dir });
     exe.addLibraryPath(.{ .cwd_relative = "./" });
 
-    exe.linkSystemLibrary2("LLVM", .{ .preferred_link_mode = .static });
-    exe.linkSystemLibrary("z"); // zlib for compression (required by LLD)
-    exe.linkSystemLibrary("dl"); // dynamic linking library
-    exe.linkSystemLibrary("pthread"); // threading library
-    // exe.addCSourceFile(.{ .file = b.path("src/llvm_c_api.h") });
-    if (builtin.target.os.tag == .linux) {
-        const lld_wrapper_step = buildLldWrapper(b, llvm_include_dir, lld_include_dir, lld_lib_dir);
-
-        // Link with our comprehensive static library (depends on lld_wrapper_step)
-        exe.addObjectFile(b.path("liblldwrapper.a"));
-        exe.step.dependOn(lld_wrapper_step); // Main exe depends on LLD wrapper
-    } else {
-
-        // Link essential LLD libraries (static linking approach)
-        exe.addLibraryPath(.{ .cwd_relative = lld_lib_dir });
-        exe.linkSystemLibrary2("lldCommon", .{ .preferred_link_mode = .static });
-        exe.linkSystemLibrary2("lldELF", .{ .preferred_link_mode = .static });
-        exe.linkSystemLibrary2("lldMachO", .{ .preferred_link_mode = .static });
-        exe.linkSystemLibrary2("lldCOFF", .{ .preferred_link_mode = .static });
-        exe.linkSystemLibrary2("lldWasm", .{ .preferred_link_mode = .static });
-        exe.linkSystemLibrary2("lldMinGW", .{ .preferred_link_mode = .static });
-        exe.linkSystemLibrary2("z", .{ .preferred_link_mode = .static }); // zlib for compression
-        exe.addCSourceFile(.{
-            .file = b.path("src/lld_wrapper.cpp"),
-            .flags = &.{"-std=c++17"},
-        });
-    }
+    createLinking(b, exe, llvm_include_dir, llvm_lib_dir, lld_include_dir, lld_lib_dir, true);
 
     // Add C++ wrapper for lld
 
@@ -183,36 +196,7 @@ pub fn build(b: *std.Build) !void {
         .root_module = exe_mod,
     });
 
-    // Copy build configuration to tests
-    exe_unit_tests.linkLibC();
-    exe_unit_tests.linkLibCpp();
-
-    exe_unit_tests.addIncludePath(.{ .cwd_relative = llvm_include_dir });
-    exe_unit_tests.addLibraryPath(.{ .cwd_relative = llvm_lib_dir });
-
-    // Link essential LLD libraries for tests (static linking)
-    exe_unit_tests.addIncludePath(.{ .cwd_relative = lld_include_dir });
-    if (builtin.target.os.tag == .linux) {
-        const lld_wrapper_step = buildLldWrapper(b, llvm_include_dir, lld_include_dir, lld_lib_dir);
-        // Link with our comprehensive static library (depends on lld_wrapper_step)
-        exe_unit_tests.addObjectFile(b.path("liblldwrapper.a"));
-        exe_unit_tests.step.dependOn(lld_wrapper_step); // Main exe depends on LLD wrapper
-    } else {
-
-        // Link essential LLD libraries (static linking approach)
-        exe_unit_tests.addLibraryPath(.{ .cwd_relative = lld_lib_dir });
-        exe_unit_tests.linkSystemLibrary2("lldCommon", .{ .preferred_link_mode = .static });
-        exe_unit_tests.linkSystemLibrary2("lldELF", .{ .preferred_link_mode = .static });
-        exe_unit_tests.linkSystemLibrary2("lldMachO", .{ .preferred_link_mode = .static });
-        exe_unit_tests.linkSystemLibrary2("lldCOFF", .{ .preferred_link_mode = .static });
-        exe_unit_tests.linkSystemLibrary2("lldWasm", .{ .preferred_link_mode = .static });
-        exe_unit_tests.linkSystemLibrary2("lldMinGW", .{ .preferred_link_mode = .static });
-        exe_unit_tests.linkSystemLibrary2("z", .{ .preferred_link_mode = .static }); // zlib for compression
-        exe_unit_tests.addCSourceFile(.{
-            .file = b.path("src/lld_wrapper.cpp"),
-            .flags = &.{"-std=c++17"},
-        });
-    }
+    createLinking(b, exe_unit_tests, llvm_include_dir, llvm_lib_dir, lld_include_dir, lld_lib_dir, false);
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 
