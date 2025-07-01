@@ -13,11 +13,8 @@ fn buildLldWrapper(b: *std.Build) *std.Build.Step {
     defer if (!std.mem.eql(u8, libstdcxx_path, "/nix/store/sa7j7cddyblhcb3ch3ds10w7nw75yjj1-gcc-14.3.0/lib/gcc/x86_64-unknown-linux-gnu/14.3.0/../../../libstdc++.a")) b.allocator.free(libstdcxx_path);
 
     // Step 1: Compile lld_wrapper.cpp to object file using g++ directly
-    const wrapper_obj_cmd = b.addSystemCommand(&.{
-        "g++", "-c", "-std=c++17", "-fPIC", "-O2",
-        "-o", "lld_wrapper.o", "src/lld_wrapper.cpp"
-    });
-    
+    const wrapper_obj_cmd = b.addSystemCommand(&.{ "g++", "-c", "-std=c++17", "-fPIC", "-O2", "-o", "lld_wrapper.o", "src/lld_wrapper.cpp" });
+
     // Add include paths
     const llvm_include_arg = b.fmt("-I{s}", .{llvm_include_dir});
     const lld_include_arg = b.fmt("-I{s}", .{lld_include_dir});
@@ -31,7 +28,7 @@ fn buildLldWrapper(b: *std.Build) *std.Build.Step {
 
     // Step 4: Use ld -r to combine all libraries with relocatable linking
     const ld_cmd = b.addSystemCommand(&.{ "ld", "-r", "-o", "comprehensive_build/combined.o" });
-    ld_cmd.addArg("lld_wrapper.o");  // Use the object file created by g++
+    ld_cmd.addArg("lld_wrapper.o"); // Use the object file created by g++
     ld_cmd.addArgs(&.{"--whole-archive"});
 
     // Add all LLD library paths
@@ -54,7 +51,7 @@ fn buildLldWrapper(b: *std.Build) *std.Build.Step {
 
     ld_cmd.addArg("--no-whole-archive");
     ld_cmd.step.dependOn(&mkdir_cmd.step);
-    ld_cmd.step.dependOn(&wrapper_obj_cmd.step);  // Depend on g++ compilation
+    ld_cmd.step.dependOn(&wrapper_obj_cmd.step); // Depend on g++ compilation
 
     // Step 5: Create the final static library
     const ar_cmd = b.addSystemCommand(&.{ "ar", "rcs", "liblldwrapper.a", "comprehensive_build/combined.o" });
@@ -123,6 +120,7 @@ pub fn build(b: *std.Build) void {
     exe.linkSystemLibrary("z"); // zlib for compression (required by LLD)
     exe.linkSystemLibrary("dl"); // dynamic linking library
     exe.linkSystemLibrary("pthread"); // threading library
+    // exe.addCSourceFile(.{ .file = b.path("src/llvm_c_api.h") });
     const lld_wrapper_step = buildLldWrapper(b);
 
     // Link with our comprehensive static library (depends on lld_wrapper_step)

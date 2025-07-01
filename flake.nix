@@ -14,32 +14,42 @@
         "x86_64-linux"
         "aarch64-darwin"
       ];
-
-      inherit (nixpkgs) lib;
     in
     {
-      devShells = forAllSystems (system: {
-        default =
-          with nixpkgs.legacyPackages.${system}.pkgs;
-          mkShell {
-            nativeBuildInputs = with pkgs; [
-              pkg-config
-            ];
-            buildInputs = with pkgs; [
-              zig
-              llvm
-              lld
-              gemini-cli
-              zls
-              zlib
-            ];
+      devShells = forAllSystems (
+        system:
+        let
+          pkgs = import nixpkgs {
+            inherit system;
+            config.allowUnfree = true;
 
-            # Set LLVM environment variables for build.zig
-            LLVM_INCLUDE_DIR = "${llvm.dev}/include";
-            LLVM_LIB_DIR = "${llvm.lib}/lib";
-            LLD_INCLUDE_DIR = "${lld.dev}/include";
-            LLD_LIB_DIR = "${lld.lib}/lib";
           };
-      });
+        in
+        {
+          default =
+            with pkgs;
+            mkShell {
+              nativeBuildInputs = with pkgs; [
+                pkg-config
+              ];
+              buildInputs = with pkgs; [
+                zig
+                llvm
+                lld
+                gemini-cli
+                zls
+                gdb
+                claude-code
+                zlib
+              ];
+
+              # Set LLVM environment variables for build.zig
+              LLVM_INCLUDE_DIR = "${llvm.dev}/include";
+              LLVM_LIB_DIR = "${llvm.lib}/lib";
+              LLD_INCLUDE_DIR = "${lld.dev}/include";
+              LLD_LIB_DIR = "${lld.lib}/lib";
+            };
+        }
+      );
     };
 }

@@ -24,6 +24,8 @@ extern fn LLVMDisposeBuilder(builder: LLVMBuilderRef) void;
 extern fn LLVMInt64TypeInContext(ctx: LLVMContextRef) LLVMTypeRef;
 extern fn LLVMInt32TypeInContext(ctx: LLVMContextRef) LLVMTypeRef;
 extern fn LLVMVoidTypeInContext(ctx: LLVMContextRef) LLVMTypeRef;
+extern fn LLVMInt8TypeInContext(ctx: LLVMContextRef) LLVMTypeRef;
+extern fn LLVMArrayType(element_type: LLVMTypeRef, element_count: c_uint) LLVMTypeRef;
 extern fn LLVMFunctionType(return_type: LLVMTypeRef, param_types: ?[*]const LLVMTypeRef, param_count: c_uint, is_var_arg: c_int) LLVMTypeRef;
 extern fn LLVMAddFunction(module: LLVMModuleRef, name: [*:0]const u8, function_type: LLVMTypeRef) LLVMValueRef;
 extern fn LLVMAppendBasicBlockInContext(ctx: LLVMContextRef, function: LLVMValueRef, name: [*:0]const u8) LLVMBasicBlockRef;
@@ -47,9 +49,25 @@ extern fn LLVMSetInitializer(global_var: LLVMValueRef, constant_val: LLVMValueRe
 extern fn LLVMBuildAlloca(builder: LLVMBuilderRef, type_: LLVMTypeRef, name: [*:0]const u8) LLVMValueRef;
 extern fn LLVMBuildStore(builder: LLVMBuilderRef, value: LLVMValueRef, ptr: LLVMValueRef) LLVMValueRef;
 extern fn LLVMBuildLoad2(builder: LLVMBuilderRef, type_: LLVMTypeRef, ptr: LLVMValueRef, name: [*:0]const u8) LLVMValueRef;
+extern fn LLVMSetAlignment(V: LLVMValueRef, Bytes: c_uint) void;
 extern fn LLVMGetParam(function: LLVMValueRef, index: c_uint) LLVMValueRef;
 extern fn LLVMPrintModuleToString(module: LLVMModuleRef) [*:0]u8;
 extern fn LLVMDisposeMessage(message: [*:0]u8) void;
+extern fn LLVMGetBasicBlockParent(BB: LLVMBasicBlockRef) LLVMValueRef;
+extern fn LLVMGetInsertBlock(Builder: LLVMBuilderRef) LLVMBasicBlockRef;
+extern fn LLVMGetValueName(Val: LLVMValueRef) [*:0]const u8;
+extern fn LLVMBuildSExt(builder: LLVMBuilderRef, val: LLVMValueRef, dest_ty: LLVMTypeRef, name: [*:0]const u8) LLVMValueRef;
+
+// Function attribute management for stack alignment
+extern fn LLVMCreateEnumAttribute(ctx: LLVMContextRef, kind_id: c_uint, val: u64) LLVMAttributeRef;
+extern fn LLVMAddAttributeAtIndex(fn_: LLVMValueRef, idx: c_uint, attr: LLVMAttributeRef) void;
+extern fn LLVMGetEnumAttributeKindForName(name: [*:0]const u8, s_len: usize) c_uint;
+
+// LLVM attribute types
+const LLVMAttributeRef = *opaque {};
+
+// Function attribute indices
+const LLVMAttributeFunctionIndex = 0xffffffff;
 
 // Target and code generation - use target-specific functions
 extern fn LLVMInitializeX86TargetInfo() void;
@@ -95,14 +113,16 @@ extern fn LLVMCreateMemoryBufferWithMemoryRange(InputData: [*]const u8, InputDat
 extern fn LLVMGlobalGetValueType(Global: LLVMValueRef) LLVMTypeRef;
 
 // LLVM Inline Assembly APIs
-extern fn LLVMGetInlineAsm(
-    ty: LLVMTypeRef,
-    asm_string: [*:0]const u8,
-    constraints: [*:0]const u8,
-    has_side_effects: c_int,
-    align_stack: c_int,
-    dialect: c_int,
-    can_throw: c_int,
+pub extern "c" fn LLVMGetInlineAsm(
+    Ty: LLVMTypeRef, // Function type of the inline assembly
+    AsmString: [*c]const u8, // The assembly code string
+    AsmStringSize: usize, // Length of the assembly string
+    Constraints: [*c]const u8, // Constraints string for operands
+    ConstraintsSize: usize, // Length of the constraints string
+    HasSideEffects: c_int, // Does the assembly have side effects? (0 for false, 1 for true)
+    IsAlignStack: c_int, // Does the assembly need stack alignment? (0 for false, 1 for true)
+    Dialect: c_int, // Assembly dialect (e.g., LLVMInlineAsmDialectATT)
+    CanThrow: c_int, // Can the assembly throw an exception? (0 for false, 1 for true)
 ) LLVMValueRef;
 
 // LLD (LLVM Linker) C wrapper API
@@ -232,6 +252,11 @@ pub const CodeGen = struct {
 
     fn generateFunction(self: *CodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration)) CodeGenError!void {
         const int64_type = LLVMInt64TypeInContext(self.context);
+        const int32_type = LLVMInt32TypeInContext(self.context);
+
+        // Use i32 return type for main function to match C runtime expectations
+        const is_main = std.mem.eql(u8, func.name, "main");
+        const return_type = if (is_main) int32_type else int64_type;
 
         // Create parameter types array
         const param_types = try self.allocator.alloc(LLVMTypeRef, func.parameters.len);
@@ -242,13 +267,17 @@ pub const CodeGen = struct {
         }
 
         // Create function type
-        const function_type = LLVMFunctionType(int64_type, param_types.ptr, @intCast(param_types.len), 0);
+        const function_type = LLVMFunctionType(return_type, param_types.ptr, @intCast(param_types.len), 0);
 
         // Create function
         const name_z = try self.allocator.dupeZ(u8, func.name);
         defer self.allocator.free(name_z);
 
         const llvm_function = LLVMAddFunction(self.module, name_z.ptr, function_type);
+
+        // Set proper stack alignment attributes for x86-64 System V ABI compliance
+        self.setStackAlignmentAttributes(llvm_function);
+
         try self.functions.put(try self.allocator.dupe(u8, func.name), llvm_function);
 
         // Create entry basic block
@@ -262,8 +291,20 @@ pub const CodeGen = struct {
             defer self.allocator.free(param_name_z);
 
             const alloca = LLVMBuildAlloca(self.builder, int64_type, param_name_z.ptr);
-            _ = LLVMBuildStore(self.builder, param_value, alloca);
+            LLVMSetAlignment(alloca, 16); // 16-byte alignment for x86-64 System V ABI
+            const store_inst = LLVMBuildStore(self.builder, param_value, alloca);
+            LLVMSetAlignment(store_inst, 16); // Match alloca alignment
             try self.variables.put(try self.allocator.dupe(u8, param_name), alloca);
+        }
+
+        // Add dummy alloca for stack alignment in main
+        if (is_main) {
+            // Allocate 16 bytes of padding so total local size is multiple of 16 (2x i64 = 16 + padding = 32)
+            const int8_type = LLVMInt8TypeInContext(self.context);
+            const dummy_array_type = LLVMArrayType(int8_type, 16); // 16 bytes
+            const dummy_name = "dummy_padding";
+            const dummy_alloca = LLVMBuildAlloca(self.builder, dummy_array_type, dummy_name);
+            LLVMSetAlignment(dummy_alloca, 16);
         }
 
         // Generate function body
@@ -281,8 +322,10 @@ pub const CodeGen = struct {
         defer self.allocator.free(name_z);
 
         const alloca = LLVMBuildAlloca(self.builder, int64_type, name_z.ptr);
+        LLVMSetAlignment(alloca, 16); // 16-byte alignment for x86-64 System V ABI
         const value = try self.generateExpression(var_decl.value.*);
-        _ = LLVMBuildStore(self.builder, value, alloca);
+        const store_inst = LLVMBuildStore(self.builder, value, alloca);
+        LLVMSetAlignment(store_inst, 16); // Match alloca alignment
 
         try self.variables.put(try self.allocator.dupe(u8, var_decl.name), alloca);
     }
@@ -290,7 +333,19 @@ pub const CodeGen = struct {
     fn generateReturn(self: *CodeGen, ret: @TypeOf(@as(parser.ASTNode, undefined).return_statement)) CodeGenError!void {
         if (ret.value) |value| {
             const llvm_value = try self.generateExpression(value.*);
-            _ = LLVMBuildRet(self.builder, llvm_value);
+
+            // Check if we're in the main function and need to convert i64 to i32
+            const current_function = LLVMGetBasicBlockParent(LLVMGetInsertBlock(self.builder));
+            const function_name = std.mem.span(LLVMGetValueName(current_function));
+
+            if (std.mem.eql(u8, function_name, "main")) {
+                // Convert i64 to i32 for main function return
+                const int32_type = LLVMInt32TypeInContext(self.context);
+                const truncated_value = LLVMBuildTrunc(self.builder, llvm_value, int32_type, "main_return");
+                _ = LLVMBuildRet(self.builder, truncated_value);
+            } else {
+                _ = LLVMBuildRet(self.builder, llvm_value);
+            }
         } else {
             _ = LLVMBuildRetVoid(self.builder);
         }
@@ -307,7 +362,9 @@ pub const CodeGen = struct {
                     const int64_type = LLVMInt64TypeInContext(self.context);
                     const name_z = try self.allocator.dupeZ(u8, ident.name);
                     defer self.allocator.free(name_z);
-                    return LLVMBuildLoad2(self.builder, int64_type, alloca, name_z.ptr);
+                    const load_inst = LLVMBuildLoad2(self.builder, int64_type, alloca, name_z.ptr);
+                    LLVMSetAlignment(load_inst, 16); // Match alloca alignment
+                    return load_inst;
                 } else {
                     return error.UndefinedVariable;
                 }
@@ -393,7 +450,7 @@ pub const CodeGen = struct {
             return error.TargetError;
         }
 
-        // Add _start function for Linux targets
+        // Temporarily disable _start function to test main computation alignment
         const is_linux = std.mem.indexOf(u8, final_triple, "linux") != null;
         if (is_linux) {
             try self.generateStartFunction();
@@ -921,44 +978,62 @@ pub const CodeGen = struct {
 
     fn generateStartFunction(self: *CodeGen) CodeGenError!void {
         // Create _start function for Linux ELF executables
-        // This function calls main() and then exits properly using syscall
+        // This function calls main() and returns the exit code
 
-        const void_type = LLVMVoidTypeInContext(self.context);
-        const i64_type = LLVMInt64TypeInContext(self.context);
-        const start_function_type = LLVMFunctionType(void_type, null, 0, 0);
+        const i32_type = LLVMInt32TypeInContext(self.context);
+        const start_function_type = LLVMFunctionType(i32_type, null, 0, 0);
         const start_function = LLVMAddFunction(self.module, "_start", start_function_type);
+
+        // Set proper stack alignment attributes for x86-64 System V ABI compliance
+        self.setStackAlignmentAttributes(start_function);
 
         // Create basic block
         const entry_block = LLVMAppendBasicBlockInContext(self.context, start_function, "entry");
         LLVMPositionBuilderAtEnd(self.builder, entry_block);
 
+        // Add dummy alloca for stack alignment in _start (accounts for call instruction push)
+        // Allocate 8 bytes of padding to help ensure 16-byte alignment before calling main
+        const int8_type = LLVMInt8TypeInContext(self.context);
+        const dummy_array_type = LLVMArrayType(int8_type, 8); // 8 bytes
+        const dummy_name_start = "dummy_padding_start";
+        const dummy_alloca_start = LLVMBuildAlloca(self.builder, dummy_array_type, dummy_name_start);
+        LLVMSetAlignment(dummy_alloca_start, 16);
+
         // Get the main function
-        const main_function = LLVMGetNamedFunction(self.module, "main");
-        if (main_function == null) {
+        const main_function_ = LLVMGetNamedFunction(self.module, "main");
+        if (main_function_ == null) {
             std.debug.print("Error: main function not found when generating _start\n", .{});
             return error.CodeGenError;
         }
+        const main_function = main_function_.?;
 
-        // Call main()
-        const main_function_type = LLVMFunctionType(i64_type, null, 0, 0);
-        const main_result = LLVMBuildCall2(self.builder, main_function_type, main_function.?, null, 0, "main_result");
+        // Call main() - main now returns i32
+        const main_function_type = LLVMFunctionType(i32_type, null, 0, 0);
+        const exit_code = LLVMBuildCall2(self.builder, main_function_type, main_function, null, 0, "main_result");
 
-        // Convert main result to i32 and store it in a global variable for debugging
-        const i32_type = LLVMInt32TypeInContext(self.context);
-        const exit_code = LLVMBuildTrunc(self.builder, main_result, i32_type, "exit_code");
-
-        // Create a global variable to store the exit code (for debugging purposes)
-        const exit_code_global = LLVMAddGlobal(self.module, i32_type, "exit_code_result");
+        // Store the exit code in a global variable for inspection
+        const exit_code_global = LLVMAddGlobal(self.module, i32_type, "program_exit_code");
         LLVMSetInitializer(exit_code_global, LLVMConstInt(i32_type, 0, 0));
         _ = LLVMBuildStore(self.builder, exit_code, exit_code_global);
 
-        // Use infinite loop approach to avoid segfault and linking issues
-        // The exit code can be inspected using: gdb ./output -ex "break _start" -ex "run" -ex "finish" -ex "print exit_code_result" -ex "quit"
-        const loop_block = LLVMAppendBasicBlockInContext(self.context, start_function, "exit_loop");
-        _ = LLVMBuildBr(self.builder, loop_block);
+        // --- Exit the process via Linux x86_64 syscall ---
+        const void_type = LLVMVoidTypeInContext(self.context);
+        const int64_type = LLVMInt64TypeInContext(self.context);
+        const syscall_asm_ty = LLVMFunctionType(void_type, &[_]LLVMTypeRef{int64_type}, 1, 0);
+        const asm_str = "mov $$60, %rax\nmov $$1, %rdi\nsyscall"; // rax=60 (SYS_exit), rdi=status
 
-        LLVMPositionBuilderAtEnd(self.builder, loop_block);
-        _ = LLVMBuildBr(self.builder, loop_block); // Infinite loop preserves exit code
+        const syscall_inline = LLVMGetInlineAsm(syscall_asm_ty, asm_str, asm_str.len, "r", 1, // single general-purpose register input
+            1, // has side effects
+            0, // align stack
+            0, // ATT dialect
+            0 // can throw
+        );
+
+        const exit_code_64 = LLVMBuildSExt(self.builder, exit_code, int64_type, "exit_code64");
+        _ = LLVMBuildCall2(self.builder, syscall_asm_ty, syscall_inline, &[_]LLVMValueRef{exit_code_64}, 1, "");
+
+        // Mark unreachable as the syscall terminates the program
+        _ = LLVMBuildUnreachable(self.builder);
     }
 
     pub fn clearVariables(self: *CodeGen) void {
@@ -968,6 +1043,32 @@ pub const CodeGen = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.variables.clearAndFree();
+    }
+
+    // Helper function to set stack alignment attributes on functions
+    fn setStackAlignmentAttributes(self: *CodeGen, function: LLVMValueRef) void {
+        // Set stack realignment for x86-64 System V ABI compliance
+        const stackrealign_attr_name = "stackrealign";
+        const stackrealign_kind = LLVMGetEnumAttributeKindForName(stackrealign_attr_name.ptr, stackrealign_attr_name.len);
+        const stackrealign_attr = LLVMCreateEnumAttribute(self.context, stackrealign_kind, 0);
+        LLVMAddAttributeAtIndex(function, LLVMAttributeFunctionIndex, stackrealign_attr);
+
+        // Set unwind table for proper exception handling and debugging
+        const uwtable_attr_name = "uwtable";
+        const uwtable_kind = LLVMGetEnumAttributeKindForName(uwtable_attr_name.ptr, uwtable_attr_name.len);
+        const uwtable_attr = LLVMCreateEnumAttribute(self.context, uwtable_kind, 2); // sync uwtable
+        LLVMAddAttributeAtIndex(function, LLVMAttributeFunctionIndex, uwtable_attr);
+
+        // Set proper calling convention for System V ABI
+        LLVMSetFunctionCallConv(function, 0); // C calling convention (System V ABI)
+
+        // Ensure the backend maintains at least 16-byte stack alignment
+        const alignstack_attr_name = "alignstack"; // LLVM attribute: alignstack(<alignment>)
+        const alignstack_kind = LLVMGetEnumAttributeKindForName(alignstack_attr_name.ptr, alignstack_attr_name.len);
+        if (alignstack_kind != 0) { // only add if LLVM recognises the attribute
+            const alignstack_attr = LLVMCreateEnumAttribute(self.context, alignstack_kind, 16);
+            LLVMAddAttributeAtIndex(function, LLVMAttributeFunctionIndex, alignstack_attr);
+        }
     }
 };
 
@@ -1030,7 +1131,7 @@ fn generateEntryPoint(module: LLVMModuleRef, context: LLVMContextRef, builder: L
         "r", // input constraint: general register
         1, // has side effects
         0, // align stack
-        0, // intel dialect
+        0, // ATT dialect
         0 // can throw
     );
 
@@ -1042,4 +1143,3 @@ fn generateEntryPoint(module: LLVMModuleRef, context: LLVMContextRef, builder: L
 
     return entry_func;
 }
-
