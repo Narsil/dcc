@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 // Add this function to your build.zig file
 fn buildLldWrapper(b: *std.Build) *std.Build.Step {
@@ -121,29 +122,32 @@ pub fn build(b: *std.Build) void {
     exe.linkSystemLibrary("dl"); // dynamic linking library
     exe.linkSystemLibrary("pthread"); // threading library
     // exe.addCSourceFile(.{ .file = b.path("src/llvm_c_api.h") });
-    const lld_wrapper_step = buildLldWrapper(b);
+    if (builtin.target.os.tag == .linux) {
+        const lld_wrapper_step = buildLldWrapper(b);
 
-    // Link with our comprehensive static library (depends on lld_wrapper_step)
-    exe.addObjectFile(b.path("liblldwrapper.a"));
-    exe.step.dependOn(lld_wrapper_step); // Main exe depends on LLD wrapper
+        // Link with our comprehensive static library (depends on lld_wrapper_step)
+        exe.addObjectFile(b.path("liblldwrapper.a"));
+        exe.step.dependOn(lld_wrapper_step); // Main exe depends on LLD wrapper
+    } else {
 
-    // // Link essential LLD libraries (static linking approach)
-    // if (lld_lib_dir) |lib_dir| {
-    //     exe.addLibraryPath(.{ .cwd_relative = lib_dir });
-    //     exe.linkSystemLibrary2("lldCommon", .{ .preferred_link_mode = .static });
-    //     exe.linkSystemLibrary2("lldELF", .{ .preferred_link_mode = .static });
-    //     exe.linkSystemLibrary2("lldMachO", .{ .preferred_link_mode = .static });
-    //     exe.linkSystemLibrary2("lldCOFF", .{ .preferred_link_mode = .static });
-    //     exe.linkSystemLibrary2("lldWasm", .{ .preferred_link_mode = .static });
-    //     exe.linkSystemLibrary2("lldMinGW", .{ .preferred_link_mode = .static });
-    //     exe.linkSystemLibrary2("z", .{ .preferred_link_mode = .static }); // zlib for compression
-    // }
+        // Link essential LLD libraries (static linking approach)
+        if (lld_lib_dir) |lib_dir| {
+            exe.addLibraryPath(.{ .cwd_relative = lib_dir });
+            exe.linkSystemLibrary2("lldCommon", .{ .preferred_link_mode = .static });
+            exe.linkSystemLibrary2("lldELF", .{ .preferred_link_mode = .static });
+            exe.linkSystemLibrary2("lldMachO", .{ .preferred_link_mode = .static });
+            exe.linkSystemLibrary2("lldCOFF", .{ .preferred_link_mode = .static });
+            exe.linkSystemLibrary2("lldWasm", .{ .preferred_link_mode = .static });
+            exe.linkSystemLibrary2("lldMinGW", .{ .preferred_link_mode = .static });
+            exe.linkSystemLibrary2("z", .{ .preferred_link_mode = .static }); // zlib for compression
+            exe.addCSourceFile(.{
+                .file = b.path("src/lld_wrapper.cpp"),
+                .flags = &.{"-std=c++17"},
+            });
+        }
+    }
 
     // Add C++ wrapper for lld
-    // exe.addCSourceFile(.{
-    //     .file = b.path("src/lld_wrapper.cpp"),
-    //     .flags = &.{"-std=c++17"},
-    // });
 
     // Keep dynamic linkage for system libraries (required on macOS)
     // But try to statically embed LLVM/LLD code
