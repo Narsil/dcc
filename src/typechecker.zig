@@ -10,6 +10,11 @@ pub const TypeCheckError = error{
     InvalidFunctionCall,
     InvalidReturnType,
     InvalidVariableType,
+    TargetMustBeTensor,
+    ImplicitIndexConflictsWithVariable,
+    IndexCountMismatch,
+    InvalidIndexType,
+    InvalidExpression,
     OutOfMemory,
 } || std.mem.Allocator.Error;
 
@@ -97,6 +102,9 @@ pub const TypeChecker = struct {
             .expression_statement => |expr_stmt| {
                 _ = try self.typeCheckExpression(expr_stmt.expression.*);
             },
+            .parallel_assignment => |parallel_assign| {
+                try self.typeCheckParallelAssignment(parallel_assign);
+            },
             else => return error.TypeMismatch,
         }
     }
@@ -135,11 +143,16 @@ pub const TypeChecker = struct {
     }
 
     fn typeCheckVariableDeclaration(self: *TypeChecker, var_decl: @TypeOf(@as(parser.ASTNode, undefined).variable_declaration)) TypeCheckError!void {
+        const declared_type = var_decl.type;
         const value_type = try self.typeCheckExpression(var_decl.value.*);
-
-        if (!self.typesCompatible(var_decl.type, value_type)) {
+        std.debug.print("DEBUG: typeCheckNode - variable_declaration: declared_type={}, value_type={} (tag: {s})\n", .{ declared_type, value_type, @tagName(value_type) });
+        if (declared_type == .tensor and value_type == .tensor) {
+            std.debug.print("DEBUG: declared_type.element_type ptr: {any}, value: {}\n", .{ declared_type.tensor.element_type, declared_type.tensor.element_type.* });
+            std.debug.print("DEBUG: value_type.element_type ptr: {any}, value: {}\n", .{ value_type.tensor.element_type, value_type.tensor.element_type.* });
+        }
+        if (!self.typesCompatible(declared_type, value_type)) {
             const pos = self.getNodePosition(var_decl.value.*);
-            std.debug.print("Error at line {}, column {}: Cannot assign value of type {} to variable of type {}\n", .{ pos.line, pos.column, value_type, var_decl.type });
+            std.debug.print("Error at line {}, column {}: Cannot assign value of type {} to variable of type {}\n", .{ pos.line, pos.column, value_type, declared_type });
             return error.TypeMismatch;
         }
 
@@ -170,36 +183,24 @@ pub const TypeChecker = struct {
         }
     }
 
-    fn typeCheckExpression(self: *TypeChecker, expr: parser.ASTNode) TypeCheckError!parser.Type {
-        switch (expr) {
-            .number_literal => |num| {
-                return num.type;
+    fn typeCheckExpression(self: *TypeChecker, node: parser.ASTNode) TypeCheckError!parser.Type {
+        const result_type = switch (node) {
+            .tensor_literal => |tensor_lit| try self.typeCheckTensorLiteral(tensor_lit),
+            .implicit_tensor_index => |tensor_index| try self.typeCheckImplicitTensorIndex(tensor_index),
+            .tensor_slice => |tensor_slice| try self.typeCheckTensorSlice(tensor_slice),
+            .parallel_assignment => |parallel_assign| {
+                try self.typeCheckParallelAssignment(parallel_assign);
+                return parser.Type.i64;
             },
-            .identifier => |ident| {
-                if (self.variables.get(ident.name)) |var_type| {
-                    return var_type;
-                } else {
-                    const pos = self.getNodePosition(expr);
-                    std.debug.print("Error at line {}, column {}: Undefined variable '{s}'\n", .{ pos.line, pos.column, ident.name });
-                    return error.UndefinedVariable;
-                }
-            },
-            .binary_expression => |bin_expr| {
-                const left_type = try self.typeCheckExpression(bin_expr.left.*);
-                const right_type = try self.typeCheckExpression(bin_expr.right.*);
-
-                return try self.typeCheckBinaryOperation(bin_expr.operator, left_type, right_type, bin_expr);
-            },
-            .unary_expression => |unary_expr| {
-                const operand_type = try self.typeCheckExpression(unary_expr.operand.*);
-
-                return try self.typeCheckUnaryOperation(unary_expr.operator, operand_type, unary_expr);
-            },
-            .call_expression => |call| {
-                return try self.typeCheckFunctionCall(call);
-            },
-            else => return error.TypeMismatch,
-        }
+            .number_literal => |num| num.type,
+            .identifier => |ident| self.variables.get(ident.name) orelse return error.UndefinedVariable,
+            .binary_expression => |bin_expr| try self.typeCheckBinaryOperation(bin_expr.operator, try self.typeCheckExpression(bin_expr.left.*), try self.typeCheckExpression(bin_expr.right.*), bin_expr),
+            .unary_expression => |unary_expr| try self.typeCheckUnaryOperation(unary_expr.operator, try self.typeCheckExpression(unary_expr.operand.*), unary_expr),
+            .call_expression => |call| try self.typeCheckFunctionCall(call),
+            else => return error.InvalidExpression,
+        };
+        std.debug.print("DEBUG: typeCheckExpression - node tag: {any}, result_type: {}\n", .{ @tagName(node), result_type });
+        return result_type;
     }
 
     fn typeCheckBinaryOperation(self: *TypeChecker, op: parser.BinaryOperator, left_type: parser.Type, right_type: parser.Type, expr: @TypeOf(@as(parser.ASTNode, undefined).binary_expression)) TypeCheckError!parser.Type {
@@ -281,6 +282,13 @@ pub const TypeChecker = struct {
     fn isNumericType(_: *TypeChecker, t: parser.Type) bool {
         return switch (t) {
             .u8, .u16, .u32, .u64, .i8, .i16, .i32, .i64, .f32, .f64 => true,
+            .tensor => |tensor_type| {
+                // A tensor is numeric if its element type is numeric
+                return switch (tensor_type.element_type.*) {
+                    .u8, .u16, .u32, .u64, .i8, .i16, .i32, .i64, .f32, .f64 => true,
+                    .tensor => false, // Nested tensors are not considered numeric for operations
+                };
+            },
         };
     }
 
@@ -289,5 +297,111 @@ pub const TypeChecker = struct {
         // In a more complete implementation, you'd want to store position info in AST nodes
         return .{ .line = 1, .column = 1 };
     }
-};
 
+    fn typeCheckTensorLiteral(self: *TypeChecker, tensor_lit: @TypeOf(@as(parser.ASTNode, undefined).tensor_literal)) TypeCheckError!parser.Type {
+        // Check that the value type matches the tensor element type
+        const value_type = try self.typeCheckExpression(tensor_lit.value.*);
+
+        std.debug.print("DEBUG: typeCheckTensorLiteral - shape={any}, element_type={}, value_type={}\n", .{ tensor_lit.shape, tensor_lit.element_type, value_type });
+        if (!self.typesCompatible(tensor_lit.element_type, value_type)) {
+            const pos = self.getNodePosition(tensor_lit.value.*);
+            std.debug.print("Error at line {}, column {}: Tensor literal value type {} does not match element type {}\n", .{ pos.line, pos.column, value_type, tensor_lit.element_type });
+            return error.TypeMismatch;
+        }
+
+        // Allocate a new copy of the element type to avoid pointer sharing issues
+        const element_type_ptr = try self.allocator.create(parser.Type);
+        element_type_ptr.* = tensor_lit.element_type;
+
+        // Return the tensor type
+        const result = parser.Type{
+            .tensor = try parser.Type.TensorType.init(self.allocator, tensor_lit.shape, element_type_ptr),
+        };
+
+        std.debug.print("DEBUG: typeCheckTensorLiteral - created tensor type: {}\n", .{result});
+
+        return result;
+    }
+
+    fn typeCheckImplicitTensorIndex(self: *TypeChecker, tensor_index: @TypeOf(@as(parser.ASTNode, undefined).implicit_tensor_index)) TypeCheckError!parser.Type {
+        // Check that base is a tensor
+        const tensor_type = try self.typeCheckExpression(tensor_index.tensor.*);
+        if (tensor_type != .tensor) {
+            const pos = self.getNodePosition(tensor_index.tensor.*);
+            std.debug.print("Error at line {}, column {}: Cannot index non-tensor type {}\n", .{ pos.line, pos.column, tensor_type });
+            return error.TargetMustBeTensor;
+        }
+
+        // Check for scope conflicts
+        if (self.variables.contains(tensor_index.implicit_index)) {
+            const pos = self.getNodePosition(tensor_index.tensor.*);
+            std.debug.print("Error at line {}, column {}: Implicit index '{s}' conflicts with variable in scope\n", .{ pos.line, pos.column, tensor_index.implicit_index });
+            return error.ImplicitIndexConflictsWithVariable;
+        }
+
+        // For now, assume 1D tensors and return element type
+        // TODO: Handle multi-dimensional tensors properly
+        if (tensor_type.tensor.rank != 1) {
+            const pos = self.getNodePosition(tensor_index.tensor.*);
+            std.debug.print("Error at line {}, column {}: Multi-dimensional tensor indexing not yet supported\n", .{ pos.line, pos.column });
+            return error.IndexCountMismatch;
+        }
+
+        return tensor_type.tensor.element_type.*;
+    }
+
+    fn typeCheckTensorSlice(self: *TypeChecker, tensor_slice: @TypeOf(@as(parser.ASTNode, undefined).tensor_slice)) TypeCheckError!parser.Type {
+        // Check that base is a tensor
+        const tensor_type = try self.typeCheckExpression(tensor_slice.tensor.*);
+        if (tensor_type != .tensor) {
+            const pos = self.getNodePosition(tensor_slice.tensor.*);
+            std.debug.print("Error at line {}, column {}: Cannot slice non-tensor type {}\n", .{ pos.line, pos.column, tensor_type });
+            return error.TargetMustBeTensor;
+        }
+
+        // Check that all indices are numeric
+        for (tensor_slice.indices) |index| {
+            if (index != .number_literal) {
+                const pos = self.getNodePosition(index);
+                std.debug.print("Error at line {}, column {}: Tensor slice indices must be numeric\n", .{ pos.line, pos.column });
+                return error.InvalidIndexType;
+            }
+        }
+
+        // Check that index count matches tensor rank
+        if (tensor_slice.indices.len != tensor_type.tensor.rank) {
+            const pos = self.getNodePosition(tensor_slice.tensor.*);
+            std.debug.print("Error at line {}, column {}: Index count {} does not match tensor rank {}\n", .{ pos.line, pos.column, tensor_slice.indices.len, tensor_type.tensor.rank });
+            return error.IndexCountMismatch;
+        }
+
+        // Calculate reduced tensor type
+        const reduced_type = tensor_type.tensor.reduceRank(@intCast(tensor_slice.indices.len));
+
+        if (reduced_type) |reduced| {
+            // Return reduced tensor type
+            return parser.Type{
+                .tensor = reduced,
+            };
+        } else {
+            // All dimensions indexed, return element type
+            return tensor_type.tensor.element_type.*;
+        }
+    }
+
+    fn typeCheckParallelAssignment(self: *TypeChecker, parallel_assign: @TypeOf(@as(parser.ASTNode, undefined).parallel_assignment)) TypeCheckError!void {
+        // Check that target is an implicit tensor index
+        const target_type = try self.typeCheckExpression(parallel_assign.target.*);
+
+        // Check that value is compatible with tensor element type
+        const value_type = try self.typeCheckExpression(parallel_assign.value.*);
+
+        if (!self.typesCompatible(target_type, value_type)) {
+            const pos = self.getNodePosition(parallel_assign.value.*);
+            std.debug.print("Error at line {}, column {}: Cannot assign value of type {} to tensor element of type {}\n", .{ pos.line, pos.column, value_type, target_type });
+            return error.TypeMismatch;
+        }
+
+        // Parallel assignment is valid
+    }
+};

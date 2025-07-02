@@ -23,9 +23,14 @@ pub const TokenType = enum {
     right_paren,
     left_brace,
     right_brace,
+    left_bracket,
+    right_bracket,
     comma,
     semicolon,
     colon, // For type annotations
+    
+    // Comparison operators
+    greater_than,
     
     // Special
     eof,
@@ -35,8 +40,8 @@ pub const TokenType = enum {
     /// Returns 0 for variable-length tokens (number, identifier, keywords, type)
     pub fn length(self: TokenType) usize {
         return switch (self) {
-            .plus, .minus, .multiply, .divide, .assign, .colon => 1,
-            .left_paren, .right_paren, .left_brace, .right_brace, .comma, .semicolon => 1,
+            .plus, .minus, .multiply, .divide, .assign, .colon, .greater_than => 1,
+            .left_paren, .right_paren, .left_brace, .right_brace, .left_bracket, .right_bracket, .comma, .semicolon => 1,
             .let => 3,
             .fn_ => 2,
             .return_ => 6,
@@ -125,9 +130,12 @@ pub const Lexer = struct {
             ')' => self.makeToken(.right_paren, start),
             '{' => self.makeToken(.left_brace, start),
             '}' => self.makeToken(.right_brace, start),
+            '[' => self.makeToken(.left_bracket, start),
+            ']' => self.makeToken(.right_bracket, start),
             ',' => self.makeToken(.comma, start),
             ';' => self.makeToken(.semicolon, start),
             ':' => self.makeToken(.colon, start),
+            '>' => self.makeToken(.greater_than, start),
             else => {
                 if (std.ascii.isDigit(c)) {
                     return self.number(start);
@@ -252,6 +260,17 @@ pub const Lexer = struct {
                 ' ', '\r', '\t', '\n' => {
                     _ = self.advance();
                 },
+                '/' => {
+                    // Check for comment
+                    if (!self.isAtEnd() and self.peekNext() == '/') {
+                        // Skip single-line comment
+                        while (!self.isAtEnd() and self.peek() != '\n') {
+                            _ = self.advance();
+                        }
+                    } else {
+                        break;
+                    }
+                },
                 else => break,
             }
         }
@@ -271,6 +290,11 @@ pub const Lexer = struct {
     fn peek(self: *Lexer) u8 {
         if (self.isAtEnd()) return 0;
         return self.source[self.current];
+    }
+    
+    fn peekNext(self: *Lexer) u8 {
+        if (self.current + 1 >= self.source.len) return 0;
+        return self.source[self.current + 1];
     }
     
     /// Convert an offset back to line and column numbers
