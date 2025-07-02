@@ -48,3 +48,320 @@ test "compile library.toy and verify it works" {
     std.debug.print("dcc compilation of library.toy successful\n", .{});
 }
 
+test "type system - different integer types" {
+    const allocator = std.testing.allocator;
+    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
+
+    // Create a test file with different integer types
+    const test_source = 
+        \\fn main(): i64 {
+        \\    let x: u8 = 255u8;
+        \\    let y: u16 = 65535u16;
+        \\    let z: u32 = 4294967295u32;
+        \\    let a: i8 = -128i8;
+        \\    let b: i16 = -32768i16;
+        \\    let c: i32 = -2147483648i32;
+        \\    return 42i64;
+        \\}
+    ;
+
+    {
+        const file = try std.fs.cwd().createFile("test_integers.toy", .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(test_source);
+    }
+    defer std.fs.cwd().deleteFile("test_integers.toy") catch {};
+
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, "test_integers.toy" } });
+    defer allocator.free(out.stdout);
+    defer allocator.free(out.stderr);
+    
+    if (out.term.Exited != 0) {
+        std.debug.print("Integer types test failed with exit code {}\n", .{out.term.Exited});
+        std.debug.print("stdout: {s}\n", .{out.stdout});
+        std.debug.print("stderr: {s}\n", .{out.stderr});
+        return error.CompilationFailed;
+    }
+    
+    std.debug.print("Integer types test passed\n", .{});
+}
+
+test "type system - floating point types" {
+    const allocator = std.testing.allocator;
+    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
+
+    // Create a test file with floating point types
+    const test_source = 
+        \\fn main(): i64 {
+        \\    let x: f32 = 3.14f32;
+        \\    let y: f64 = 2.718281828f64;
+        \\    return 42i64;
+        \\}
+    ;
+
+    {
+        const file = try std.fs.cwd().createFile("test_floats.toy", .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(test_source);
+    }
+    defer std.fs.cwd().deleteFile("test_floats.toy") catch {};
+
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, "test_floats.toy" } });
+    defer allocator.free(out.stdout);
+    defer allocator.free(out.stderr);
+    
+    if (out.term.Exited != 0) {
+        std.debug.print("Float types test failed with exit code {}\n", .{out.term.Exited});
+        std.debug.print("stdout: {s}\n", .{out.stdout});
+        std.debug.print("stderr: {s}\n", .{out.stderr});
+        return error.CompilationFailed;
+    }
+    
+    std.debug.print("Float types test passed\n", .{});
+}
+
+test "type system - function with typed parameters" {
+    const allocator = std.testing.allocator;
+    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
+
+    // Create a test file with typed function parameters
+    const test_source = 
+        \\fn add_u8(a: u8, b: u8): u8 {
+        \\    return a + b;
+        \\}
+        \\
+        \\fn add_i32(a: i32, b: i32): i32 {
+        \\    return a + b;
+        \\}
+        \\
+        \\fn add_f64(a: f64, b: f64): f64 {
+        \\    return a + b;
+        \\}
+        \\
+        \\fn main(): i64 {
+        \\    let x: u8 = add_u8(1u8, 2u8);
+        \\    let y: i32 = add_i32(10i32, 20i32);
+        \\    let z: f64 = add_f64(1.5f64, 2.5f64);
+        \\    return 42i64;
+        \\}
+    ;
+
+    {
+        const file = try std.fs.cwd().createFile("test_functions.toy", .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(test_source);
+    }
+    defer std.fs.cwd().deleteFile("test_functions.toy") catch {};
+
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, "test_functions.toy" } });
+    defer allocator.free(out.stdout);
+    defer allocator.free(out.stderr);
+    
+    if (out.term.Exited != 0) {
+        std.debug.print("Function types test failed with exit code {}\n", .{out.term.Exited});
+        std.debug.print("stdout: {s}\n", .{out.stdout});
+        std.debug.print("stderr: {s}\n", .{out.stderr});
+        return error.CompilationFailed;
+    }
+    
+    std.debug.print("Function types test passed\n", .{});
+}
+
+test "type system - missing parameter type annotation" {
+    const allocator = std.testing.allocator;
+    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
+
+    // Create a test file with missing parameter type
+    const test_source = 
+        \\fn add(a, b: i64): i64 {
+        \\    return a + b;
+        \\}
+        \\
+        \\fn main(): i64 {
+        \\    return 42i64;
+        \\}
+    ;
+
+    {
+        const file = try std.fs.cwd().createFile("test_missing_param_type.toy", .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(test_source);
+    }
+    defer std.fs.cwd().deleteFile("test_missing_param_type.toy") catch {};
+
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, "test_missing_param_type.toy" } });
+    defer allocator.free(out.stdout);
+    defer allocator.free(out.stderr);
+    
+    if (out.term.Exited == 0) {
+        std.debug.print("Expected compilation to fail due to missing parameter type\n", .{});
+        return error.UnexpectedSuccess;
+    }
+    
+    // Check that the error message is readable and mentions the missing type
+    if (std.mem.indexOf(u8, out.stderr, "Expected ':' after parameter name") == null) {
+        std.debug.print("Error message not found in stderr: {s}\n", .{out.stderr});
+        return error.MissingError;
+    }
+    
+    std.debug.print("Missing parameter type error test passed\n", .{});
+    std.debug.print("Error message: {s}\n", .{out.stderr});
+}
+
+test "type system - missing return type annotation" {
+    const allocator = std.testing.allocator;
+    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
+
+    // Create a test file with missing return type
+    const test_source = 
+        \\fn add(a: i64, b: i64) {
+        \\    return a + b;
+        \\}
+        \\
+        \\fn main(): i64 {
+        \\    return 42i64;
+        \\}
+    ;
+
+    {
+        const file = try std.fs.cwd().createFile("test_missing_return_type.toy", .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(test_source);
+    }
+    defer std.fs.cwd().deleteFile("test_missing_return_type.toy") catch {};
+
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, "test_missing_return_type.toy" } });
+    defer allocator.free(out.stdout);
+    defer allocator.free(out.stderr);
+    
+    if (out.term.Exited == 0) {
+        std.debug.print("Expected compilation to fail due to missing return type\n", .{});
+        return error.UnexpectedSuccess;
+    }
+    
+    // Check that the error message is readable and mentions the missing return type
+    if (std.mem.indexOf(u8, out.stderr, "Expected ':' before return type") == null) {
+        std.debug.print("Error message not found in stderr: {s}\n", .{out.stderr});
+        return error.MissingError;
+    }
+    
+    std.debug.print("Missing return type error test passed\n", .{});
+    std.debug.print("Error message: {s}\n", .{out.stderr});
+}
+
+test "type system - missing variable type annotation" {
+    const allocator = std.testing.allocator;
+    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
+
+    // Create a test file with missing variable type
+    const test_source = 
+        \\fn main(): i64 {
+        \\    let x = 42i64;
+        \\    return x;
+        \\}
+    ;
+
+    {
+        const file = try std.fs.cwd().createFile("test_missing_var_type.toy", .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(test_source);
+    }
+    defer std.fs.cwd().deleteFile("test_missing_var_type.toy") catch {};
+
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, "test_missing_var_type.toy" } });
+    defer allocator.free(out.stdout);
+    defer allocator.free(out.stderr);
+    
+    if (out.term.Exited == 0) {
+        std.debug.print("Expected compilation to fail due to missing variable type\n", .{});
+        return error.UnexpectedSuccess;
+    }
+    
+    // Check that the error message is readable and mentions the missing type
+    if (std.mem.indexOf(u8, out.stderr, "Expected ':' after variable name") == null) {
+        std.debug.print("Error message not found in stderr: {s}\n", .{out.stderr});
+        return error.MissingError;
+    }
+    
+    std.debug.print("Missing variable type error test passed\n", .{});
+    std.debug.print("Error message: {s}\n", .{out.stderr});
+}
+
+test "type system - invalid type annotation" {
+    const allocator = std.testing.allocator;
+    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
+
+    // Create a test file with invalid type
+    const test_source = 
+        \\fn main(): i64 {
+        \\    let x: invalid_type = 42i64;
+        \\    return x;
+        \\}
+    ;
+
+    {
+        const file = try std.fs.cwd().createFile("test_invalid_type.toy", .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(test_source);
+    }
+    defer std.fs.cwd().deleteFile("test_invalid_type.toy") catch {};
+
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, "test_invalid_type.toy" } });
+    defer allocator.free(out.stdout);
+    defer allocator.free(out.stderr);
+    
+    if (out.term.Exited == 0) {
+        std.debug.print("Expected compilation to fail due to invalid type\n", .{});
+        return error.UnexpectedSuccess;
+    }
+    
+    // Check that the error message is readable and mentions the invalid type
+    if (std.mem.indexOf(u8, out.stderr, "Expected type") == null) {
+        std.debug.print("Error message not found in stderr: {s}\n", .{out.stderr});
+        return error.MissingError;
+    }
+    
+    std.debug.print("Invalid type error test passed\n", .{});
+    std.debug.print("Error message: {s}\n", .{out.stderr});
+}
+
+test "type system - type mismatch in function call" {
+    const allocator = std.testing.allocator;
+    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
+
+    // Create a test file with type mismatch
+    const test_source = 
+        \\fn add(a: i64, b: i64): i64 {
+        \\    return a + b;
+        \\}
+        \\
+        \\fn main(): i64 {
+        \\    let x: f64 = 3.14f64;
+        \\    let result: i64 = add(x, 5i64);
+        \\    return result;
+        \\}
+    ;
+
+    {
+        const file = try std.fs.cwd().createFile("test_type_mismatch.toy", .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(test_source);
+    }
+    defer std.fs.cwd().deleteFile("test_type_mismatch.toy") catch {};
+
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, "test_type_mismatch.toy" } });
+    defer allocator.free(out.stdout);
+    defer allocator.free(out.stderr);
+    
+    // This should compile successfully since we're not doing strict type checking yet
+    // In a more advanced type system, this would be a type error
+    if (out.term.Exited != 0) {
+        std.debug.print("Type mismatch test failed with exit code {}\n", .{out.term.Exited});
+        std.debug.print("stdout: {s}\n", .{out.stdout});
+        std.debug.print("stderr: {s}\n", .{out.stderr});
+        return error.CompilationFailed;
+    }
+    
+    std.debug.print("Type mismatch test passed (no strict type checking yet)\n", .{});
+}
+

@@ -4,6 +4,7 @@ pub const TokenType = enum {
     // Literals
     number,
     identifier,
+    type, // For type identifiers like u32, i64, f32, etc.
     
     // Keywords
     let,
@@ -24,21 +25,22 @@ pub const TokenType = enum {
     right_brace,
     comma,
     semicolon,
+    colon, // For type annotations
     
     // Special
     eof,
     invalid,
     
     /// Returns the fixed length for tokens that have a known length
-    /// Returns 0 for variable-length tokens (number, identifier, keywords)
+    /// Returns 0 for variable-length tokens (number, identifier, keywords, type)
     pub fn length(self: TokenType) usize {
         return switch (self) {
-            .plus, .minus, .multiply, .divide, .assign => 1,
+            .plus, .minus, .multiply, .divide, .assign, .colon => 1,
             .left_paren, .right_paren, .left_brace, .right_brace, .comma, .semicolon => 1,
             .let => 3,
             .fn_ => 2,
             .return_ => 6,
-            .number, .identifier, .eof, .invalid => 0, // Variable length
+            .number, .identifier, .type, .eof, .invalid => 0, // Variable length
         };
     }
     
@@ -125,6 +127,7 @@ pub const Lexer = struct {
             '}' => self.makeToken(.right_brace, start),
             ',' => self.makeToken(.comma, start),
             ';' => self.makeToken(.semicolon, start),
+            ':' => self.makeToken(.colon, start),
             else => {
                 if (std.ascii.isDigit(c)) {
                     return self.number(start);
@@ -145,6 +148,58 @@ pub const Lexer = struct {
         while (!self.isAtEnd() and std.ascii.isDigit(self.peek())) {
             _ = self.advance();
         }
+        
+        // Check for decimal point
+        if (!self.isAtEnd() and self.peek() == '.') {
+            _ = self.advance(); // consume '.'
+            while (!self.isAtEnd() and std.ascii.isDigit(self.peek())) {
+                _ = self.advance();
+            }
+        }
+        
+        // Check for type suffix
+        if (!self.isAtEnd()) {
+            const suffix_start = self.current;
+            const c = self.peek();
+            
+            // Check for unsigned integer types
+            if (c == 'u') {
+                _ = self.advance(); // consume 'u'
+                if (!self.isAtEnd() and std.ascii.isDigit(self.peek())) {
+                    while (!self.isAtEnd() and std.ascii.isDigit(self.peek())) {
+                        _ = self.advance();
+                    }
+                } else {
+                    // Invalid suffix, backtrack
+                    self.current = suffix_start;
+                }
+            }
+            // Check for signed integer types
+            else if (c == 'i') {
+                _ = self.advance(); // consume 'i'
+                if (!self.isAtEnd() and std.ascii.isDigit(self.peek())) {
+                    while (!self.isAtEnd() and std.ascii.isDigit(self.peek())) {
+                        _ = self.advance();
+                    }
+                } else {
+                    // Invalid suffix, backtrack
+                    self.current = suffix_start;
+                }
+            }
+            // Check for float types
+            else if (c == 'f') {
+                _ = self.advance(); // consume 'f'
+                if (!self.isAtEnd() and std.ascii.isDigit(self.peek())) {
+                    while (!self.isAtEnd() and std.ascii.isDigit(self.peek())) {
+                        _ = self.advance();
+                    }
+                } else {
+                    // Invalid suffix, backtrack
+                    self.current = suffix_start;
+                }
+            }
+        }
+        
         return self.makeToken(.number, start);
     }
     
@@ -163,11 +218,23 @@ pub const Lexer = struct {
     }
     
     fn identifierType(self: *Lexer, text: []const u8) TokenType {
-        _ = self;
         if (std.mem.eql(u8, text, "let")) return .let;
         if (std.mem.eql(u8, text, "fn")) return .fn_;
         if (std.mem.eql(u8, text, "return")) return .return_;
+        
+        // Check if it's a type identifier
+        if (self.isTypeIdentifier(text)) return .type;
+        
         return .identifier;
+    }
+    
+    fn isTypeIdentifier(_: *Lexer, text: []const u8) bool {
+        // Check for supported types
+        const types = [_][]const u8{ "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64" };
+        for (types) |type_str| {
+            if (std.mem.eql(u8, text, type_str)) return true;
+        }
+        return false;
     }
     
     fn makeToken(self: *Lexer, token_type: TokenType, start: usize) Token {

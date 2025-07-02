@@ -10,7 +10,7 @@ const LLVM = @cImport({
     @cInclude("llvm-c/Object.h");
 });
 
-pub const CodeGenError = error{ InvalidTopLevelNode, InvalidStatement, InvalidExpression, InvalidCallee, UndefinedVariable, UndefinedFunction, TargetError, CodeGenError, MainFunctionNotFound, MissingMainFunction, LinkingFailed } || std.mem.Allocator.Error;
+pub const CodeGenError = error{ InvalidTopLevelNode, InvalidStatement, InvalidExpression, InvalidCallee, UndefinedVariable, UndefinedFunction, TargetError, CodeGenError, MainFunctionNotFound, MissingMainFunction, LinkingFailed, InvalidCharacter, Overflow } || std.mem.Allocator.Error;
 
 // LLVM types are now available from the LLVM module
 
@@ -39,10 +39,11 @@ pub const CodeGen = struct {
     module: LLVM.LLVMModuleRef,
     builder: LLVM.LLVMBuilderRef,
     allocator: std.mem.Allocator,
+    verbose: bool,
     variables: std.HashMap([]const u8, LLVM.LLVMValueRef, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
     functions: std.HashMap([]const u8, LLVM.LLVMValueRef, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
 
-    pub fn init(allocator: std.mem.Allocator, module_name: []const u8) !CodeGen {
+    pub fn init(allocator: std.mem.Allocator, module_name: []const u8, verbose: bool) !CodeGen {
         // Initialize LLVM X86 target (for x86_64 support)
         LLVM.LLVMInitializeX86TargetInfo();
         LLVM.LLVMInitializeX86Target();
@@ -69,6 +70,7 @@ pub const CodeGen = struct {
             .module = module,
             .builder = builder,
             .allocator = allocator,
+            .verbose = verbose,
             .variables = std.HashMap([]const u8, LLVM.LLVMValueRef, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .functions = std.HashMap([]const u8, LLVM.LLVMValueRef, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
         };
@@ -117,23 +119,20 @@ pub const CodeGen = struct {
     }
 
     fn generateFunction(self: *CodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration)) CodeGenError!void {
-        const int64_type = LLVM.LLVMInt64TypeInContext(self.context);
-        const int32_type = LLVM.LLVMInt32TypeInContext(self.context);
-
         // Use i32 return type for main function to match C runtime expectations
         const is_main = std.mem.eql(u8, func.name, "main");
-        const return_type = if (is_main) int32_type else int64_type;
 
         // Create parameter types array
         const param_types = try self.allocator.alloc(LLVM.LLVMTypeRef, func.parameters.len);
         defer self.allocator.free(param_types);
 
-        for (param_types) |*param_type| {
-            param_type.* = int64_type;
+        for (func.parameters, 0..) |param, i| {
+            param_types[i] = param.type.toLLVMType(self.context);
         }
 
         // Create function type
-        const function_type = LLVM.LLVMFunctionType(return_type, param_types.ptr, @intCast(param_types.len), 0);
+        const actual_return_type = func.return_type.toLLVMType(self.context);
+        const function_type = LLVM.LLVMFunctionType(actual_return_type, param_types.ptr, @intCast(param_types.len), 0);
 
         // Create function
         const name_z = try self.allocator.dupeZ(u8, func.name);
@@ -151,16 +150,17 @@ pub const CodeGen = struct {
         LLVM.LLVMPositionBuilderAtEnd(self.builder, entry_block);
 
         // Create allocas for parameters
-        for (func.parameters, 0..) |param_name, i| {
+        for (func.parameters, 0..) |param, i| {
             const param_value = LLVM.LLVMGetParam(llvm_function, @intCast(i));
-            const param_name_z = try self.allocator.dupeZ(u8, param_name);
+            const param_name_z = try self.allocator.dupeZ(u8, param.name);
             defer self.allocator.free(param_name_z);
 
-            const alloca = LLVM.LLVMBuildAlloca(self.builder, int64_type, param_name_z.ptr);
+            const param_type = param.type.toLLVMType(self.context);
+            const alloca = LLVM.LLVMBuildAlloca(self.builder, param_type, param_name_z.ptr);
             LLVM.LLVMSetAlignment(alloca, 16); // 16-byte alignment for x86-64 System V ABI
             const store_inst = LLVM.LLVMBuildStore(self.builder, param_value, alloca);
             LLVM.LLVMSetAlignment(store_inst, 16); // Match alloca alignment
-            try self.variables.put(try self.allocator.dupe(u8, param_name), alloca);
+            try self.variables.put(try self.allocator.dupe(u8, param.name), alloca);
         }
 
         // Add dummy alloca for stack alignment in main
@@ -183,11 +183,11 @@ pub const CodeGen = struct {
     }
 
     fn generateVariableDeclaration(self: *CodeGen, var_decl: @TypeOf(@as(parser.ASTNode, undefined).variable_declaration)) CodeGenError!void {
-        const int64_type = LLVM.LLVMInt64TypeInContext(self.context);
+        const var_type = var_decl.type.toLLVMType(self.context);
         const name_z = try self.allocator.dupeZ(u8, var_decl.name);
         defer self.allocator.free(name_z);
 
-        const alloca = LLVM.LLVMBuildAlloca(self.builder, int64_type, name_z.ptr);
+        const alloca = LLVM.LLVMBuildAlloca(self.builder, var_type, name_z.ptr);
         LLVM.LLVMSetAlignment(alloca, 16); // 16-byte alignment for x86-64 System V ABI
         const value = try self.generateExpression(var_decl.value.*);
         const store_inst = LLVM.LLVMBuildStore(self.builder, value, alloca);
@@ -220,8 +220,29 @@ pub const CodeGen = struct {
     fn generateExpression(self: *CodeGen, node: parser.ASTNode) CodeGenError!LLVM.LLVMValueRef {
         switch (node) {
             .number_literal => |num| {
-                const int64_type = LLVM.LLVMInt64TypeInContext(self.context);
-                return LLVM.LLVMConstInt(int64_type, @intCast(num.value), 0);
+                const llvm_type = num.type.toLLVMType(self.context);
+                
+                if (num.type.isFloat()) {
+                    // Strip type suffix for float parsing
+                    const value_without_suffix = if (std.mem.endsWith(u8, num.value, "f32") or std.mem.endsWith(u8, num.value, "f64")) 
+                        num.value[0..(num.value.len - 3)]
+                    else 
+                        num.value;
+                    const float_value = try std.fmt.parseFloat(f64, value_without_suffix);
+                    return LLVM.LLVMConstReal(llvm_type, float_value);
+                } else {
+                    // Strip type suffix for integer parsing
+                    const value_without_suffix = if (std.mem.endsWith(u8, num.value, "u8") or std.mem.endsWith(u8, num.value, "i8")) 
+                        num.value[0..(num.value.len - 2)]
+                    else if (std.mem.endsWith(u8, num.value, "u16") or std.mem.endsWith(u8, num.value, "i16") or 
+                             std.mem.endsWith(u8, num.value, "u32") or std.mem.endsWith(u8, num.value, "i32") or
+                             std.mem.endsWith(u8, num.value, "u64") or std.mem.endsWith(u8, num.value, "i64")) 
+                        num.value[0..(num.value.len - 3)]
+                    else 
+                        num.value;
+                    const int_value = try std.fmt.parseInt(u64, value_without_suffix, 10);
+                    return LLVM.LLVMConstInt(llvm_type, int_value, 0);
+                }
             },
             .identifier => |ident| {
                 if (self.variables.get(ident.name)) |alloca| {
@@ -244,6 +265,13 @@ pub const CodeGen = struct {
                     .subtract => LLVM.LLVMBuildSub(self.builder, left, right, "sub"),
                     .multiply => LLVM.LLVMBuildMul(self.builder, left, right, "mul"),
                     .divide => LLVM.LLVMBuildSDiv(self.builder, left, right, "div"),
+                };
+            },
+            .unary_expression => |unary_expr| {
+                const operand = try self.generateExpression(unary_expr.operand.*);
+
+                return switch (unary_expr.operator) {
+                    .negate => LLVM.LLVMBuildNeg(self.builder, operand, "neg"),
                 };
             },
             .call_expression => |call| {
@@ -852,6 +880,8 @@ pub const CodeGen = struct {
     }
 
     pub fn printIR(self: *CodeGen) void {
+        if (!self.verbose) return;
+        
         const ir_string = LLVM.LLVMPrintModuleToString(self.module);
         defer LLVM.LLVMDisposeMessage(ir_string);
         std.debug.print("Generated LLVM IR:\n{s}\n", .{ir_string});

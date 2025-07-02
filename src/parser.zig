@@ -1,18 +1,75 @@
 const std = @import("std");
 const lexer = @import("lexer.zig");
+const LLVM = @cImport({
+    @cInclude("llvm-c/Core.h");
+    @cInclude("llvm-c/TargetMachine.h");
+    @cInclude("llvm-c/Target.h");
+    @cInclude("llvm-c/Support.h");
+    @cInclude("llvm-c/BitReader.h");
+    @cInclude("llvm-c/Object.h");
+});
 
 pub const ParseError = error{ ParseError, OutOfMemory, InvalidCharacter, Overflow, InvalidUtf8 } || std.mem.Allocator.Error;
 
-pub const NodeType = enum {
-    program,
-    function_declaration,
-    variable_declaration,
-    return_statement,
-    expression_statement,
-    binary_expression,
-    call_expression,
-    identifier,
-    number_literal,
+pub const Type = enum {
+    u8, u16, u32, u64,
+    i8, i16, i32, i64,
+    f32, f64,
+    
+    pub fn fromString(type_str: []const u8) ?Type {
+        return std.meta.stringToEnum(Type, type_str);
+    }
+    
+    pub fn toString(self: Type) []const u8 {
+        return switch (self) {
+            .u8 => "u8",
+            .u16 => "u16", 
+            .u32 => "u32",
+            .u64 => "u64",
+            .i8 => "i8",
+            .i16 => "i16",
+            .i32 => "i32", 
+            .i64 => "i64",
+            .f32 => "f32",
+            .f64 => "f64",
+        };
+    }
+    
+    /// Get the LLVM type for this type
+    pub fn toLLVMType(self: Type, context: anytype) LLVM.LLVMTypeRef {
+        return switch (self) {
+            .u8, .i8 => LLVM.LLVMInt8TypeInContext(context),
+            .u16, .i16 => LLVM.LLVMInt16TypeInContext(context),
+            .u32, .i32 => LLVM.LLVMInt32TypeInContext(context),
+            .u64, .i64 => LLVM.LLVMInt64TypeInContext(context),
+            .f32 => LLVM.LLVMFloatTypeInContext(context),
+            .f64 => LLVM.LLVMDoubleTypeInContext(context),
+        };
+    }
+    
+    /// Check if this is a signed integer type
+    pub fn isSignedInt(self: Type) bool {
+        return switch (self) {
+            .i8, .i16, .i32, .i64 => true,
+            else => false,
+        };
+    }
+    
+    /// Check if this is an unsigned integer type
+    pub fn isUnsignedInt(self: Type) bool {
+        return switch (self) {
+            .u8, .u16, .u32, .u64 => true,
+            else => false,
+        };
+    }
+    
+    /// Check if this is a float type
+    pub fn isFloat(self: Type) bool {
+        return switch (self) {
+            .f32, .f64 => true,
+            else => false,
+        };
+    }
 };
 
 pub const BinaryOperator = enum {
@@ -22,17 +79,27 @@ pub const BinaryOperator = enum {
     divide,
 };
 
-pub const ASTNode = union(NodeType) {
+pub const UnaryOperator = enum {
+    negate,
+};
+
+pub const ASTNode = union(enum) {
     program: struct {
         statements: []ASTNode,
     },
     function_declaration: struct {
         name: []const u8,
-        parameters: [][]const u8,
+        parameters: []Parameter,
+        return_type: Type,
         body: []ASTNode,
+    },
+    parameter: struct {
+        name: []const u8,
+        type: Type,
     },
     variable_declaration: struct {
         name: []const u8,
+        type: Type,
         value: *ASTNode,
     },
     return_statement: struct {
@@ -41,21 +108,31 @@ pub const ASTNode = union(NodeType) {
     expression_statement: struct {
         expression: *ASTNode,
     },
+    number_literal: struct {
+        value: []const u8, // Keep as string to preserve type suffix
+        type: Type,
+    },
+    identifier: struct {
+        name: []const u8,
+    },
     binary_expression: struct {
         left: *ASTNode,
         operator: BinaryOperator,
         right: *ASTNode,
     },
+    unary_expression: struct {
+        operator: UnaryOperator,
+        operand: *ASTNode,
+    },
     call_expression: struct {
         callee: *ASTNode,
         arguments: []ASTNode,
     },
-    identifier: struct {
-        name: []const u8,
-    },
-    number_literal: struct {
-        value: i64,
-    },
+};
+
+pub const Parameter = struct {
+    name: []const u8,
+    type: Type,
 };
 
 pub const Parser = struct {
@@ -119,6 +196,10 @@ pub const Parser = struct {
                 self.cleanupASTNode(bin_expr.right);
                 self.allocator.destroy(bin_expr.right);
             },
+            .unary_expression => |unary_expr| {
+                self.cleanupASTNode(unary_expr.operand);
+                self.allocator.destroy(unary_expr.operand);
+            },
             .call_expression => |call| {
                 self.cleanupASTNode(call.callee);
                 self.allocator.destroy(call.callee);
@@ -154,7 +235,7 @@ pub const Parser = struct {
                 }
                 self.allocator.free(prog.statements);
             },
-            .identifier, .number_literal => {},
+            .identifier, .number_literal, .parameter => {},
         }
     }
     
@@ -167,6 +248,10 @@ pub const Parser = struct {
                 self.cleanupASTNode(bin_expr.right);
                 self.allocator.destroy(bin_expr.right);
             },
+            .unary_expression => |unary_expr| {
+                self.cleanupASTNode(unary_expr.operand);
+                self.allocator.destroy(unary_expr.operand);
+            },
             .call_expression => |call| {
                 self.cleanupASTNode(call.callee);
                 self.allocator.destroy(call.callee);
@@ -202,7 +287,7 @@ pub const Parser = struct {
                 }
                 self.allocator.free(prog.statements);
             },
-            .identifier, .number_literal => {},
+            .identifier, .number_literal, .parameter => {},
         }
     }
     
@@ -242,22 +327,17 @@ pub const Parser = struct {
         const name = try self.consume(.identifier, "Expected function name");
         
         if (!self.match(.left_paren)) {
-            const pos = lexer.Lexer.offsetToLineColumn(self.source, self.peek().offset);
-            std.debug.print("Error at line {}, column {}: Expected '(' after function name '{s}'\n", .{ 
-                pos.line, pos.column, 
-                self.source[name.offset .. name.offset + name.getLength()]
-            });
+            self.reportError(self.peek().offset, "Expected '(' after function name");
             return error.ParseError;
         }
         
-        var params = std.ArrayList([]const u8).init(self.allocator);
+        var params = std.ArrayList(Parameter).init(self.allocator);
         defer params.deinit();
         
         if (!self.check(.right_paren)) {
             repeat: while (true) {
-                const param = try self.consume(.identifier, "Expected parameter name");
-                const param_lexeme = self.source[param.offset .. param.offset + param.getLength()];
-                try params.append(param_lexeme);
+                const param = try self.parseParameter();
+                try params.append(param);
                 
                 if (!self.match(.comma)) break :repeat;
             }
@@ -267,6 +347,13 @@ pub const Parser = struct {
             self.reportError(self.peek().offset, "Expected ')' after function parameters");
             return error.ParseError;
         }
+        
+        if (!self.match(.colon)) {
+            self.reportError(self.peek().offset, "Expected ':' before return type");
+            return error.ParseError;
+        }
+        
+        const return_type = try self.parseType();
         
         if (!self.match(.left_brace)) {
             self.reportError(self.peek().offset, "Expected '{' before function body");
@@ -295,6 +382,7 @@ pub const Parser = struct {
             .function_declaration = .{
                 .name = name_lexeme,
                 .parameters = try params.toOwnedSlice(),
+                .return_type = return_type,
                 .body = try body.toOwnedSlice(),
             },
         };
@@ -303,8 +391,15 @@ pub const Parser = struct {
     fn parseVariableDeclaration(self: *Parser) ParseError!ASTNode {
         const name = try self.consume(.identifier, "Expected variable name");
         
+        if (!self.match(.colon)) {
+            self.reportError(self.peek().offset, "Expected ':' after variable name");
+            return error.ParseError;
+        }
+        
+        const var_type = try self.parseType();
+        
         if (!self.match(.assign)) {
-            self.reportError(self.peek().offset, "Expected '=' after variable name");
+            self.reportError(self.peek().offset, "Expected '=' after variable type");
             return error.ParseError;
         }
         
@@ -322,6 +417,7 @@ pub const Parser = struct {
         return ASTNode{
             .variable_declaration = .{
                 .name = name_lexeme,
+                .type = var_type,
                 .value = value,
             },
         };
@@ -438,7 +534,7 @@ pub const Parser = struct {
     }
     
     fn parseCall(self: *Parser) ParseError!ASTNode {
-        var expr = try self.parsePrimary();
+        var expr = try self.parseUnary();
         
         while (self.match(.left_paren)) {
             var args = std.ArrayList(ASTNode).init(self.allocator);
@@ -480,14 +576,35 @@ pub const Parser = struct {
         return expr;
     }
     
+    fn parseUnary(self: *Parser) ParseError!ASTNode {
+        if (self.match(.minus)) {
+            const operand = try self.allocator.create(ASTNode);
+            errdefer self.allocator.destroy(operand);
+            operand.* = try self.parseUnary();
+            
+            return ASTNode{
+                .unary_expression = .{
+                    .operator = UnaryOperator.negate,
+                    .operand = operand,
+                },
+            };
+        }
+        
+        return try self.parsePrimary();
+    }
+    
     fn parsePrimary(self: *Parser) ParseError!ASTNode {
         if (self.match(.number)) {
             const token = self.previous();
             const lexeme = self.source[token.offset .. token.offset + token.getLength()];
-            const value = try std.fmt.parseInt(i64, lexeme, 10);
+            
+            // Parse the number and extract type
+            const number_info = try self.parseNumberWithType(lexeme);
+            
             return ASTNode{
                 .number_literal = .{
-                    .value = value,
+                    .value = lexeme,
+                    .type = number_info.type,
                 },
             };
         }
@@ -516,6 +633,59 @@ pub const Parser = struct {
         
         self.reportError(self.peek().offset, "Unexpected token");
         return error.ParseError;
+    }
+    
+    fn parseNumberWithType(self: *Parser, lexeme: []const u8) ParseError!struct { value: []const u8, type: Type } {
+        // Find the type suffix
+        var type_start: ?usize = null;
+        for (lexeme, 0..) |c, i| {
+            if (c == 'u' or c == 'i' or c == 'f') {
+                type_start = i;
+                break;
+            }
+        }
+        
+        if (type_start) |start| {
+            const number_part = lexeme[0..start];
+            const type_part = lexeme[start..];
+            
+            const parsed_type = Type.fromString(type_part) orelse {
+                self.reportError(0, "Invalid type suffix");
+                return error.ParseError;
+            };
+            
+            return .{ .value = number_part, .type = parsed_type };
+        } else {
+            // Default to i64 if no type suffix
+            return .{ .value = lexeme, .type = .i64 };
+        }
+    }
+    
+    fn parseParameter(self: *Parser) ParseError!Parameter {
+        const name = try self.consume(.identifier, "Expected parameter name");
+        
+        if (!self.match(.colon)) {
+            self.reportError(self.peek().offset, "Expected ':' after parameter name");
+            return error.ParseError;
+        }
+        
+        const param_type = try self.parseType();
+        const name_lexeme = self.source[name.offset .. name.offset + name.getLength()];
+        
+        return Parameter{
+            .name = name_lexeme,
+            .type = param_type,
+        };
+    }
+    
+    fn parseType(self: *Parser) ParseError!Type {
+        const type_token = try self.consume(.type, "Expected type");
+        const type_str = self.source[type_token.offset .. type_token.offset + type_token.getLength()];
+        
+        return Type.fromString(type_str) orelse {
+            self.reportError(type_token.offset, "Invalid type");
+            return error.ParseError;
+        };
     }
     
     fn match(self: *Parser, token_type: lexer.TokenType) bool {
@@ -559,7 +729,7 @@ pub const Parser = struct {
 
 test "parser simple variable" {
     const allocator = std.testing.allocator;
-    const source = "let x = 42;";
+    const source = "let x: i64 = 42i64;";
     
     var lex = lexer.Lexer.init(allocator, source);
     const tokens = try lex.tokenize();
@@ -576,7 +746,7 @@ test "parser simple variable" {
 
 test "parser error - calling non-function" {
     const allocator = std.testing.allocator;
-    const source = "fn main() { 42(); }";
+    const source = "fn main(): i64 { 42i64(); }";
     
     var lex = lexer.Lexer.init(allocator, source);
     const tokens = try lex.tokenize();
@@ -589,7 +759,7 @@ test "parser error - calling non-function" {
 
 test "parser error - missing function parentheses" {
     const allocator = std.testing.allocator;
-    const source = "fn main { return 42; }";
+    const source = "fn main: i64 { return 42i64; }";
     
     var lex = lexer.Lexer.init(allocator, source);
     const tokens = try lex.tokenize();
@@ -602,7 +772,7 @@ test "parser error - missing function parentheses" {
 
 test "parser error - missing closing parenthesis" {
     const allocator = std.testing.allocator;
-    const source = "fn main( { return 42; }";
+    const source = "fn main(x: i64 { return 42i64; }";
     
     var lex = lexer.Lexer.init(allocator, source);
     const tokens = try lex.tokenize();
@@ -615,7 +785,7 @@ test "parser error - missing closing parenthesis" {
 
 test "parser error - missing opening brace" {
     const allocator = std.testing.allocator;
-    const source = "fn main() return 42; }";
+    const source = "fn main(): i64 return 42i64; }";
     
     var lex = lexer.Lexer.init(allocator, source);
     const tokens = try lex.tokenize();
@@ -628,7 +798,7 @@ test "parser error - missing opening brace" {
 
 test "parser error - missing closing brace" {
     const allocator = std.testing.allocator;
-    const source = "fn main() { return 42;";
+    const source = "fn main(): i64 { return 42i64;";
     
     var lex = lexer.Lexer.init(allocator, source);
     const tokens = try lex.tokenize();
@@ -641,7 +811,7 @@ test "parser error - missing closing brace" {
 
 test "parser error - missing assignment operator" {
     const allocator = std.testing.allocator;
-    const source = "let x 42;";
+    const source = "let x: i64 42i64;";
     
     var lex = lexer.Lexer.init(allocator, source);
     const tokens = try lex.tokenize();
@@ -654,7 +824,7 @@ test "parser error - missing assignment operator" {
 
 test "parser error - missing semicolon after variable" {
     const allocator = std.testing.allocator;
-    const source = "let x = 42";
+    const source = "let x: i64 = 42i64";
     
     var lex = lexer.Lexer.init(allocator, source);
     const tokens = try lex.tokenize();
@@ -667,7 +837,7 @@ test "parser error - missing semicolon after variable" {
 
 test "parser error - missing closing parenthesis in expression" {
     const allocator = std.testing.allocator;
-    const source = "let x = (5 + 3;";
+    const source = "let x: i64 = (5i64 + 3i64;";
     
     var lex = lexer.Lexer.init(allocator, source);
     const tokens = try lex.tokenize();
@@ -680,7 +850,7 @@ test "parser error - missing closing parenthesis in expression" {
 
 test "parser error - calling expression" {
     const allocator = std.testing.allocator;
-    const source = "fn main() { (5 + 3)(); }";
+    const source = "fn main(): i64 { (5i64 + 3i64)(); }";
     
     var lex = lexer.Lexer.init(allocator, source);
     const tokens = try lex.tokenize();
@@ -726,6 +896,10 @@ pub fn freeAST(allocator: std.mem.Allocator, node: ASTNode) void {
             allocator.destroy(bin_expr.left);
             allocator.destroy(bin_expr.right);
         },
+        .unary_expression => |unary_expr| {
+            freeAST(allocator, unary_expr.operand.*);
+            allocator.destroy(unary_expr.operand);
+        },
         .call_expression => |call| {
             freeAST(allocator, call.callee.*);
             allocator.destroy(call.callee);
@@ -734,6 +908,6 @@ pub fn freeAST(allocator: std.mem.Allocator, node: ASTNode) void {
             }
             allocator.free(call.arguments);
         },
-        .identifier, .number_literal => {},
+        .identifier, .number_literal, .parameter => {},
     }
 } 
