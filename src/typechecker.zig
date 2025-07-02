@@ -150,6 +150,7 @@ pub const TypeChecker = struct {
             std.debug.print("DEBUG: declared_type.element_type ptr: {any}, value: {}\n", .{ declared_type.tensor.element_type, declared_type.tensor.element_type.* });
             std.debug.print("DEBUG: value_type.element_type ptr: {any}, value: {}\n", .{ value_type.tensor.element_type, value_type.tensor.element_type.* });
         }
+        std.debug.print("Somethingsomething\n", .{});
         if (!self.typesCompatible(declared_type, value_type)) {
             const pos = self.getNodePosition(var_decl.value.*);
             std.debug.print("Error at line {}, column {}: Cannot assign value of type {} to variable of type {}\n", .{ pos.line, pos.column, value_type, declared_type });
@@ -276,6 +277,19 @@ pub const TypeChecker = struct {
     }
 
     fn typesCompatible(_: *TypeChecker, expected: parser.Type, actual: parser.Type) bool {
+        switch (expected) {
+            .tensor => |expected_| {
+                switch (actual) {
+                    .tensor => |actual_| {
+                        if (std.mem.eql(u32, expected_.shape, actual_.shape) and std.meta.eql(expected_.element_type.*, actual_.element_type.*)) {
+                            return true;
+                        }
+                    },
+                    else => {},
+                }
+            },
+            else => {},
+        }
         return std.meta.eql(expected, actual);
     }
 
@@ -341,7 +355,7 @@ pub const TypeChecker = struct {
 
         // For now, assume 1D tensors and return element type
         // TODO: Handle multi-dimensional tensors properly
-        if (tensor_type.tensor.rank != 1) {
+        if (tensor_type.tensor.rank() != 1) {
             const pos = self.getNodePosition(tensor_index.tensor.*);
             std.debug.print("Error at line {}, column {}: Multi-dimensional tensor indexing not yet supported\n", .{ pos.line, pos.column });
             return error.IndexCountMismatch;
@@ -369,9 +383,9 @@ pub const TypeChecker = struct {
         }
 
         // Check that index count matches tensor rank
-        if (tensor_slice.indices.len != tensor_type.tensor.rank) {
+        if (tensor_slice.indices.len != tensor_type.tensor.rank()) {
             const pos = self.getNodePosition(tensor_slice.tensor.*);
-            std.debug.print("Error at line {}, column {}: Index count {} does not match tensor rank {}\n", .{ pos.line, pos.column, tensor_slice.indices.len, tensor_type.tensor.rank });
+            std.debug.print("Error at line {}, column {}: Index count {} does not match tensor rank {}\n", .{ pos.line, pos.column, tensor_slice.indices.len, tensor_type.tensor.rank() });
             return error.IndexCountMismatch;
         }
 

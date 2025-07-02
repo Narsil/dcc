@@ -36,16 +36,14 @@ pub const Type = union(enum) {
             return TensorType{
                 .shape = try allocator.dupe(u32, shape),
                 .element_type = @constCast(element_type),
-                .rank = rank,
-                .total_elements = total_elements,
             };
         }
 
-        pub fn rank(self: *TensorType) u32 {
+        pub fn rank(self: *const TensorType) usize {
             return self.shape.len;
         }
 
-        pub fn total_elements(self: *TensorType) u64 {
+        pub fn total_elements(self: *const TensorType) u64 {
             var total: u64 = 1;
             for (self.shape) |dim| {
                 total *= dim;
@@ -60,7 +58,7 @@ pub const Type = union(enum) {
         /// Calculate the reduced tensor type after applying explicit indices
         /// This reduces the rank by the number of indices provided
         pub fn reduceRank(self: *const TensorType, num_indices: u32) ?TensorType {
-            if (num_indices >= self.rank) {
+            if (num_indices >= self.rank()) {
                 // If we index all dimensions, return the element type
                 return null; // This will be handled as element access
             }
@@ -133,7 +131,7 @@ pub const Type = union(enum) {
                 // For now, create a simple array type
                 // In a full implementation, we'd want to handle multi-dimensional arrays properly
                 const element_type = tensor_type.element_type.toLLVMType(context);
-                return LLVM.LLVMArrayType(element_type, @intCast(tensor_type.total_elements));
+                return LLVM.LLVMArrayType(element_type, @intCast(tensor_type.total_elements()));
             },
         };
     }
@@ -1244,4 +1242,3 @@ pub fn freeAST(allocator: std.mem.Allocator, node: ASTNode) void {
         .identifier, .number_literal, .parameter, .tensor_literal, .implicit_tensor_index, .tensor_slice, .parallel_assignment => {},
     }
 }
-
