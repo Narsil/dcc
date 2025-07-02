@@ -7,7 +7,6 @@ DCC is a simple, statically-typed programming language designed for learning com
 - **🚀 Cross-Compilation**: Compile for different architectures and platforms from a single machine
   - macOS ARM64 → Linux x86_64
   - Linux x86_64 → macOS ARM64
-  - And many more combinations
 - **Static Typing**: Support for basic types including integers (i8, i16, i32, i64), unsigned integers (u8, u16, u32, u64), and floating-point numbers (f32, f64)
 - **Function Declarations**: Define functions with parameters and return types
 - **Variable Declarations**: Declare and initialize variables with type annotations
