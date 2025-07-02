@@ -353,15 +353,189 @@ test "type system - type mismatch in function call" {
     defer allocator.free(out.stdout);
     defer allocator.free(out.stderr);
     
-    // This should compile successfully since we're not doing strict type checking yet
-    // In a more advanced type system, this would be a type error
-    if (out.term.Exited != 0) {
-        std.debug.print("Type mismatch test failed with exit code {}\n", .{out.term.Exited});
-        std.debug.print("stdout: {s}\n", .{out.stdout});
-        std.debug.print("stderr: {s}\n", .{out.stderr});
-        return error.CompilationFailed;
+    if (out.term.Exited == 0) {
+        std.debug.print("Expected compilation to fail due to type mismatch\n", .{});
+        return error.UnexpectedSuccess;
     }
     
-    std.debug.print("Type mismatch test passed (no strict type checking yet)\n", .{});
+    // Check that the error message mentions type mismatch
+    if (std.mem.indexOf(u8, out.stderr, "type mismatch") == null and 
+        std.mem.indexOf(u8, out.stderr, "Type") == null) {
+        std.debug.print("Type mismatch error message not found in stderr: {s}\n", .{out.stderr});
+        return error.MissingError;
+    }
+    
+    std.debug.print("Type mismatch error test passed\n", .{});
+    std.debug.print("Error message: {s}\n", .{out.stderr});
+}
+
+test "type system - type mismatch in assignment" {
+    const allocator = std.testing.allocator;
+    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
+
+    // Create a test file with type mismatch in assignment
+    const test_source = 
+        \\fn main(): i64 {
+        \\    let x: i64 = 42i64;
+        \\    let y: f64 = x;
+        \\    return 0i64;
+        \\}
+    ;
+
+    {
+        const file = try std.fs.cwd().createFile("test_assignment_mismatch.toy", .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(test_source);
+    }
+    defer std.fs.cwd().deleteFile("test_assignment_mismatch.toy") catch {};
+
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, "test_assignment_mismatch.toy" } });
+    defer allocator.free(out.stdout);
+    defer allocator.free(out.stderr);
+    
+    if (out.term.Exited == 0) {
+        std.debug.print("Expected compilation to fail due to assignment type mismatch\n", .{});
+        return error.UnexpectedSuccess;
+    }
+    
+    std.debug.print("Assignment type mismatch error test passed\n", .{});
+    std.debug.print("Error message: {s}\n", .{out.stderr});
+}
+
+test "type system - type mismatch in return statement" {
+    const allocator = std.testing.allocator;
+    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
+
+    // Create a test file with type mismatch in return
+    const test_source = 
+        \\fn main(): i64 {
+        \\    return 3.14f64;
+        \\}
+    ;
+
+    {
+        const file = try std.fs.cwd().createFile("test_return_mismatch.toy", .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(test_source);
+    }
+    defer std.fs.cwd().deleteFile("test_return_mismatch.toy") catch {};
+
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, "test_return_mismatch.toy" } });
+    defer allocator.free(out.stdout);
+    defer allocator.free(out.stderr);
+    
+    if (out.term.Exited == 0) {
+        std.debug.print("Expected compilation to fail due to return type mismatch\n", .{});
+        return error.UnexpectedSuccess;
+    }
+    
+    std.debug.print("Return type mismatch error test passed\n", .{});
+    std.debug.print("Error message: {s}\n", .{out.stderr});
+}
+
+test "type system - type mismatch in binary expression" {
+    const allocator = std.testing.allocator;
+    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
+
+    // Create a test file with type mismatch in binary expression
+    const test_source = 
+        \\fn main(): i64 {
+        \\    let x: i64 = 42i64;
+        \\    let y: f64 = 3.14f64;
+        \\    let z: i64 = x + y;
+        \\    return z;
+        \\}
+    ;
+
+    {
+        const file = try std.fs.cwd().createFile("test_binary_mismatch.toy", .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(test_source);
+    }
+    defer std.fs.cwd().deleteFile("test_binary_mismatch.toy") catch {};
+
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, "test_binary_mismatch.toy" } });
+    defer allocator.free(out.stdout);
+    defer allocator.free(out.stderr);
+    
+    if (out.term.Exited == 0) {
+        std.debug.print("Expected compilation to fail due to binary expression type mismatch\n", .{});
+        return error.UnexpectedSuccess;
+    }
+    
+    std.debug.print("Binary expression type mismatch error test passed\n", .{});
+    std.debug.print("Error message: {s}\n", .{out.stderr});
+}
+
+test "type system - integer type mismatches" {
+    const allocator = std.testing.allocator;
+    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
+
+    // Create a test file with integer type mismatches
+    const test_source = 
+        \\fn add_u8(a: u8, b: u8): u8 {
+        \\    return a + b;
+        \\}
+        \\
+        \\fn main(): i64 {
+        \\    let x: u8 = 255u8;
+        \\    let y: i64 = 42i64;
+        \\    let result: u8 = add_u8(x, y);
+        \\    return 0i64;
+        \\}
+    ;
+
+    {
+        const file = try std.fs.cwd().createFile("test_integer_mismatch.toy", .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(test_source);
+    }
+    defer std.fs.cwd().deleteFile("test_integer_mismatch.toy") catch {};
+
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, "test_integer_mismatch.toy" } });
+    defer allocator.free(out.stdout);
+    defer allocator.free(out.stderr);
+    
+    if (out.term.Exited == 0) {
+        std.debug.print("Expected compilation to fail due to integer type mismatch\n", .{});
+        return error.UnexpectedSuccess;
+    }
+    
+    std.debug.print("Integer type mismatch error test passed\n", .{});
+    std.debug.print("Error message: {s}\n", .{out.stderr});
+}
+
+test "type system - signed vs unsigned mismatch" {
+    const allocator = std.testing.allocator;
+    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
+
+    // Create a test file with signed vs unsigned mismatch
+    const test_source = 
+        \\fn main(): i64 {
+        \\    let x: u64 = 42u64;
+        \\    let y: i64 = -10i64;
+        \\    let z: u64 = x + y;
+        \\    return 0i64;
+        \\}
+    ;
+
+    {
+        const file = try std.fs.cwd().createFile("test_signed_unsigned.toy", .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(test_source);
+    }
+    defer std.fs.cwd().deleteFile("test_signed_unsigned.toy") catch {};
+
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, "test_signed_unsigned.toy" } });
+    defer allocator.free(out.stdout);
+    defer allocator.free(out.stderr);
+    
+    if (out.term.Exited == 0) {
+        std.debug.print("Expected compilation to fail due to signed/unsigned type mismatch\n", .{});
+        return error.UnexpectedSuccess;
+    }
+    
+    std.debug.print("Signed/unsigned type mismatch error test passed\n", .{});
+    std.debug.print("Error message: {s}\n", .{out.stderr});
 }
 

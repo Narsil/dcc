@@ -4,6 +4,7 @@
 const std = @import("std");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
+const typechecker = @import("typechecker.zig");
 const codegen = @import("codegen.zig");
 
 /// Target information parsed from target triplet
@@ -214,6 +215,33 @@ pub fn main() !void {
                 std.debug.print("Error: Linking failed\n", .{});
                 std.process.exit(1);
             },
+            // Type checker errors (normal compilation errors)
+            typechecker.TypeCheckError.TypeMismatch => {
+                // Type checker already prints the error message, just exit
+                std.process.exit(1);
+            },
+
+
+            typechecker.TypeCheckError.InvalidBinaryOperation => {
+                // Type checker already prints the error message, just exit
+                std.process.exit(1);
+            },
+            typechecker.TypeCheckError.InvalidUnaryOperation => {
+                // Type checker already prints the error message, just exit
+                std.process.exit(1);
+            },
+            typechecker.TypeCheckError.InvalidFunctionCall => {
+                // Type checker already prints the error message, just exit
+                std.process.exit(1);
+            },
+            typechecker.TypeCheckError.InvalidReturnType => {
+                // Type checker already prints the error message, just exit
+                std.process.exit(1);
+            },
+            typechecker.TypeCheckError.InvalidVariableType => {
+                // Type checker already prints the error message, just exit
+                std.process.exit(1);
+            },
             else => {
                 // For any other errors, re-raise to get stack trace (unhandled errors)
                 return err;
@@ -255,6 +283,15 @@ fn compile(allocator: std.mem.Allocator, source_file: []const u8, target_triple:
 
     if (verbose) {
         std.debug.print("AST parsed successfully!\n", .{});
+    }
+
+    // Type check
+    var type_checker = typechecker.TypeChecker.init(allocator, source);
+    defer type_checker.deinit();
+    try type_checker.typeCheck(ast);
+
+    if (verbose) {
+        std.debug.print("Type checking passed!\n", .{});
     }
 
     // Check if there's a main function
