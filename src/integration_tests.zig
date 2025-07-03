@@ -540,3 +540,51 @@ test "tensor - mismatching dtype in binary op" {
 
     std.debug.print("Tensor dtype mismatch in binary op error test passed\n", .{});
 }
+
+test "gpu vector addition compilation with MLIR" {
+    const allocator = std.testing.allocator;
+    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
+
+    const gpu_source =
+        \\fn gpu_vector_add(a: [16]f32, b: [16]f32, c: [16]f32): i32 {
+        \\    c[i] = a[i] + b[i];
+        \\    return 0i32;
+        \\}
+        \\
+        \\fn main(): i32 {
+        \\    return 0i32;
+        \\}
+    ;
+
+    const filename = "test_gpu_vector_add.toy";
+
+    // Write the temporary source file
+    {
+        const file = try std.fs.cwd().createFile(filename, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(gpu_source);
+    }
+    defer std.fs.cwd().deleteFile(filename) catch {};
+
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, filename } });
+    defer allocator.free(out.stdout);
+    defer allocator.free(out.stderr);
+
+    switch (out.term) {
+        .Exited => |code| {
+            // Expect successful compilation now that MLIR GPU infrastructure is implemented
+            if (code != 0) {
+                std.debug.print("GPU compilation failed with exit code {}\n", .{code});
+                std.debug.print("stdout: {s}\n", .{out.stdout});
+                std.debug.print("stderr: {s}\n", .{out.stderr});
+                return error.CompilationFailed;
+            }
+        },
+        else => {
+            std.debug.print("GPU compilation terminated abnormally\n", .{});
+            return error.CompilationFailed;
+        },
+    }
+
+    std.debug.print("GPU vector addition compilation successful with MLIR backend\n", .{});
+}

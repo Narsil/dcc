@@ -1292,6 +1292,22 @@ test "parser error - calling expression" {
     try std.testing.expectError(error.ParseError, result);
 }
 
+fn freeType(allocator: std.mem.Allocator, type_info: Type) void {
+    switch (type_info) {
+        .tensor => |tensor_type| {
+            // Free the shape array
+            allocator.free(tensor_type.shape);
+            // Recursively free the element type
+            freeType(allocator, tensor_type.element_type.*);
+            // Free the element type pointer
+            allocator.destroy(tensor_type.element_type);
+        },
+        else => {
+            // Basic types don't need cleanup
+        },
+    }
+}
+
 pub fn freeAST(allocator: std.mem.Allocator, node: ASTNode) void {
     switch (node) {
         .program => |prog| {
@@ -1301,13 +1317,23 @@ pub fn freeAST(allocator: std.mem.Allocator, node: ASTNode) void {
             allocator.free(prog.statements);
         },
         .function_declaration => |func| {
+            // Free parameter types
+            for (func.parameters) |param| {
+                freeType(allocator, param.type);
+            }
             allocator.free(func.parameters);
+            
+            // Free return type
+            freeType(allocator, func.return_type);
+            
             for (func.body) |stmt| {
                 freeAST(allocator, stmt);
             }
             allocator.free(func.body);
         },
         .variable_declaration => |var_decl| {
+            // Free the variable type
+            freeType(allocator, var_decl.type);
             freeAST(allocator, var_decl.value.*);
             allocator.destroy(var_decl.value);
         },
@@ -1339,6 +1365,32 @@ pub fn freeAST(allocator: std.mem.Allocator, node: ASTNode) void {
             }
             allocator.free(call.arguments);
         },
-        .identifier, .number_literal, .parameter, .tensor_literal, .implicit_tensor_index, .tensor_slice, .parallel_assignment => {},
+        .tensor_literal => |tensor_lit| {
+            // Free the tensor literal type
+            freeType(allocator, tensor_lit.element_type);
+            freeAST(allocator, tensor_lit.value.*);
+            allocator.destroy(tensor_lit.value);
+        },
+        .tensor_slice => |tensor_slice| {
+            freeAST(allocator, tensor_slice.tensor.*);
+            allocator.destroy(tensor_slice.tensor);
+            for (tensor_slice.indices) |index| {
+                freeAST(allocator, index);
+            }
+            allocator.free(tensor_slice.indices);
+        },
+        .implicit_tensor_index => |tensor_index| {
+            // Free the implicit index name string
+            allocator.free(tensor_index.implicit_index);
+            freeAST(allocator, tensor_index.tensor.*);
+            allocator.destroy(tensor_index.tensor);
+        },
+        .parallel_assignment => |pa| {
+            freeAST(allocator, pa.target.*);
+            freeAST(allocator, pa.value.*);
+            allocator.destroy(pa.target);
+            allocator.destroy(pa.value);
+        },
+        .identifier, .number_literal, .parameter => {},
     }
 }

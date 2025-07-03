@@ -76,6 +76,40 @@ fn createLinking(b: *std.Build, exe: *std.Build.Step.Compile, llvm_include_dir: 
     exe.addIncludePath(.{ .cwd_relative = llvm_include_dir });
     exe.addLibraryPath(.{ .cwd_relative = llvm_lib_dir });
 
+    // Try to add MLIR support (optional)
+    const mlir_include_dir = std.process.getEnvVarOwned(b.allocator, "MLIR_INCLUDE_DIR") catch null;
+    const mlir_lib_dir = std.process.getEnvVarOwned(b.allocator, "MLIR_LIB_DIR") catch null;
+    
+    if (mlir_include_dir != null and mlir_lib_dir != null) {
+        defer b.allocator.free(mlir_include_dir.?);
+        defer b.allocator.free(mlir_lib_dir.?);
+        
+        exe.addIncludePath(.{ .cwd_relative = mlir_include_dir.? });
+        exe.addLibraryPath(.{ .cwd_relative = mlir_lib_dir.? });
+        
+        // Link essential MLIR libraries for C API support
+        exe.linkSystemLibrary2("MLIR", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("MLIRIR", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("MLIRSupport", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("MLIRArithDialect", .{ .preferred_link_mode = .static });
+        // Core C API libraries
+        exe.linkSystemLibrary2("MLIRCAPIIR", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("MLIRCAPIFunc", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("MLIRCAPIGPU", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("MLIRCAPIArith", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("MLIRCAPIMemRef", .{ .preferred_link_mode = .static });
+        // NVVM dialect and target libraries
+        exe.linkSystemLibrary2("MLIRCAPINVVM", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("MLIRNVVMDialect", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("MLIRGPUToNVVMTransforms", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("MLIRNVVMTarget", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("MLIRNVVMToLLVM", .{ .preferred_link_mode = .static });
+        
+        std.debug.print("MLIR support enabled\n", .{});
+    } else {
+        std.debug.print("MLIR support not available (MLIR_INCLUDE_DIR and MLIR_LIB_DIR not set)\n", .{});
+    }
+
     // Link essential LLD libraries for tests (static linking)
     exe.addIncludePath(.{ .cwd_relative = lld_include_dir });
     if (builtin.target.os.tag == .linux) {
@@ -167,6 +201,35 @@ pub fn build(b: *std.Build) !void {
     // step when running `zig build`).
     b.installArtifact(exe);
 
+    // Create emit_ptx executable
+    const emit_ptx_mod = b.createModule(.{
+        .root_source_file = b.path("src/emit_ptx.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const emit_ptx_exe = b.addExecutable(.{
+        .name = "emit_ptx",
+        .root_module = emit_ptx_mod,
+    });
+
+    // Link emit_ptx with the same libraries as main dcc
+    createLinking(b, emit_ptx_exe, llvm_include_dir, llvm_lib_dir, lld_include_dir, lld_lib_dir, false);
+
+    // Install emit_ptx executable
+    b.installArtifact(emit_ptx_exe);
+
+    // Create run step for emit_ptx
+    const run_emit_ptx_cmd = b.addRunArtifact(emit_ptx_exe);
+    run_emit_ptx_cmd.step.dependOn(b.getInstallStep());
+
+    if (b.args) |args| {
+        run_emit_ptx_cmd.addArgs(args);
+    }
+
+    const run_emit_ptx_step = b.step("emit-ptx", "Run the emit_ptx tool");
+    run_emit_ptx_step.dependOn(&run_emit_ptx_cmd.step);
+
     // This *creates* a Run step in the build graph, to be executed when another
     // step is evaluated that depends on it. The next line below will establish
     // such a dependency.
@@ -223,4 +286,23 @@ pub fn build(b: *std.Build) !void {
 
     // Make the main test step depend on both unit and integration tests
     test_step.dependOn(&run_integration_tests.step);
+
+    // Add specific MLIR codegen test step
+    const mlir_codegen_tests = b.addTest(.{
+        .name = "mlir-codegen-tests",
+        .root_source_file = b.path("src/mlir_codegen.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Configure MLIR test with all necessary dependencies
+    createLinking(b, mlir_codegen_tests, llvm_include_dir, llvm_lib_dir, lld_include_dir, lld_lib_dir, false);
+
+    const run_mlir_codegen_tests = b.addRunArtifact(mlir_codegen_tests);
+
+    const mlir_test_step = b.step("test-mlir", "Run MLIR codegen tests");
+    mlir_test_step.dependOn(&run_mlir_codegen_tests.step);
+
+    // Also add MLIR tests to the main test step
+    test_step.dependOn(&run_mlir_codegen_tests.step);
 }

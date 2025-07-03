@@ -215,6 +215,10 @@ pub fn main() !void {
                 std.debug.print("Error: Linking failed\n", .{});
                 std.process.exit(1);
             },
+            codegen.CodeGenError.GpuCompilationNotImplemented => {
+                std.debug.print("Error: GPU compilation not implemented\n", .{});
+                std.process.exit(1);
+            },
             // Type checker errors (normal compilation errors)
             typechecker.TypeCheckError.TypeMismatch => {
                 // Type checker already prints the error message, just exit

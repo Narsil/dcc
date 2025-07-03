@@ -36,6 +36,7 @@
                 zig
                 llvm
                 lld
+                llvmPackages.mlir
                 gemini-cli
                 zls
                 gdb
@@ -48,6 +49,8 @@
               LLVM_LIB_DIR = "${llvm.lib}/lib";
               LLD_INCLUDE_DIR = "${lld.dev}/include";
               LLD_LIB_DIR = "${lld.lib}/lib";
+              MLIR_INCLUDE_DIR = "${llvmPackages.mlir.dev}/include";
+              MLIR_LIB_DIR = "${llvmPackages.mlir}/lib";
             };
         }
       );
