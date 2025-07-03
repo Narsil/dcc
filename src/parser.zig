@@ -177,66 +177,82 @@ pub const UnaryOperator = enum {
 
 pub const ASTNode = union(enum) {
     program: struct {
+        offset: usize,
         statements: []ASTNode,
     },
     function_declaration: struct {
+        offset: usize,
         name: []const u8,
         parameters: []Parameter,
         return_type: Type,
         body: []ASTNode,
     },
     parameter: struct {
+        offset: usize,
         name: []const u8,
         type: Type,
     },
     variable_declaration: struct {
+        offset: usize,
         name: []const u8,
         type: Type,
         value: *ASTNode,
     },
     return_statement: struct {
+        offset: usize,
         value: ?*ASTNode,
     },
     expression_statement: struct {
+        offset: usize,
         expression: *ASTNode,
     },
     number_literal: struct {
+        offset: usize,
         value: []const u8, // Keep as string to preserve type suffix
         type: Type,
     },
     identifier: struct {
+        offset: usize,
         name: []const u8,
     },
     binary_expression: struct {
+        offset: usize,
         left: *ASTNode,
         operator: BinaryOperator,
         right: *ASTNode,
     },
     unary_expression: struct {
+        offset: usize,
         operator: UnaryOperator,
         operand: *ASTNode,
     },
     call_expression: struct {
+        offset: usize,
+        return_type: ?Type,
         callee: *ASTNode,
         arguments: []ASTNode,
     },
     tensor_literal: struct {
+        offset: usize,
         shape: []const u32,
         element_type: Type,
         value: *ASTNode, // The fill value
     },
     // Implicit tensor indexing: vector[i]
     implicit_tensor_index: struct {
+        offset: usize,
         tensor: *ASTNode, // The tensor being indexed
         implicit_index: []const u8, // The implicit index name
     },
     // Explicit tensor indexing: vector[0] - reduces rank
     tensor_slice: struct {
+        offset: usize,
         tensor: *ASTNode, // The tensor being sliced
         indices: []ASTNode, // The explicit indices (numbers)
     },
     // Parallel assignment: vector[i] = expression
     parallel_assignment: struct {
+        offset: usize,
         target: *ASTNode, // The target (implicit_tensor_index)
         value: *ASTNode, // The value expression
     },
@@ -414,6 +430,28 @@ pub const Parser = struct {
 
         return ASTNode{
             .program = .{
+                .offset = if (statements.items.len > 0) blk: {
+                    // Use first statement's offset as program offset
+                    const first = statements.items[0];
+                    const off: usize = switch (first) {
+                        .program => |n| n.offset,
+                        .function_declaration => |n| n.offset,
+                        .parameter => |n| n.offset,
+                        .variable_declaration => |n| n.offset,
+                        .return_statement => |n| n.offset,
+                        .expression_statement => |n| n.offset,
+                        .number_literal => |n| n.offset,
+                        .identifier => |n| n.offset,
+                        .binary_expression => |n| n.offset,
+                        .unary_expression => |n| n.offset,
+                        .call_expression => |n| n.offset,
+                        .tensor_literal => |n| n.offset,
+                        .implicit_tensor_index => |n| n.offset,
+                        .tensor_slice => |n| n.offset,
+                        .parallel_assignment => |n| n.offset,
+                    };
+                    break :blk off;
+                } else 0,
                 .statements = try statements.toOwnedSlice(),
             },
         };
@@ -446,14 +484,39 @@ pub const Parser = struct {
             return error.ParseError;
         }
 
-        const expr_ptr = try self.allocator.create(ASTNode);
-        expr_ptr.* = expr;
-
-        return ASTNode{
-            .expression_statement = .{
-                .expression = expr_ptr,
+        // If the parsed expression itself is a parallel_assignment, treat it as a statement directly
+        switch (expr) {
+            .parallel_assignment => {
+                return expr; // already a full statement
             },
-        };
+            else => {
+                const expr_ptr = try self.allocator.create(ASTNode);
+                expr_ptr.* = expr;
+                const expr_offset: usize = switch (expr) {
+                    .program => |n| n.offset,
+                    .function_declaration => |n| n.offset,
+                    .parameter => |n| n.offset,
+                    .variable_declaration => |n| n.offset,
+                    .return_statement => |n| n.offset,
+                    .expression_statement => |n| n.offset,
+                    .number_literal => |n| n.offset,
+                    .identifier => |n| n.offset,
+                    .binary_expression => |n| n.offset,
+                    .unary_expression => |n| n.offset,
+                    .call_expression => |n| n.offset,
+                    .tensor_literal => |n| n.offset,
+                    .implicit_tensor_index => |n| n.offset,
+                    .tensor_slice => |n| n.offset,
+                    .parallel_assignment => |n| n.offset,
+                };
+                return ASTNode{
+                    .expression_statement = .{
+                        .offset = expr_offset,
+                        .expression = expr_ptr,
+                    },
+                };
+            },
+        }
     }
 
     fn parseFunctionDeclaration(self: *Parser) ParseError!ASTNode {
@@ -513,6 +576,7 @@ pub const Parser = struct {
         const name_lexeme = self.source[name.offset .. name.offset + name.getLength()];
         return ASTNode{
             .function_declaration = .{
+                .offset = name.offset,
                 .name = name_lexeme,
                 .parameters = try params.toOwnedSlice(),
                 .return_type = return_type,
@@ -553,6 +617,7 @@ pub const Parser = struct {
         }
         return ASTNode{
             .variable_declaration = .{
+                .offset = name.offset,
                 .name = name_lexeme,
                 .type = var_type,
                 .value = value_ptr,
@@ -579,8 +644,10 @@ pub const Parser = struct {
             return error.ParseError;
         }
 
+        const return_offset = self.previous().offset; // 'return' token
         return ASTNode{
             .return_statement = .{
+                .offset = return_offset,
                 .value = value,
             },
         };
@@ -589,6 +656,7 @@ pub const Parser = struct {
     fn parseExpression(self: *Parser) ParseError!ASTNode {
         // Check for tensor literal: [shape]type{value}
         if (self.check(.left_bracket)) {
+            const start_offset = self.peek().offset; // '[' position
             // Parse shape
             _ = try self.consume(.left_bracket, "Expected '['");
             var dimensions = std.ArrayList(u32).init(self.allocator);
@@ -614,10 +682,9 @@ pub const Parser = struct {
             // Build AST node
             const value_ptr = try self.allocator.create(ASTNode);
             value_ptr.* = value;
-            std.debug.print("DEBUG: parseExpression - tensor literal: shape={any}, element_type={}, value_type={any}\n", .{ dimensions.items, element_type, value });
-            std.debug.print("DEBUG: parseExpression - tensor literal element_type ptr: {any}\n", .{&element_type});
             return ASTNode{
                 .tensor_literal = .{
+                    .offset = start_offset,
                     .shape = try self.allocator.dupe(u32, dimensions.items),
                     .element_type = element_type,
                     .value = value_ptr,
@@ -648,6 +715,7 @@ pub const Parser = struct {
 
             expr = ASTNode{
                 .binary_expression = .{
+                    .offset = operator_token.offset,
                     .left = left,
                     .operator = operator,
                     .right = right,
@@ -679,6 +747,7 @@ pub const Parser = struct {
 
             expr = ASTNode{
                 .binary_expression = .{
+                    .offset = operator_token.offset,
                     .left = left,
                     .operator = operator,
                     .right = right,
@@ -721,9 +790,28 @@ pub const Parser = struct {
                 },
             }
 
+            const callee_offset: usize = switch (callee.*) {
+                .program => |n| n.offset,
+                .function_declaration => |n| n.offset,
+                .parameter => |n| n.offset,
+                .variable_declaration => |n| n.offset,
+                .return_statement => |n| n.offset,
+                .expression_statement => |n| n.offset,
+                .number_literal => |n| n.offset,
+                .identifier => |n| n.offset,
+                .binary_expression => |n| n.offset,
+                .unary_expression => |n| n.offset,
+                .call_expression => |n| n.offset,
+                .tensor_literal => |n| n.offset,
+                .implicit_tensor_index => |n| n.offset,
+                .tensor_slice => |n| n.offset,
+                .parallel_assignment => |n| n.offset,
+            };
             expr = ASTNode{
                 .call_expression = .{
+                    .offset = callee_offset,
                     .callee = callee,
+                    .return_type = null,
                     .arguments = try args.toOwnedSlice(),
                 },
             };
@@ -734,12 +822,14 @@ pub const Parser = struct {
 
     fn parseUnary(self: *Parser) ParseError!ASTNode {
         if (self.match(.minus)) {
+            const minus_token = self.previous();
             const operand = try self.allocator.create(ASTNode);
             errdefer self.allocator.destroy(operand);
             operand.* = try self.parseUnary();
 
             return ASTNode{
                 .unary_expression = .{
+                    .offset = minus_token.offset,
                     .operator = UnaryOperator.negate,
                     .operand = operand,
                 },
@@ -759,6 +849,7 @@ pub const Parser = struct {
 
             return ASTNode{
                 .number_literal = .{
+                    .offset = token.offset,
                     .value = lexeme,
                     .type = number_info.type,
                 },
@@ -770,6 +861,7 @@ pub const Parser = struct {
             const lexeme = self.source[token.offset .. token.offset + token.getLength()];
             var expr = ASTNode{
                 .identifier = .{
+                    .offset = token.offset,
                     .name = lexeme,
                 },
             };
@@ -929,6 +1021,7 @@ pub const Parser = struct {
 
                 try indices.append(ASTNode{
                     .number_literal = .{
+                        .offset = index_token.offset,
                         .value = index_str,
                         .type = number_info.type,
                     },
@@ -947,6 +1040,7 @@ pub const Parser = struct {
 
                 return ASTNode{
                     .implicit_tensor_index = .{
+                        .offset = index_token.offset,
                         .tensor = tensor_ptr,
                         .implicit_index = try self.allocator.dupe(u8, index_name),
                     },
@@ -971,6 +1065,7 @@ pub const Parser = struct {
 
         return ASTNode{
             .tensor_slice = .{
+                .offset = 0,
                 .tensor = tensor_ptr,
                 .indices = try indices.toOwnedSlice(),
             },
@@ -1038,8 +1133,13 @@ pub const Parser = struct {
                 const value_ptr = try self.allocator.create(ASTNode);
                 value_ptr.* = right;
 
+                const target_offset = switch (left) {
+                    .implicit_tensor_index => |n| n.offset,
+                    else => 0,
+                };
                 return ASTNode{
                     .parallel_assignment = .{
+                        .offset = target_offset,
                         .target = target_ptr,
                         .value = value_ptr,
                     },

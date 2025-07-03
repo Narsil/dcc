@@ -12,6 +12,11 @@ const LLVM = @cImport({
 
 pub const CodeGenError = error{ InvalidTopLevelNode, InvalidStatement, InvalidExpression, InvalidCallee, UndefinedVariable, UndefinedFunction, TargetError, CodeGenError, MainFunctionNotFound, MissingMainFunction, LinkingFailed, InvalidCharacter, Overflow } || std.mem.Allocator.Error;
 
+const VarInfo = struct {
+    alloca: LLVM.LLVMValueRef,
+    ty: parser.Type,
+};
+
 // LLVM types are now available from the LLVM module
 
 // LLVM functions are now available from the LLVM module
@@ -40,7 +45,7 @@ pub const CodeGen = struct {
     builder: LLVM.LLVMBuilderRef,
     allocator: std.mem.Allocator,
     verbose: bool,
-    variables: std.HashMap([]const u8, LLVM.LLVMValueRef, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
+    variables: std.HashMap([]const u8, VarInfo, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
     functions: std.HashMap([]const u8, LLVM.LLVMValueRef, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
 
     pub fn init(allocator: std.mem.Allocator, module_name: []const u8, verbose: bool) !CodeGen {
@@ -71,7 +76,7 @@ pub const CodeGen = struct {
             .builder = builder,
             .allocator = allocator,
             .verbose = verbose,
-            .variables = std.HashMap([]const u8, LLVM.LLVMValueRef, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
+            .variables = std.HashMap([]const u8, VarInfo, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .functions = std.HashMap([]const u8, LLVM.LLVMValueRef, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
         };
     }
@@ -114,6 +119,7 @@ pub const CodeGen = struct {
             .variable_declaration => try self.generateVariableDeclaration(node.variable_declaration),
             .return_statement => try self.generateReturn(node.return_statement),
             .expression_statement => _ = try self.generateExpression(node.expression_statement.expression.*),
+            .parallel_assignment => try self.generateParallelAssignment(node.parallel_assignment),
             else => return error.InvalidStatement,
         }
     }
@@ -160,7 +166,7 @@ pub const CodeGen = struct {
             LLVM.LLVMSetAlignment(alloca, 16); // 16-byte alignment for x86-64 System V ABI
             const store_inst = LLVM.LLVMBuildStore(self.builder, param_value, alloca);
             LLVM.LLVMSetAlignment(store_inst, 16); // Match alloca alignment
-            try self.variables.put(try self.allocator.dupe(u8, param.name), alloca);
+            try self.variables.put(try self.allocator.dupe(u8, param.name), VarInfo{ .alloca = alloca, .ty = param.type });
         }
 
         // Add dummy alloca for stack alignment in main
@@ -193,7 +199,7 @@ pub const CodeGen = struct {
         const store_inst = LLVM.LLVMBuildStore(self.builder, value, alloca);
         LLVM.LLVMSetAlignment(store_inst, 16); // Match alloca alignment
 
-        try self.variables.put(try self.allocator.dupe(u8, var_decl.name), alloca);
+        try self.variables.put(try self.allocator.dupe(u8, var_decl.name), VarInfo{ .alloca = alloca, .ty = var_decl.type });
     }
 
     fn generateReturn(self: *CodeGen, ret: @TypeOf(@as(parser.ASTNode, undefined).return_statement)) CodeGenError!void {
@@ -217,40 +223,119 @@ pub const CodeGen = struct {
         }
     }
 
+    fn generateParallelAssignment(self: *CodeGen, pa: @TypeOf(@as(parser.ASTNode, undefined).parallel_assignment)) CodeGenError!void {
+        // For now only support target of the form identifier[i]
+        if (pa.target.* != .implicit_tensor_index) {
+            return error.CodeGenError;
+        }
+        const ti = pa.target.*.implicit_tensor_index;
+        // Expect tensor to be an identifier
+        if (ti.tensor.* != .identifier) {
+            return error.CodeGenError;
+        }
+        const tensor_name = ti.tensor.*.identifier.name;
+        // Fetch alloca of tensor variable
+        const tensor_info = self.variables.get(tensor_name) orelse return error.UndefinedVariable;
+
+        // Determine tensor length from stored type info (first dimension)
+        const len: u64 = switch (tensor_info.ty) {
+            .tensor => |t| t.shape[0],
+            else => 0,
+        };
+        const elem_type = tensor_info.ty.toLLVMType(self.context);
+
+        const i64_type = LLVM.LLVMInt64TypeInContext(self.context);
+        const zero_const = LLVM.LLVMConstInt(i64_type, 0, 0);
+        const one_const = LLVM.LLVMConstInt(i64_type, 1, 0);
+        const bound_const = LLVM.LLVMConstInt(i64_type, len, 0);
+
+        // Current function and basic blocks
+        const func = LLVM.LLVMGetBasicBlockParent(LLVM.LLVMGetInsertBlock(self.builder));
+        const loop_bb = LLVM.LLVMAppendBasicBlockInContext(self.context, func, "par_loop");
+        const body_bb = LLVM.LLVMAppendBasicBlockInContext(self.context, func, "par_body");
+        const inc_bb = LLVM.LLVMAppendBasicBlockInContext(self.context, func, "par_inc");
+        const after_bb = LLVM.LLVMAppendBasicBlockInContext(self.context, func, "par_after");
+
+        // Create induction variable on stack
+        const idx_alloc = LLVM.LLVMBuildAlloca(self.builder, i64_type, "idx");
+        _ = LLVM.LLVMBuildStore(self.builder, zero_const, idx_alloc);
+        _ = LLVM.LLVMBuildBr(self.builder, loop_bb);
+
+        // Loop condition
+        LLVM.LLVMPositionBuilderAtEnd(self.builder, loop_bb);
+        const idx_val = LLVM.LLVMBuildLoad2(self.builder, i64_type, idx_alloc, "idx_val");
+        const cond = LLVM.LLVMBuildICmp(self.builder, LLVM.LLVMIntULT, idx_val, bound_const, "loop_cond");
+        _ = LLVM.LLVMBuildCondBr(self.builder, cond, body_bb, after_bb);
+
+        // Body
+        LLVM.LLVMPositionBuilderAtEnd(self.builder, body_bb);
+        if (self.verbose) {
+            std.debug.print("Parallel assignment: IR before generating RHS\n", .{});
+            self.printIR();
+        }
+        const rhs_val = try self.generateTensorExpression(pa.value.*, idx_val);
+        var gep_indices = [_]LLVM.LLVMValueRef{ zero_const, idx_val };
+        const elem_ptr = LLVM.LLVMBuildGEP2(self.builder, elem_type, tensor_info.alloca, &gep_indices[0], 2, "elem_ptr");
+        if (elem_ptr == null) {
+            std.debug.print("ERROR: LLVMBuildGEP2 returned null\n", .{});
+        }
+        _ = LLVM.LLVMBuildStore(self.builder, rhs_val, elem_ptr);
+        _ = LLVM.LLVMBuildBr(self.builder, inc_bb);
+
+        // Increment
+        LLVM.LLVMPositionBuilderAtEnd(self.builder, inc_bb);
+        const next_idx = LLVM.LLVMBuildAdd(self.builder, idx_val, one_const, "next_idx");
+        _ = LLVM.LLVMBuildStore(self.builder, next_idx, idx_alloc);
+        _ = LLVM.LLVMBuildBr(self.builder, loop_bb);
+
+        // After
+        LLVM.LLVMPositionBuilderAtEnd(self.builder, after_bb);
+    }
+
     fn generateExpression(self: *CodeGen, node: parser.ASTNode) CodeGenError!LLVM.LLVMValueRef {
         switch (node) {
             .number_literal => |num| {
                 const llvm_type = num.type.toLLVMType(self.context);
-                
+
                 if (num.type.isFloat()) {
                     // Strip type suffix for float parsing
-                    const value_without_suffix = if (std.mem.endsWith(u8, num.value, "f32") or std.mem.endsWith(u8, num.value, "f64")) 
+                    const value_without_suffix = if (std.mem.endsWith(u8, num.value, "f32") or std.mem.endsWith(u8, num.value, "f64"))
                         num.value[0..(num.value.len - 3)]
-                    else 
+                    else
                         num.value;
                     const float_value = try std.fmt.parseFloat(f64, value_without_suffix);
                     return LLVM.LLVMConstReal(llvm_type, float_value);
                 } else {
                     // Strip type suffix for integer parsing
-                    const value_without_suffix = if (std.mem.endsWith(u8, num.value, "u8") or std.mem.endsWith(u8, num.value, "i8")) 
+                    const value_without_suffix = if (std.mem.endsWith(u8, num.value, "u8") or std.mem.endsWith(u8, num.value, "i8"))
                         num.value[0..(num.value.len - 2)]
-                    else if (std.mem.endsWith(u8, num.value, "u16") or std.mem.endsWith(u8, num.value, "i16") or 
-                             std.mem.endsWith(u8, num.value, "u32") or std.mem.endsWith(u8, num.value, "i32") or
-                             std.mem.endsWith(u8, num.value, "u64") or std.mem.endsWith(u8, num.value, "i64")) 
+                    else if (std.mem.endsWith(u8, num.value, "u16") or std.mem.endsWith(u8, num.value, "i16") or
+                        std.mem.endsWith(u8, num.value, "u32") or std.mem.endsWith(u8, num.value, "i32") or
+                        std.mem.endsWith(u8, num.value, "u64") or std.mem.endsWith(u8, num.value, "i64"))
                         num.value[0..(num.value.len - 3)]
-                    else 
+                    else
                         num.value;
                     const int_value = try std.fmt.parseInt(u64, value_without_suffix, 10);
                     return LLVM.LLVMConstInt(llvm_type, int_value, 0);
                 }
             },
             .identifier => |ident| {
-                if (self.variables.get(ident.name)) |alloca| {
-                    const int64_type = LLVM.LLVMInt64TypeInContext(self.context);
+                if (self.variables.get(ident.name)) |info| {
+                    if (info.ty == .tensor) {
+                        return info.alloca; // use pointer for tensors
+                    }
+
+                    const elem_type = info.ty.toLLVMType(self.context);
                     const name_z = try self.allocator.dupeZ(u8, ident.name);
                     defer self.allocator.free(name_z);
-                    const load_inst = LLVM.LLVMBuildLoad2(self.builder, int64_type, alloca, name_z.ptr);
-                    LLVM.LLVMSetAlignment(load_inst, 16); // Match alloca alignment
+
+                    if (self.verbose) {
+                        std.debug.print("Identifier load '{s}', printing IR before load\n", .{ident.name});
+                        self.printIR();
+                    }
+
+                    const load_inst = LLVM.LLVMBuildLoad2(self.builder, elem_type, info.alloca, name_z.ptr);
+                    LLVM.LLVMSetAlignment(load_inst, 16);
                     return load_inst;
                 } else {
                     return error.UndefinedVariable;
@@ -260,18 +345,44 @@ pub const CodeGen = struct {
                 const left = try self.generateExpression(bin_expr.left.*);
                 const right = try self.generateExpression(bin_expr.right.*);
 
-                return switch (bin_expr.operator) {
-                    .add => LLVM.LLVMBuildAdd(self.builder, left, right, "add"),
-                    .subtract => LLVM.LLVMBuildSub(self.builder, left, right, "sub"),
-                    .multiply => LLVM.LLVMBuildMul(self.builder, left, right, "mul"),
-                    .divide => LLVM.LLVMBuildSDiv(self.builder, left, right, "div"),
+                // Decide whether we are dealing with floating-point or integer ops based on LLVM type of the LHS.
+                const type_kind = LLVM.LLVMGetTypeKind(LLVM.LLVMTypeOf(left));
+                const is_float = switch (type_kind) {
+                    LLVM.LLVMFloatTypeKind, LLVM.LLVMDoubleTypeKind, LLVM.LLVMHalfTypeKind, LLVM.LLVMBFloatTypeKind, LLVM.LLVMFP128TypeKind => true,
+                    else => false,
                 };
+
+                if (is_float) {
+                    return switch (bin_expr.operator) {
+                        .add => LLVM.LLVMBuildFAdd(self.builder, left, right, "fadd"),
+                        .subtract => LLVM.LLVMBuildFSub(self.builder, left, right, "fsub"),
+                        .multiply => LLVM.LLVMBuildFMul(self.builder, left, right, "fmul"),
+                        .divide => LLVM.LLVMBuildFDiv(self.builder, left, right, "fdiv"),
+                    };
+                } else {
+                    // Integer path (assume signed until we propagate sign info)
+                    return switch (bin_expr.operator) {
+                        .add => LLVM.LLVMBuildAdd(self.builder, left, right, "add"),
+                        .subtract => LLVM.LLVMBuildSub(self.builder, left, right, "sub"),
+                        .multiply => LLVM.LLVMBuildMul(self.builder, left, right, "mul"),
+                        .divide => LLVM.LLVMBuildSDiv(self.builder, left, right, "sdiv"),
+                    };
+                }
             },
             .unary_expression => |unary_expr| {
                 const operand = try self.generateExpression(unary_expr.operand.*);
 
+                const type_kind = LLVM.LLVMGetTypeKind(LLVM.LLVMTypeOf(operand));
+                const is_float = switch (type_kind) {
+                    LLVM.LLVMFloatTypeKind, LLVM.LLVMDoubleTypeKind, LLVM.LLVMHalfTypeKind, LLVM.LLVMBFloatTypeKind, LLVM.LLVMFP128TypeKind => true,
+                    else => false,
+                };
+
                 return switch (unary_expr.operator) {
-                    .negate => LLVM.LLVMBuildNeg(self.builder, operand, "neg"),
+                    .negate => if (is_float)
+                        LLVM.LLVMBuildFNeg(self.builder, operand, "fneg")
+                    else
+                        LLVM.LLVMBuildNeg(self.builder, operand, "neg"),
                 };
             },
             .call_expression => |call| {
@@ -289,6 +400,7 @@ pub const CodeGen = struct {
                     }
 
                     const int64_type = LLVM.LLVMInt64TypeInContext(self.context);
+                    const return_type = call.return_type.?.toLLVMType(self.context);
                     const param_types = try self.allocator.alloc(LLVM.LLVMTypeRef, call.arguments.len);
                     defer self.allocator.free(param_types);
 
@@ -296,14 +408,144 @@ pub const CodeGen = struct {
                         param_type.* = int64_type;
                     }
 
-                    const function_type = LLVM.LLVMFunctionType(int64_type, param_types.ptr, @intCast(param_types.len), 0);
+                    const function_type = LLVM.LLVMFunctionType(return_type, param_types.ptr, @intCast(param_types.len), 0);
 
                     return LLVM.LLVMBuildCall2(self.builder, function_type, function, args.ptr, @intCast(args.len), "call");
                 } else {
                     return error.UndefinedFunction;
                 }
             },
+            .tensor_literal => |tensor_lit| {
+                // For now, create a simple array with the specified value
+                const element_type = tensor_lit.element_type.toLLVMType(self.context);
+                _ = LLVM.LLVMArrayType(element_type, @intCast(tensor_lit.shape[0])); // Suppress unused warning
+                const value = try self.generateExpression(tensor_lit.value.*);
+
+                // Create a constant array with the value repeated
+                const values = try self.allocator.alloc(LLVM.LLVMValueRef, tensor_lit.shape[0]);
+                defer self.allocator.free(values);
+
+                for (values) |*val| {
+                    val.* = value;
+                }
+
+                return LLVM.LLVMConstArray(element_type, values.ptr, @intCast(values.len));
+            },
+            .tensor_slice => |tensor_slice| {
+                // Evaluate the base tensor expression. For variables this will be a pointer
+                // to the array aggregate.
+                const tensor_ptr = try self.generateExpression(tensor_slice.tensor.*);
+
+                const ptr_ty = LLVM.LLVMTypeOf(tensor_ptr);
+                if (LLVM.LLVMGetTypeKind(ptr_ty) != LLVM.LLVMPointerTypeKind) {
+                    // Fallback – if we somehow have an aggregate constant instead of a pointer,
+                    // simply extract the first element.
+                    return LLVM.LLVMBuildExtractValue(self.builder, tensor_ptr, 0, "tensor_slice_const");
+                }
+
+                if (tensor_slice.tensor.* != .identifier) return error.CodeGenError;
+
+                const name_slice = tensor_slice.tensor.*.identifier.name;
+                const vi_slice = self.variables.get(name_slice) orelse return error.CodeGenError;
+                if (vi_slice.ty != .tensor) return error.CodeGenError;
+
+                const array_ty = vi_slice.ty.toLLVMType(self.context);
+                const elem_ty = vi_slice.ty.tensor.element_type.toLLVMType(self.context);
+
+                // Currently only support 1-dimensional explicit indices.
+                if (tensor_slice.indices.len != 1) {
+                    return error.CodeGenError;
+                }
+
+                // Evaluate the index expression (should yield an integer value).
+                const index_val = try self.generateExpression(tensor_slice.indices[0]);
+
+                // Build GEP indices [0, index_val] to address the desired element.
+                const i64_type = LLVM.LLVMInt64TypeInContext(self.context);
+                const zero_const = LLVM.LLVMConstInt(i64_type, 0, 0);
+                var gep_indices = [_]LLVM.LLVMValueRef{ zero_const, index_val };
+
+                const elem_ptr = LLVM.LLVMBuildGEP2(self.builder, array_ty, tensor_ptr, &gep_indices[0], 2, "tensor_slice_elem_ptr");
+                self.printIR();
+
+                return LLVM.LLVMBuildLoad2(self.builder, elem_ty, elem_ptr, "tensor_slice_load");
+            },
             else => return error.InvalidExpression,
+        }
+    }
+
+    /// Similar to generateExpression but aware of the induction variable of a
+    /// parallel tensor loop.  Any implicit_tensor_index nodes will load the
+    /// element at the current loop index provided by `idx_val`.
+    fn generateTensorExpression(self: *CodeGen, node: parser.ASTNode, idx_val: LLVM.LLVMValueRef) CodeGenError!LLVM.LLVMValueRef {
+        switch (node) {
+            // Handle the special case first
+            .implicit_tensor_index => |tensor_index| {
+                const tensor_val = try self.generateExpression(tensor_index.tensor.*);
+
+                if (tensor_index.tensor.* != .identifier) {
+                    return error.CodeGenError;
+                }
+
+                const name = tensor_index.tensor.*.identifier.name;
+                const vi = self.variables.get(name) orelse return error.CodeGenError;
+                if (vi.ty != .tensor) return error.CodeGenError;
+
+                const array_ty = vi.ty.toLLVMType(self.context);
+                const elem_ty = vi.ty.tensor.element_type.toLLVMType(self.context);
+
+                // Build GEP indices [0, idx_val]
+                const i64_type = LLVM.LLVMInt64TypeInContext(self.context);
+                const zero_const = LLVM.LLVMConstInt(i64_type, 0, 0);
+                var gep_indices = [_]LLVM.LLVMValueRef{ zero_const, idx_val };
+
+                const elem_ptr = LLVM.LLVMBuildGEP2(self.builder, array_ty, tensor_val, &gep_indices[0], 2, "tensor_elem_ptr");
+                return LLVM.LLVMBuildLoad2(self.builder, elem_ty, elem_ptr, "tensor_element");
+            },
+            .binary_expression => |bin_expr| {
+                const left = try self.generateTensorExpression(bin_expr.left.*, idx_val);
+                const right = try self.generateTensorExpression(bin_expr.right.*, idx_val);
+
+                const type_kind = LLVM.LLVMGetTypeKind(LLVM.LLVMTypeOf(left));
+                const is_float = switch (type_kind) {
+                    LLVM.LLVMFloatTypeKind, LLVM.LLVMDoubleTypeKind, LLVM.LLVMHalfTypeKind, LLVM.LLVMBFloatTypeKind, LLVM.LLVMFP128TypeKind => true,
+                    else => false,
+                };
+
+                if (is_float) {
+                    return switch (bin_expr.operator) {
+                        .add => LLVM.LLVMBuildFAdd(self.builder, left, right, "fadd"),
+                        .subtract => LLVM.LLVMBuildFSub(self.builder, left, right, "fsub"),
+                        .multiply => LLVM.LLVMBuildFMul(self.builder, left, right, "fmul"),
+                        .divide => LLVM.LLVMBuildFDiv(self.builder, left, right, "fdiv"),
+                    };
+                } else {
+                    return switch (bin_expr.operator) {
+                        .add => LLVM.LLVMBuildAdd(self.builder, left, right, "add"),
+                        .subtract => LLVM.LLVMBuildSub(self.builder, left, right, "sub"),
+                        .multiply => LLVM.LLVMBuildMul(self.builder, left, right, "mul"),
+                        .divide => LLVM.LLVMBuildSDiv(self.builder, left, right, "sdiv"),
+                    };
+                }
+            },
+            .unary_expression => |unary_expr| {
+                const operand = try self.generateTensorExpression(unary_expr.operand.*, idx_val);
+
+                const type_kind = LLVM.LLVMGetTypeKind(LLVM.LLVMTypeOf(operand));
+                const is_float = switch (type_kind) {
+                    LLVM.LLVMFloatTypeKind, LLVM.LLVMDoubleTypeKind, LLVM.LLVMHalfTypeKind, LLVM.LLVMBFloatTypeKind, LLVM.LLVMFP128TypeKind => true,
+                    else => false,
+                };
+
+                return switch (unary_expr.operator) {
+                    .negate => if (is_float)
+                        LLVM.LLVMBuildFNeg(self.builder, operand, "fneg")
+                    else
+                        LLVM.LLVMBuildNeg(self.builder, operand, "neg"),
+                };
+            },
+            // For all other node kinds, fall back to the regular expression generator
+            else => return self.generateExpression(node),
         }
     }
 
@@ -880,8 +1122,6 @@ pub const CodeGen = struct {
     }
 
     pub fn printIR(self: *CodeGen) void {
-        if (!self.verbose) return;
-        
         const ir_string = LLVM.LLVMPrintModuleToString(self.module);
         defer LLVM.LLVMDisposeMessage(ir_string);
         std.debug.print("Generated LLVM IR:\n{s}\n", .{ir_string});
@@ -947,7 +1187,9 @@ pub const CodeGen = struct {
         // Mark unreachable as the syscall terminates the program
         _ = LLVM.LLVMBuildUnreachable(self.builder);
 
-        self.printIR();
+        if (self.verbose) {
+            self.printIR();
+        }
     }
 
     pub fn clearVariables(self: *CodeGen) void {

@@ -221,7 +221,6 @@ pub fn main() !void {
                 std.process.exit(1);
             },
 
-
             typechecker.TypeCheckError.InvalidBinaryOperation => {
                 // Type checker already prints the error message, just exit
                 std.process.exit(1);
@@ -298,6 +297,7 @@ fn compile(allocator: std.mem.Allocator, source_file: []const u8, target_triple:
     const has_main = hasMainFunction(ast);
 
     // Generate LLVM IR using C bindings
+    std.debug.print("CodeGen\n", .{});
     var code_gen = try codegen.CodeGen.init(allocator, "toy_program", verbose);
     defer code_gen.deinit();
 
