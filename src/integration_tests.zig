@@ -460,3 +460,83 @@ test "type system - tensor simple" {
 
     std.debug.print("Tensor basic test passed\n", .{});
 }
+
+test "tensor - out of bounds index" {
+    const allocator = std.testing.allocator;
+
+    const test_source =
+        \\fn main(): i64 {
+        \\    let vector: [5]u32 = [5]u32{0u32};
+        \\    let x: u32 = vector[10];
+        \\    return 0i64;
+        \\}
+    ;
+
+    try assertCompileFailure(allocator, test_source, "test_tensor_oob.toy", "out of bounds", "    let x: u32 = vector[10];");
+
+    std.debug.print("Tensor out-of-bounds index error test passed\n", .{});
+}
+
+test "tensor - incorrect indexing rank (1D accessed with 2 indices)" {
+    const allocator = std.testing.allocator;
+
+    const test_source =
+        \\fn main(): i64 {
+        \\    let vector: [5]u32 = [5]u32{0u32};
+        \\    let x: u32 = vector[1, 2];
+        \\    return 0i64;
+        \\}
+    ;
+
+    try assertCompileFailure(allocator, test_source, "test_tensor_rank_mismatch1.toy", "does not match tensor rank", "    let x: u32 = vector[1, 2];");
+
+    std.debug.print("Tensor rank mismatch (too many indices) error test passed\n", .{});
+}
+
+test "tensor - incorrect indexing rank (2D accessed with 1 index)" {
+    const allocator = std.testing.allocator;
+
+    const test_source =
+        \\fn main(): i64 {
+        \\    let matrix: [2, 2]u32 = [2, 2]u32{0u32};
+        \\    let x: u32 = matrix[1];
+        \\    return 0i64;
+        \\}
+    ;
+
+    try assertCompileFailure(allocator, test_source, "test_tensor_rank_mismatch2.toy", "does not match tensor rank", "    let x: u32 = matrix[1];");
+
+    std.debug.print("Tensor rank mismatch (too few indices) error test passed\n", .{});
+}
+
+test "tensor - mismatching dtype in allocation" {
+    const allocator = std.testing.allocator;
+
+    const test_source =
+        \\fn main(): i64 {
+        \\    let vector: [5]u32 = [5]u32{0.0f32};
+        \\    return 0i64;
+        \\}
+    ;
+
+    try assertCompileFailure(allocator, test_source, "test_tensor_dtype_alloc.toy", "Tensor literal value type", "    let vector: [5]u32 = [5]u32{0.0f32};");
+
+    std.debug.print("Tensor dtype mismatch in allocation error test passed\n", .{});
+}
+
+test "tensor - mismatching dtype in binary op" {
+    const allocator = std.testing.allocator;
+
+    const test_source =
+        \\fn main(): i64 {
+        \\    let a: [5]u32 = [5]u32{1u32};
+        \\    let b: [5]i64 = [5]i64{1i64};
+        \\    a[i] = a[i] + b[i];
+        \\    return 0i64;
+        \\}
+    ;
+
+    try assertCompileFailure(allocator, test_source, "test_tensor_dtype_binop.toy", "Cannot perform", "    a[i] = a[i] + b[i];");
+
+    std.debug.print("Tensor dtype mismatch in binary op error test passed\n", .{});
+}

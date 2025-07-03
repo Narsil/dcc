@@ -17,6 +17,7 @@ pub const TypeCheckError = error{
     InvalidIndexType,
     InvalidExpression,
     OutOfMemory,
+    IndexOutOfBounds,
 } || std.mem.Allocator.Error;
 
 const FunctionInfo = struct {
@@ -408,22 +409,45 @@ pub const TypeChecker = struct {
             return error.TargetMustBeTensor;
         }
 
-        // Check that all indices are numeric
-        for (tensor_slice.indices) |*index_ptr| {
-            if (index_ptr.* != .number_literal) {
-                const pos = self.getNodePosition(index_ptr.*);
-                std.debug.print("Error at line {}, column {}: Tensor slice indices must be numeric\n", .{ pos.line, pos.column });
-                self.printSourceContext(self.getNodeOffset(index_ptr.*));
-                return error.InvalidIndexType;
-            }
-        }
-
         // Check that index count matches tensor rank
         if (tensor_slice.indices.len != tensor_type.tensor.rank()) {
             const pos = self.getNodePosition(tensor_slice.tensor.*);
             std.debug.print("Error at line {}, column {}: Index count {} does not match tensor rank {}\n", .{ pos.line, pos.column, tensor_slice.indices.len, tensor_type.tensor.rank() });
             self.printSourceContext(self.getNodeOffset(tensor_slice.tensor.*));
             return error.IndexCountMismatch;
+        }
+
+        // Validate each index expression
+        for (tensor_slice.indices, 0..) |*index_ptr, dim| {
+            // Type check the index expression to ensure it is numeric
+            const idx_type = try self.typeCheckExpression(index_ptr);
+
+            if (!self.isNumericType(idx_type)) {
+                const pos = self.getNodePosition(index_ptr.*);
+                std.debug.print("Error at line {}, column {}: Tensor slice indices must be numeric, got {}\n", .{ pos.line, pos.column, idx_type });
+                self.printSourceContext(self.getNodeOffset(index_ptr.*));
+                return error.InvalidIndexType;
+            }
+
+            // Perform static bounds check when the index is a compile-time numeric literal
+            if (index_ptr.* == .number_literal) {
+                const idx_val_str = index_ptr.*.number_literal.value;
+
+                // Strip any type suffix such as 'u32', 'i64', etc.
+                var end: usize = 0;
+                while (end < idx_val_str.len and idx_val_str[end] >= '0' and idx_val_str[end] <= '9') : (end += 1) {}
+                const digits = idx_val_str[0..end];
+
+                const idx_val = std.fmt.parseInt(u64, digits, 10) catch 0;
+                const dim_size = tensor_type.tensor.shape[dim];
+
+                if (idx_val >= dim_size) {
+                    const pos = self.getNodePosition(index_ptr.*);
+                    std.debug.print("Error at line {}, column {}: Index {} out of bounds for dimension size {}\n", .{ pos.line, pos.column, idx_val, dim_size });
+                    self.printSourceContext(self.getNodeOffset(index_ptr.*));
+                    return error.IndexOutOfBounds;
+                }
+            }
         }
 
         // Calculate reduced tensor type
