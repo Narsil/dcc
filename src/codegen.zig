@@ -196,6 +196,30 @@ pub const CodeGen = struct {
             try self.generateNode(stmt);
         }
 
+        // Ensure void functions have proper terminators
+        // Check if the current basic block has a terminator
+        const current_block = LLVM.LLVMGetInsertBlock(self.builder);
+        const terminator = LLVM.LLVMGetBasicBlockTerminator(current_block);
+        
+        if (terminator == null) {
+            // No terminator found, add appropriate return based on function type
+            if (func.return_type == .void) {
+                _ = LLVM.LLVMBuildRetVoid(self.builder);
+            } else {
+                // For non-void functions without explicit return, this is an error
+                // that should have been caught by the type checker, but add a default return
+                // to prevent LLVM IR errors
+                const default_value = switch (func.return_type) {
+                    .i32 => LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 0, 0),
+                    .i64 => LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), 0, 0),
+                    .f32 => LLVM.LLVMConstReal(LLVM.LLVMFloatTypeInContext(self.context), 0.0),
+                    .f64 => LLVM.LLVMConstReal(LLVM.LLVMDoubleTypeInContext(self.context), 0.0),
+                    else => LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 0, 0),
+                };
+                _ = LLVM.LLVMBuildRet(self.builder, default_value);
+            }
+        }
+
         // Clear variables after function generation to avoid conflicts
         self.clearVariables();
     }
@@ -217,20 +241,9 @@ pub const CodeGen = struct {
     fn generateReturn(self: *CodeGen, ret: @TypeOf(@as(parser.ASTNode, undefined).return_statement)) CodeGenError!void {
         if (ret.value) |value| {
             const llvm_value = try self.generateExpression(value.*);
-
-            // Check if we're in the main function and need to convert i64 to i32
-            const current_function = LLVM.LLVMGetBasicBlockParent(LLVM.LLVMGetInsertBlock(self.builder));
-            const function_name = std.mem.span(LLVM.LLVMGetValueName(current_function));
-
-            if (std.mem.eql(u8, function_name, "main")) {
-                // Convert i64 to i32 for main function return
-                const int32_type = LLVM.LLVMInt32TypeInContext(self.context);
-                const truncated_value = LLVM.LLVMBuildTrunc(self.builder, llvm_value, int32_type, "main_return");
-                _ = LLVM.LLVMBuildRet(self.builder, truncated_value);
-            } else {
-                _ = LLVM.LLVMBuildRet(self.builder, llvm_value);
-            }
+            _ = LLVM.LLVMBuildRet(self.builder, llvm_value);
         } else {
+            // Return statement has no value - must be a void function
             _ = LLVM.LLVMBuildRetVoid(self.builder);
         }
     }

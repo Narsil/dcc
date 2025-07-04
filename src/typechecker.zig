@@ -132,6 +132,29 @@ pub const TypeChecker = struct {
             try self.typeCheckStatement(stmt);
         }
 
+        // Check that non-void functions have return statements
+        if (func.return_type != .void) {
+            // For a simple implementation, check that the last statement is a return statement
+            // This covers the most common case where functions end with a return
+            var has_return = false;
+            
+            // Look for any return statement in the function body
+            for (func.body) |stmt| {
+                if (stmt == .return_statement) {
+                    has_return = true;
+                    break;
+                }
+            }
+            
+            if (!has_return) {
+                // Get the actual position of the function declaration
+                const func_pos = self.getPositionFromOffset(func.offset);
+                std.debug.print("Error at line {}, column {}: Must return value from non-void function '{s}'\n", .{ func_pos.line, func_pos.column, func.name });
+                self.printSourceContext(func.offset);
+                return error.InvalidReturnType;
+            }
+        }
+
         // Restore old scope
         var var_iter = self.variables.iterator();
         while (var_iter.next()) |entry| {
@@ -167,23 +190,41 @@ pub const TypeChecker = struct {
 
     fn typeCheckReturnStatement(self: *TypeChecker, ret: @TypeOf(@as(parser.ASTNode, undefined).return_statement)) TypeCheckError!void {
         const expected_type = self.current_function_return_type orelse {
-            const pos = self.getNodePosition(ret.value.?.*);
+            const pos = if (ret.value) |val| self.getNodePosition(val.*) else self.getNodePosition(parser.ASTNode{ .return_statement = ret });
             std.debug.print("Error at line {}, column {}: Return statement outside of function\n", .{ pos.line, pos.column });
-            self.printSourceContext(self.getNodeOffset(ret.value.?.*));
+            const offset = if (ret.value) |val| self.getNodeOffset(val.*) else ret.offset;
+            self.printSourceContext(offset);
             return error.InvalidReturnType;
         };
 
         std.debug.print("DEBUG: Return statement - expected type: {}\n", .{expected_type});
 
         if (ret.value) |value| {
+            // Return statement has a value
+            if (expected_type == .void) {
+                // Function returns void but return statement has a value
+                const pos = self.getNodePosition(value.*);
+                std.debug.print("Error at line {}, column {}: Cannot return value from void function\n", .{ pos.line, pos.column });
+                self.printSourceContext(self.getNodeOffset(value.*));
+                return error.InvalidReturnType;
+            }
+            
             const actual_type = try self.typeCheckExpression(value);
-
             std.debug.print("DEBUG: Return statement - actual type: {}\n", .{actual_type});
 
             if (!self.typesCompatible(expected_type, actual_type)) {
                 const pos = self.getNodePosition(value.*);
                 std.debug.print("Error at line {}, column {}: Cannot return value of type {} from function returning {}\n", .{ pos.line, pos.column, actual_type, expected_type });
                 self.printSourceContext(self.getNodeOffset(value.*));
+                return error.InvalidReturnType;
+            }
+        } else {
+            // Return statement has no value
+            if (expected_type != .void) {
+                // Function expects a return value but none provided
+                const pos = self.getNodePosition(parser.ASTNode{ .return_statement = ret });
+                std.debug.print("Error at line {}, column {}: Must return value of type {} from non-void function\n", .{ pos.line, pos.column, expected_type });
+                self.printSourceContext(ret.offset);
                 return error.InvalidReturnType;
             }
         }
@@ -311,10 +352,12 @@ pub const TypeChecker = struct {
     fn isNumericType(_: *TypeChecker, t: parser.Type) bool {
         return switch (t) {
             .u8, .u16, .u32, .u64, .i8, .i16, .i32, .i64, .f32, .f64 => true,
+            .void => false,
             .tensor => |tensor_type| {
                 // A tensor is numeric if its element type is numeric
                 return switch (tensor_type.element_type.*) {
                     .u8, .u16, .u32, .u64, .i8, .i16, .i32, .i64, .f32, .f64 => true,
+                    .void => false,
                     .tensor => false, // Nested tensors are not considered numeric for operations
                 };
             },
@@ -523,5 +566,10 @@ pub const TypeChecker = struct {
         }
         caret_line.append('^') catch {};
         std.debug.print("  {s}\n", .{caret_line.items});
+    }
+
+    fn getPositionFromOffset(self: *TypeChecker, offset: usize) struct { line: usize, column: usize } {
+        const pos = lexer.Lexer.offsetToLineColumn(self.source, offset);
+        return .{ .line = @as(usize, pos.line), .column = @as(usize, pos.column) };
     }
 };

@@ -577,14 +577,119 @@ test "gpu vector addition compilation with MLIR" {
                 std.debug.print("GPU compilation failed with exit code {}\n", .{code});
                 std.debug.print("stdout: {s}\n", .{out.stdout});
                 std.debug.print("stderr: {s}\n", .{out.stderr});
-                return error.CompilationFailed;
+                return error.TestFailed;
             }
         },
-        else => {
-            std.debug.print("GPU compilation terminated abnormally\n", .{});
-            return error.CompilationFailed;
-        },
+        else => return error.TestFailed,
     }
 
-    std.debug.print("GPU vector addition compilation successful with MLIR backend\n", .{});
+    std.debug.print("GPU vector addition compilation with MLIR test passed\n", .{});
+}
+
+test "void functions - basic void function" {
+    const allocator = std.testing.allocator;
+
+    const test_source =
+        \\fn simple_void(): void {
+        \\    return;
+        \\}
+        \\
+        \\fn main(): i64 {
+        \\    simple_void();
+        \\    return 0i64;
+        \\}
+    ;
+
+    try assertCompiles(allocator, test_source, "test_void_basic.toy");
+    try assertReturns(allocator, 0);
+
+    std.debug.print("Basic void function test passed\n", .{});
+}
+
+test "void functions - void function with variables" {
+    const allocator = std.testing.allocator;
+
+    const test_source =
+        \\fn void_with_variable(): void {
+        \\    let x: i32 = 42i32;
+        \\}
+        \\
+        \\fn main(): i64 {
+        \\    void_with_variable();
+        \\    return 0i64;
+        \\}
+    ;
+
+    try assertCompiles(allocator, test_source, "test_void_variables.toy");
+    try assertReturns(allocator, 0);
+
+    std.debug.print("Void function with variables test passed\n", .{});
+}
+
+test "void functions - void functions calling void functions" {
+    const allocator = std.testing.allocator;
+
+    const test_source =
+        \\fn simple_void(): void {
+        \\    return;
+        \\}
+        \\
+        \\fn void_with_variable(): void {
+        \\    let x: i32 = 42i32;
+        \\}
+        \\
+        \\fn void_calling_void(): void {
+        \\    simple_void();
+        \\    void_with_variable();
+        \\    return;
+        \\}
+        \\
+        \\fn main(): i64 {
+        \\    void_calling_void();
+        \\    return 0i64;
+        \\}
+    ;
+
+    try assertCompiles(allocator, test_source, "test_void_comprehensive.toy");
+    try assertReturns(allocator, 0);
+
+    std.debug.print("Comprehensive void function test passed\n", .{});
+}
+
+test "void functions - error: return value from void function" {
+    const allocator = std.testing.allocator;
+
+    const test_source =
+        \\fn bad_void(): void {
+        \\    return 42i32;
+        \\}
+        \\
+        \\fn main(): i64 {
+        \\    bad_void();
+        \\    return 0i64;
+        \\}
+    ;
+
+    try assertCompileFailure(allocator, test_source, "test_void_error_return_value.toy", "Cannot return value from void function", "    return 42i32;");
+
+    std.debug.print("Void function return value error test passed\n", .{});
+}
+
+test "void functions - error: missing return from non-void function" {
+    const allocator = std.testing.allocator;
+
+    const test_source =
+        \\fn missing_return(): i32 {
+        \\    let x: i32 = 42i32;
+        \\}
+        \\
+        \\fn main(): i64 {
+        \\    let result: i32 = missing_return();
+        \\    return 0i64;
+        \\}
+    ;
+
+    try assertCompileFailure(allocator, test_source, "test_missing_return.toy", "Must return value from non-void function", "fn missing_return(): i32 {");
+
+    std.debug.print("Missing return statement error test passed\n", .{});
 }

@@ -238,7 +238,7 @@ pub const Lexer = struct {
     
     fn isTypeIdentifier(_: *Lexer, text: []const u8) bool {
         // Check for supported types
-        const types = [_][]const u8{ "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64" };
+        const types = [_][]const u8{ "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64", "void" };
         for (types) |type_str| {
             if (std.mem.eql(u8, text, type_str)) return true;
         }

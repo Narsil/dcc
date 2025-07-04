@@ -92,23 +92,33 @@ fn createLinking(b: *std.Build, exe: *std.Build.Step.Compile, llvm_include_dir: 
         exe.linkSystemLibrary2("MLIRIR", .{ .preferred_link_mode = .static });
         exe.linkSystemLibrary2("MLIRSupport", .{ .preferred_link_mode = .static });
         exe.linkSystemLibrary2("MLIRArithDialect", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("MLIRSCFDialect", .{ .preferred_link_mode = .static });
         // Core C API libraries
         exe.linkSystemLibrary2("MLIRCAPIIR", .{ .preferred_link_mode = .static });
         exe.linkSystemLibrary2("MLIRCAPIFunc", .{ .preferred_link_mode = .static });
         exe.linkSystemLibrary2("MLIRCAPIGPU", .{ .preferred_link_mode = .static });
         exe.linkSystemLibrary2("MLIRCAPIArith", .{ .preferred_link_mode = .static });
         exe.linkSystemLibrary2("MLIRCAPIMemRef", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("MLIRCAPISCF", .{ .preferred_link_mode = .static });
         // NVVM dialect and target libraries
         exe.linkSystemLibrary2("MLIRCAPINVVM", .{ .preferred_link_mode = .static });
         exe.linkSystemLibrary2("MLIRNVVMDialect", .{ .preferred_link_mode = .static });
         exe.linkSystemLibrary2("MLIRGPUToNVVMTransforms", .{ .preferred_link_mode = .static });
         exe.linkSystemLibrary2("MLIRNVVMTarget", .{ .preferred_link_mode = .static });
         exe.linkSystemLibrary2("MLIRNVVMToLLVM", .{ .preferred_link_mode = .static });
+        // Target libraries for MLIR to LLVM IR translation
+        exe.linkSystemLibrary2("MLIRCAPITarget", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("MLIRGPUToLLVMIRTranslation", .{ .preferred_link_mode = .static });
+        exe.linkSystemLibrary2("MLIRBuiltinToLLVMIRTranslation", .{ .preferred_link_mode = .static });
         
         std.debug.print("MLIR support enabled\n", .{});
     } else {
         std.debug.print("MLIR support not available (MLIR_INCLUDE_DIR and MLIR_LIB_DIR not set)\n", .{});
     }
+
+    // Add CUDA cross-compilation support for --target x86_64-unknown-linux --gpu nvidia-ptx
+    // Note: CUDA variables are now declared at the top level of build() function
+    // This is just a placeholder comment - the actual CUDA linking is handled per-executable
 
     // Link essential LLD libraries for tests (static linking)
     exe.addIncludePath(.{ .cwd_relative = lld_include_dir });
@@ -183,6 +193,14 @@ pub fn build(b: *std.Build) !void {
     defer b.allocator.free(lld_include_dir);
     defer b.allocator.free(lld_lib_dir);
 
+    // Get CUDA directories from environment (for cross-compilation)
+    const cuda_include_dir = std.process.getEnvVarOwned(b.allocator, "CUDA_INCLUDE_DIR") catch null;
+    const cuda_lib_dir = std.process.getEnvVarOwned(b.allocator, "CUDA_LIB_DIR") catch null;
+    const cuda_stub_dir = std.process.getEnvVarOwned(b.allocator, "CUDA_STUB_DIR") catch null;
+    defer if (cuda_include_dir) |dir| b.allocator.free(dir);
+    defer if (cuda_lib_dir) |dir| b.allocator.free(dir);
+    defer if (cuda_stub_dir) |dir| b.allocator.free(dir);
+
     exe.addIncludePath(.{ .cwd_relative = llvm_include_dir });
     exe.addLibraryPath(.{ .cwd_relative = llvm_lib_dir });
     // exe.addIncludePath(.{ .cwd_relative = lld_include_dir });
@@ -219,6 +237,52 @@ pub fn build(b: *std.Build) !void {
     // Install emit_ptx executable
     b.installArtifact(emit_ptx_exe);
 
+    // Create CUDA test executable (cross-compile to x86_64-linux)
+    const linux_target = b.resolveTargetQuery(.{
+        .cpu_arch = .x86_64,
+        .os_tag = .linux,
+        .abi = .gnu,
+    });
+    
+    const cuda_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/dcc_cuda_test.zig"),
+        .target = linux_target,
+        .optimize = optimize,
+    });
+
+    const cuda_test_exe = b.addExecutable(.{
+        .name = "dcc_cuda_test",
+        .root_module = cuda_test_mod,
+    });
+
+    // CUDA test only needs basic C/C++ linking, not LLVM/MLIR
+    cuda_test_exe.linkLibC();
+
+    // Add CUDA-specific linking for the test
+    if (cuda_include_dir != null and cuda_lib_dir != null) {
+        cuda_test_exe.addIncludePath(.{ .cwd_relative = cuda_include_dir.? });
+        cuda_test_exe.addLibraryPath(.{ .cwd_relative = cuda_lib_dir.? });
+        
+        // Add stub directory for libcuda.so (driver API)
+        if (cuda_stub_dir != null) {
+            cuda_test_exe.addLibraryPath(.{ .cwd_relative = cuda_stub_dir.? });
+        }
+        
+        cuda_test_exe.linkSystemLibrary("cuda");      // libcuda.so (from stubs)
+        cuda_test_exe.linkSystemLibrary("cudart");    // libcudart.so
+        std.debug.print("CUDA test executable will be linked with CUDA libraries\n", .{});
+        std.debug.print("CUDA Headers: {s}\n", .{cuda_include_dir.?});
+        std.debug.print("CUDA Libraries: {s}\n", .{cuda_lib_dir.?});
+        if (cuda_stub_dir != null) {
+            std.debug.print("CUDA Stubs: {s}\n", .{cuda_stub_dir.?});
+        }
+    } else {
+        std.debug.print("CUDA cross-compilation not available for test executable\n", .{});
+    }
+
+    // Install CUDA test executable
+    b.installArtifact(cuda_test_exe);
+
     // Create run step for emit_ptx
     const run_emit_ptx_cmd = b.addRunArtifact(emit_ptx_exe);
     run_emit_ptx_cmd.step.dependOn(b.getInstallStep());
@@ -229,6 +293,13 @@ pub fn build(b: *std.Build) !void {
 
     const run_emit_ptx_step = b.step("emit-ptx", "Run the emit_ptx tool");
     run_emit_ptx_step.dependOn(&run_emit_ptx_cmd.step);
+
+    // Create run step for CUDA test
+    const run_cuda_test_cmd = b.addRunArtifact(cuda_test_exe);
+    run_cuda_test_cmd.step.dependOn(b.getInstallStep());
+
+    const run_cuda_test_step = b.step("cuda-test", "Run the CUDA cross-compilation test");
+    run_cuda_test_step.dependOn(&run_cuda_test_cmd.step);
 
     // This *creates* a Run step in the build graph, to be executed when another
     // step is evaluated that depends on it. The next line below will establish

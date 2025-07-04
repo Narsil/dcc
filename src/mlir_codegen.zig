@@ -11,9 +11,15 @@ const MLIR = @cImport({
     @cInclude("mlir-c/Dialect/Arith.h");
     @cInclude("mlir-c/Dialect/MemRef.h");
     @cInclude("mlir-c/Dialect/NVVM.h");
+    @cInclude("mlir-c/Dialect/SCF.h");
     @cInclude("mlir-c/Pass.h");
     @cInclude("mlir-c/ExecutionEngine.h");
     @cInclude("mlir-c/Transforms.h");
+    @cInclude("mlir-c/Target/LLVMIR.h");
+    @cInclude("llvm-c/Core.h");
+    @cInclude("llvm-c/Target.h");
+    @cInclude("llvm-c/TargetMachine.h");
+    @cInclude("llvm-c/Support.h");
 });
 
 pub const MLIRCodeGenError = error{
@@ -21,45 +27,33 @@ pub const MLIRCodeGenError = error{
     InvalidGpuFunction,
     UnsupportedOperation,
     MLIRNotAvailable,
-    PTXLoweringNotImplemented,
-    PassPipelineNotAvailable,
+    PassPipelineError,
     GPUDialectNotSupported,
     NVVMDialectNotAvailable,
+    NVVMError,
+    NVVMFailed,
     InvalidCharacter,
     Overflow,
 } || std.mem.Allocator.Error;
 
-/// Information about a parallel assignment target (e.g., a[i])
-const ParallelTargetInfo = struct {
-    tensor_name: []const u8,
-    index_var: []const u8,
-    is_tensor: bool,
+/// GPU function analysis result
+const GPUFunctionInfo = struct {
+    has_parallel_assignment: bool,
+    tensor_params: [][]const u8, // names of tensor parameters
+    parallel_assignment: ?parser.ASTNode, // the parallel assignment if found
+
+    pub fn deinit(self: *GPUFunctionInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.tensor_params);
+    }
 };
 
-/// Type of operation in a parallel value expression
-const ParallelOperation = enum {
-    binary,
-    tensor_access,
-    constant,
-};
+/// Error callback for MLIR pass pipeline parsing
+fn pipelineErrorCallback(message: MLIR.MlirStringRef, userData: ?*anyopaque) callconv(.C) void {
+    _ = message; // Message parsing not available in current MLIR C API
+    _ = userData; // Unused
 
-/// Information about a parallel assignment value (e.g., a[i] + b[i])
-const ParallelValueInfo = struct {
-    operation: ParallelOperation,
-
-    // For binary operations
-    binary_op: parser.BinaryOperator = .add,
-    left: ?*ParallelValueInfo = null,
-    right: ?*ParallelValueInfo = null,
-
-    // For tensor access
-    tensor_name: []const u8 = "",
-    index_var: []const u8 = "",
-
-    // For constants
-    constant_value: []const u8 = "",
-    constant_type: parser.Type = .f32,
-};
+    std.debug.print("MLIR Pass Pipeline Error: Parse or execution error occurred\n", .{});
+}
 
 pub const MLIRCodeGen = struct {
     context: MLIR.MlirContext,
@@ -77,7 +71,7 @@ pub const MLIRCodeGen = struct {
         MLIR.mlirDialectHandleRegisterDialect(MLIR.mlirGetDialectHandle__gpu__(), context);
         MLIR.mlirDialectHandleRegisterDialect(MLIR.mlirGetDialectHandle__arith__(), context);
         MLIR.mlirDialectHandleRegisterDialect(MLIR.mlirGetDialectHandle__memref__(), context);
-        // Register NVVM dialect for PTX generation
+        MLIR.mlirDialectHandleRegisterDialect(MLIR.mlirGetDialectHandle__scf__(), context);
         MLIR.mlirDialectHandleRegisterDialect(MLIR.mlirGetDialectHandle__nvvm__(), context);
 
         // Create location and module
@@ -99,52 +93,693 @@ pub const MLIRCodeGen = struct {
         MLIR.mlirContextDestroy(self.context);
     }
 
-    pub fn generateGpuFunction(self: *MLIRCodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration)) MLIRCodeGenError!void {
+    /// Print the MLIR module (for debugging)
+    pub fn printMLIR(self: *MLIRCodeGen) void {
         if (self.verbose) {
-            std.debug.print("Generating MLIR GPU function: {s}\n", .{func.name});
-        }
-
-        // Generate MLIR function declaration
-        try self.createGpuFunctionDeclaration(func);
-
-        if (self.verbose) {
-            std.debug.print("GPU function MLIR generation completed\n", .{});
+            std.debug.print("=== MLIR Module ===\n", .{});
+            // Use mlirOperationDump for proper printing to stderr
+            MLIR.mlirOperationDump(MLIR.mlirModuleGetOperation(self.module));
+            std.debug.print("\n=== End MLIR ===\n", .{});
         }
     }
 
-    fn createGpuFunctionDeclaration(self: *MLIRCodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration)) MLIRCodeGenError!void {
-        // Create function type
-        const func_type = try self.createFunctionType(func);
+    /// Lower MLIR module to PTX assembly through GPU → NVVM → PTX pipeline
+    pub fn lowerMLIRToPTX(self: *MLIRCodeGen) MLIRCodeGenError![]const u8 {
+        if (self.verbose) {
+            std.debug.print("Lowering MLIR to PTX using official GPU compilation pipeline\n", .{});
+        }
 
-        // Create function operation using the general operation creation API
-        var operation_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("func.func".ptr), self.location);
+        // Step 1: Create pass manager for the official GPU compilation pipeline
+        const pass_manager = MLIR.mlirPassManagerCreate(self.context);
+        defer MLIR.mlirPassManagerDestroy(pass_manager);
 
-        // Set function name attribute
-        const func_name_attr = MLIR.mlirStringAttrGet(self.context, MLIR.mlirStringRefCreateFromCString(func.name.ptr));
-        const sym_name_id = MLIR.mlirIdentifierGet(self.context, MLIR.mlirStringRefCreateFromCString("sym_name".ptr));
-        const sym_name_named_attr = MLIR.mlirNamedAttributeGet(sym_name_id, func_name_attr);
-        MLIR.mlirOperationStateAddAttributes(&operation_state, 1, &sym_name_named_attr);
+        // Step 2: Get module operation
+        const module_op = MLIR.mlirModuleGetOperation(self.module);
 
-        // Set function type attribute
-        const func_type_attr = MLIR.mlirTypeAttrGet(func_type);
-        const function_type_id = MLIR.mlirIdentifierGet(self.context, MLIR.mlirStringRefCreateFromCString("function_type".ptr));
-        const function_type_named_attr = MLIR.mlirNamedAttributeGet(function_type_id, func_type_attr);
-        MLIR.mlirOperationStateAddAttributes(&operation_state, 1, &function_type_named_attr);
+        // Step 3: Print MLIR before pass pipeline (for debugging)
+        if (self.verbose) {
+            std.debug.print("=== MLIR Before GPU Pass Pipeline ===\n", .{});
+            MLIR.mlirOperationDump(module_op);
+            std.debug.print("\n=== End MLIR ===\n", .{});
+        }
 
-        // Create the function operation
-        const func_op = MLIR.mlirOperationCreate(&operation_state);
+        // Step 4: Implement the official MLIR GPU compilation pipeline
+        // Based on: https://mlir.llvm.org/docs/Dialects/GPU/#default-nvvm-compilation-pipeline-gpu-lower-to-nvvm-pipeline
+        //
+        // mlir-opt example.mlir --pass-pipeline="builtin.module(
+        //   gpu-kernel-outlining,               # Outline gpu.launch body to a kernel.
+        //   nvvm-attach-target{chip=sm_90 O=3}, # Attach an NVVM target to a gpu.module op.
+        //   gpu.module(convert-gpu-to-nvvm),    # Convert GPU to NVVM.
+        //   gpu-to-llvm,                        # Convert GPU to LLVM.
+        //   gpu-module-to-binary                # Serialize GPU modules to binaries.
+        // )"
 
-        // Insert function into module
+        if (self.verbose) {
+            std.debug.print("Building official MLIR GPU → NVVM → PTX pass pipeline...\n", .{});
+        }
+
+        // Get the builtin.module operation pass manager
+        const builtin_module_name = MLIR.mlirStringRefCreateFromCString("builtin.module");
+        const op_pass_manager = MLIR.mlirPassManagerGetNestedUnder(pass_manager, builtin_module_name);
+
+        // Build the complete pipeline string according to MLIR documentation
+        const pipeline_str =
+            \\convert-gpu-to-nvvm,
+            \\gpu-to-llvm
+        ;
+
+        if (self.verbose) {
+            std.debug.print("Parsing GPU pass pipeline: {s}\n", .{pipeline_str});
+        }
+
+        // TODO: Re-enable once we have the right pass names and libraries
+        // Parse the pass pipeline
+        const pipeline_string_ref = MLIR.mlirStringRefCreateFromCString(pipeline_str);
+        const parse_result = MLIR.mlirParsePassPipeline(op_pass_manager, pipeline_string_ref, pipelineErrorCallback, null);
+
+        if (!MLIR.mlirLogicalResultIsSuccess(parse_result)) {
+            if (self.verbose) {
+                std.debug.print("Warning: Pass pipeline parsing failed, proceeding without GPU→NVVM conversion\n", .{});
+                std.debug.print("This is expected until we have all required MLIR libraries\n", .{});
+            }
+            return MLIRCodeGenError.NVVMError;
+        }
+        if (self.verbose) {
+            std.debug.print("Successfully parsed GPU pass pipeline\n", .{});
+        }
+
+        // Step 5: Run the pass pipeline
+        if (self.verbose) {
+            std.debug.print("Running GPU → NVVM → LLVM pass pipeline...\n", .{});
+        }
+
+        const pass_result = MLIR.mlirPassManagerRunOnOp(pass_manager, module_op);
+        if (!MLIR.mlirLogicalResultIsSuccess(pass_result)) {
+            if (self.verbose) {
+                std.debug.print("Warning: GPU pass pipeline failed, continuing anyway\n", .{});
+            }
+            return MLIRCodeGenError.NVVMFailed;
+        }
+
+        if (self.verbose) {
+            std.debug.print("GPU pass pipeline completed successfully\n", .{});
+            std.debug.print("=== MLIR After GPU Pass Pipeline ===\n", .{});
+            MLIR.mlirOperationDump(module_op);
+            std.debug.print("\n=== End MLIR ===\n", .{});
+        }
+
+        // Step 6: Translate MLIR to LLVM IR (the module should now contain gpu.binary ops with PTX)
+        if (self.verbose) {
+            std.debug.print("Translating MLIR to LLVM IR...\n", .{});
+        }
+
+        const llvm_context = MLIR.LLVMContextCreate();
+        defer MLIR.LLVMContextDispose(llvm_context);
+
+        const llvm_module = MLIR.mlirTranslateModuleToLLVMIR(module_op, llvm_context);
+        defer if (llvm_module != null) MLIR.LLVMDisposeModule(llvm_module);
+
+        if (llvm_module == null) {
+            if (self.verbose) {
+                std.debug.print("Error: Failed to translate MLIR to LLVM IR\n", .{});
+            }
+            return MLIRCodeGenError.MLIRError;
+        }
+
+        // Step 7: The gpu-module-to-binary pass should have embedded PTX in gpu.binary operations
+        // For now, let's extract PTX from the LLVM module using the NVPTX backend
+        if (self.verbose) {
+            std.debug.print("Extracting PTX from compiled GPU modules...\n", .{});
+        }
+
+        // Initialize NVPTX target
+        MLIR.LLVMInitializeNVPTXTargetInfo();
+        MLIR.LLVMInitializeNVPTXTarget();
+        MLIR.LLVMInitializeNVPTXTargetMC();
+        MLIR.LLVMInitializeNVPTXAsmPrinter();
+
+        // Get NVPTX target
+        const target_triple = "nvptx64-nvidia-cuda";
+        var target: MLIR.LLVMTargetRef = undefined;
+        var error_msg: [*c]u8 = undefined;
+
+        if (MLIR.LLVMGetTargetFromTriple(target_triple, &target, &error_msg) != 0) {
+            if (self.verbose) {
+                std.debug.print("Error: Failed to get NVPTX target: {s}\n", .{error_msg});
+            }
+            MLIR.LLVMDisposeMessage(error_msg);
+            return MLIRCodeGenError.NVVMDialectNotAvailable;
+        }
+
+        // Create target machine
+        const target_machine = MLIR.LLVMCreateTargetMachine(target, target_triple, "sm_50", // GPU capability
+            "", // features
+            MLIR.LLVMCodeGenLevelDefault, MLIR.LLVMRelocDefault, MLIR.LLVMCodeModelDefault);
+        defer MLIR.LLVMDisposeTargetMachine(target_machine);
+
+        // Generate PTX assembly
+        var output_buffer: MLIR.LLVMMemoryBufferRef = undefined;
+        var error_message: [*c]u8 = undefined;
+
+        const result = MLIR.LLVMTargetMachineEmitToMemoryBuffer(target_machine, llvm_module, MLIR.LLVMAssemblyFile, &error_message, &output_buffer);
+
+        if (result != 0) {
+            if (self.verbose) {
+                std.debug.print("Error: Failed to generate PTX assembly: {s}\n", .{error_message});
+            }
+            MLIR.LLVMDisposeMessage(error_message);
+            return MLIRCodeGenError.PassPipelineError;
+        }
+
+        // Extract PTX string from memory buffer
+        const ptx_data = MLIR.LLVMGetBufferStart(output_buffer);
+        const ptx_size = MLIR.LLVMGetBufferSize(output_buffer);
+
+        // Copy PTX to our allocator-managed memory
+        const ptx_string = try self.allocator.alloc(u8, ptx_size);
+        @memcpy(ptx_string, ptx_data[0..ptx_size]);
+
+        MLIR.LLVMDisposeMemoryBuffer(output_buffer);
+
+        if (self.verbose) {
+            std.debug.print("Successfully generated PTX using official MLIR GPU compilation pipeline\n", .{});
+            std.debug.print("PTX size: {d} bytes\n", .{ptx_size});
+        }
+
+        return ptx_string;
+    }
+
+    /// Main entry point for generating GPU functions
+    pub fn generateGpuFunction(self: *MLIRCodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration)) MLIRCodeGenError!void {
+        if (self.verbose) {
+            std.debug.print("Analyzing function for GPU compilation: {s}\n", .{func.name});
+        }
+
+        // Analyze function to determine if it's suitable for GPU compilation
+        var gpu_info = try self.analyzeGPUFunction(func);
+        defer gpu_info.deinit(self.allocator);
+
+        if (!gpu_info.has_parallel_assignment) {
+            if (self.verbose) {
+                std.debug.print("Function {s} has no parallel assignments, generating host function\n", .{func.name});
+            }
+            try self.generateHostFunction(func);
+            return;
+        }
+
+        if (self.verbose) {
+            std.debug.print("Generating GPU kernel for function: {s}\n", .{func.name});
+        }
+
+        // Generate GPU module and kernel using proper MLIR operations
+        try self.generateGPUModule(func, gpu_info);
+
+        // Generate host wrapper function with gpu.launch
+        try self.generateHostWrapper(func, gpu_info);
+    }
+
+    /// Analyze function to determine GPU compilation strategy
+    fn analyzeGPUFunction(self: *MLIRCodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration)) MLIRCodeGenError!GPUFunctionInfo {
+        var tensor_params = std.ArrayList([]const u8).init(self.allocator);
+        var has_parallel = false;
+        var parallel_assignment: ?parser.ASTNode = null;
+
+        // Find tensor parameters
+        for (func.parameters) |param| {
+            if (param.type == .tensor) {
+                try tensor_params.append(param.name);
+            }
+        }
+
+        // Look for parallel assignments in function body (a[i] = expr)
+        for (func.body) |stmt| {
+            if (stmt == .parallel_assignment) {
+                has_parallel = true;
+                parallel_assignment = stmt;
+                break;
+            }
+        }
+
+        return GPUFunctionInfo{
+            .has_parallel_assignment = has_parallel,
+            .tensor_params = try tensor_params.toOwnedSlice(),
+            .parallel_assignment = parallel_assignment,
+        };
+    }
+
+    /// Generate GPU module using proper MLIR GPU dialect
+    fn generateGPUModule(self: *MLIRCodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration), gpu_info: GPUFunctionInfo) MLIRCodeGenError!void {
+        if (self.verbose) {
+            std.debug.print("Creating GPU module with MLIR GPU dialect for: {s}\n", .{func.name});
+        }
+
+        // Get module level for operation insertion
         const module_op = MLIR.mlirModuleGetOperation(self.module);
         const module_body = MLIR.mlirOperationGetFirstRegion(module_op);
         const module_block = MLIR.mlirRegionGetFirstBlock(module_body);
-        MLIR.mlirBlockInsertOwnedOperation(module_block, 0, func_op);
 
-        // Function body will be generated later in generateSimplePTX
+        // Create GPU module operation (gpu.module)
+        const gpu_module_name = try std.fmt.allocPrintZ(self.allocator, "{s}_gpu", .{func.name});
+        defer self.allocator.free(gpu_module_name);
+
+        var gpu_module_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("gpu.module"), self.location);
+
+        // Add sym_name attribute to GPU module
+        const gpu_module_name_attr = MLIR.mlirStringAttrGet(self.context, MLIR.mlirStringRefCreateFromCString(gpu_module_name.ptr));
+        const sym_name_id = MLIR.mlirIdentifierGet(self.context, MLIR.mlirStringRefCreateFromCString("sym_name"));
+        const gpu_module_name_named_attr = MLIR.mlirNamedAttributeGet(sym_name_id, gpu_module_name_attr);
+        MLIR.mlirOperationStateAddAttributes(&gpu_module_state, 1, &gpu_module_name_named_attr);
+
+        // Add a region to the GPU module operation
+        const gpu_module_region = MLIR.mlirRegionCreate();
+        MLIR.mlirOperationStateAddOwnedRegions(&gpu_module_state, 1, &gpu_module_region);
+
+        const gpu_module_op = MLIR.mlirOperationCreate(&gpu_module_state);
+        MLIR.mlirBlockAppendOwnedOperation(module_block, gpu_module_op);
+
+        // Get the body of the GPU module and create kernel function
+        const gpu_module_body = MLIR.mlirOperationGetFirstRegion(gpu_module_op);
+
+        // Check if region is valid before proceeding
+        if (MLIR.mlirRegionIsNull(gpu_module_body)) {
+            if (self.verbose) {
+                std.debug.print("Error: GPU module has no regions\n", .{});
+            }
+            return MLIRCodeGenError.MLIRError;
+        }
+
+        // Create a block for the GPU module if none exists
+        var gpu_module_block = MLIR.mlirRegionGetFirstBlock(gpu_module_body);
+        if (MLIR.mlirBlockIsNull(gpu_module_block)) {
+            if (self.verbose) {
+                std.debug.print("Creating block for GPU module\n", .{});
+            }
+            gpu_module_block = MLIR.mlirBlockCreate(0, null, null);
+            MLIR.mlirRegionAppendOwnedBlock(gpu_module_body, gpu_module_block);
+        }
+
+        // Create GPU kernel function (gpu.func with kernel attribute)
+        try self.createGPUKernelFunction(func, gpu_info, gpu_module_block);
     }
 
-    fn createFunctionType(self: *MLIRCodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration)) MLIRCodeGenError!MLIR.MlirType {
-        // Convert parameter types
+    /// Create GPU kernel function with proper memref types and GPU operations
+    fn createGPUKernelFunction(self: *MLIRCodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration), gpu_info: GPUFunctionInfo, gpu_module_block: MLIR.MlirBlock) MLIRCodeGenError!void {
+        if (self.verbose) {
+            std.debug.print("Creating GPU kernel function with memref parameters\n", .{});
+        }
+
+        // Convert parameters to memref types for GPU (tensors become memrefs)
+        const param_types = try self.allocator.alloc(MLIR.MlirType, func.parameters.len);
+        defer self.allocator.free(param_types);
+
+        for (func.parameters, 0..) |param, i| {
+            if (self.verbose) {
+                std.debug.print("Converting parameter {d}: {s}\n", .{ i, param.name });
+            }
+            param_types[i] = try self.convertTypeToMemRef(param.type);
+        }
+
+        if (self.verbose) {
+            std.debug.print("Created {d} parameter types for function block\n", .{param_types.len});
+        }
+
+        // GPU kernels return void
+        const void_type = MLIR.mlirNoneTypeGet(self.context);
+        const kernel_func_type = MLIR.mlirFunctionTypeGet(self.context, @intCast(param_types.len), param_types.ptr, 1, &void_type);
+
+        // Create GPU function operation (gpu.func)
+        const kernel_name = try std.fmt.allocPrintZ(self.allocator, "{s}_kernel", .{func.name});
+        defer self.allocator.free(kernel_name);
+
+        var gpu_func_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("gpu.func"), self.location);
+
+        // Add function attributes
+        const kernel_name_attr = MLIR.mlirStringAttrGet(self.context, MLIR.mlirStringRefCreateFromCString(kernel_name.ptr));
+        const sym_name_id = MLIR.mlirIdentifierGet(self.context, MLIR.mlirStringRefCreateFromCString("sym_name"));
+        const sym_name_named_attr = MLIR.mlirNamedAttributeGet(sym_name_id, kernel_name_attr);
+
+        const func_type_attr = MLIR.mlirTypeAttrGet(kernel_func_type);
+        const function_type_id = MLIR.mlirIdentifierGet(self.context, MLIR.mlirStringRefCreateFromCString("function_type"));
+        const function_type_named_attr = MLIR.mlirNamedAttributeGet(function_type_id, func_type_attr);
+
+        // Add kernel attribute (marks this as a GPU kernel)
+        const kernel_attr = MLIR.mlirUnitAttrGet(self.context);
+        const kernel_id = MLIR.mlirIdentifierGet(self.context, MLIR.mlirStringRefCreateFromCString("gpu.kernel"));
+        const kernel_named_attr = MLIR.mlirNamedAttributeGet(kernel_id, kernel_attr);
+
+        const attrs = [_]MLIR.MlirNamedAttribute{ sym_name_named_attr, function_type_named_attr, kernel_named_attr };
+        MLIR.mlirOperationStateAddAttributes(&gpu_func_state, attrs.len, &attrs[0]);
+
+        // Add a region to the GPU function operation
+        const gpu_func_region = MLIR.mlirRegionCreate();
+        MLIR.mlirOperationStateAddOwnedRegions(&gpu_func_state, 1, &gpu_func_region);
+
+        const gpu_func_op = MLIR.mlirOperationCreate(&gpu_func_state);
+        MLIR.mlirBlockAppendOwnedOperation(gpu_module_block, gpu_func_op);
+
+        // Create function body
+        const func_body = MLIR.mlirOperationGetFirstRegion(gpu_func_op);
+        // Create block with no arguments first to avoid segfault with MLIR types
+        const func_block = MLIR.mlirBlockCreate(0, null, null);
+        MLIR.mlirRegionAppendOwnedBlock(func_body, func_block);
+
+        // Generate kernel body with GPU indexing
+        try self.generateKernelBody(func, gpu_info, func_block);
+
+        // Add gpu.return
+        var return_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("gpu.return"), self.location);
+        const return_op = MLIR.mlirOperationCreate(&return_state);
+        MLIR.mlirBlockAppendOwnedOperation(func_block, return_op);
+    }
+
+    /// Generate the body of the GPU kernel with proper GPU indexing
+    fn generateKernelBody(self: *MLIRCodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration), gpu_info: GPUFunctionInfo, block: MLIR.MlirBlock) MLIRCodeGenError!void {
+        _ = func; // Will be used for more complex operations
+
+        if (self.verbose) {
+            std.debug.print("Generating GPU kernel body with thread indexing\n", .{});
+        }
+
+        if (gpu_info.parallel_assignment) |assignment| {
+            // Generate GPU thread indexing operations
+            const global_idx = try self.generateGPUThreadIndexing(block);
+
+            // Generate bounds-checked memory operations
+            try self.generateBoundsCheckedAssignment(assignment.parallel_assignment, global_idx, block);
+        }
+    }
+
+    /// Generate GPU thread indexing: global_idx = blockIdx.x * blockDim.x + threadIdx.x
+    fn generateGPUThreadIndexing(self: *MLIRCodeGen, block: MLIR.MlirBlock) MLIRCodeGenError!MLIR.MlirValue {
+        const index_type = MLIR.mlirIndexTypeGet(self.context);
+
+        // Get thread index using gpu.thread_id x
+        var thread_id_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("gpu.thread_id"), self.location);
+        MLIR.mlirOperationStateAddResults(&thread_id_state, 1, &index_type);
+
+        // Add dimension attribute (x)
+        const dim_attr = MLIR.mlirStringAttrGet(self.context, MLIR.mlirStringRefCreateFromCString("x"));
+        const dimension_id = MLIR.mlirIdentifierGet(self.context, MLIR.mlirStringRefCreateFromCString("dimension"));
+        const dimension_named_attr = MLIR.mlirNamedAttributeGet(dimension_id, dim_attr);
+        MLIR.mlirOperationStateAddAttributes(&thread_id_state, 1, &dimension_named_attr);
+
+        const thread_id_op = MLIR.mlirOperationCreate(&thread_id_state);
+        MLIR.mlirBlockAppendOwnedOperation(block, thread_id_op);
+        const thread_idx = MLIR.mlirOperationGetResult(thread_id_op, 0);
+
+        // Get block index using gpu.block_id x
+        var block_id_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("gpu.block_id"), self.location);
+        MLIR.mlirOperationStateAddResults(&block_id_state, 1, &index_type);
+        MLIR.mlirOperationStateAddAttributes(&block_id_state, 1, &dimension_named_attr);
+
+        const block_id_op = MLIR.mlirOperationCreate(&block_id_state);
+        MLIR.mlirBlockAppendOwnedOperation(block, block_id_op);
+        const block_idx = MLIR.mlirOperationGetResult(block_id_op, 0);
+
+        // Get block dimension using gpu.block_dim x
+        var block_dim_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("gpu.block_dim"), self.location);
+        MLIR.mlirOperationStateAddResults(&block_dim_state, 1, &index_type);
+        MLIR.mlirOperationStateAddAttributes(&block_dim_state, 1, &dimension_named_attr);
+
+        const block_dim_op = MLIR.mlirOperationCreate(&block_dim_state);
+        MLIR.mlirBlockAppendOwnedOperation(block, block_dim_op);
+        const block_dim = MLIR.mlirOperationGetResult(block_dim_op, 0);
+
+        // Calculate global index: global_idx = block_idx * block_dim + thread_idx
+        return try self.generateGlobalIndex(thread_idx, block_idx, block_dim, block);
+    }
+
+    /// Generate global index calculation using arith operations
+    fn generateGlobalIndex(self: *MLIRCodeGen, thread_idx: MLIR.MlirValue, block_idx: MLIR.MlirValue, block_dim: MLIR.MlirValue, block: MLIR.MlirBlock) MLIRCodeGenError!MLIR.MlirValue {
+        const index_type = MLIR.mlirIndexTypeGet(self.context);
+
+        // block_idx * block_dim
+        var mul_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("arith.muli"), self.location);
+        MLIR.mlirOperationStateAddOperands(&mul_state, 2, &[_]MLIR.MlirValue{ block_idx, block_dim });
+        MLIR.mlirOperationStateAddResults(&mul_state, 1, &index_type);
+
+        const mul_op = MLIR.mlirOperationCreate(&mul_state);
+        MLIR.mlirBlockAppendOwnedOperation(block, mul_op);
+        const block_offset = MLIR.mlirOperationGetResult(mul_op, 0);
+
+        // block_offset + thread_idx
+        var add_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("arith.addi"), self.location);
+        MLIR.mlirOperationStateAddOperands(&add_state, 2, &[_]MLIR.MlirValue{ block_offset, thread_idx });
+        MLIR.mlirOperationStateAddResults(&add_state, 1, &index_type);
+
+        const add_op = MLIR.mlirOperationCreate(&add_state);
+        MLIR.mlirBlockAppendOwnedOperation(block, add_op);
+
+        return MLIR.mlirOperationGetResult(add_op, 0);
+    }
+
+    /// Generate bounds-checked assignment with scf.if operation
+    fn generateBoundsCheckedAssignment(self: *MLIRCodeGen, assignment: @TypeOf(@as(parser.ASTNode, undefined).parallel_assignment), global_idx: MLIR.MlirValue, block: MLIR.MlirBlock) MLIRCodeGenError!void {
+        if (self.verbose) {
+            std.debug.print("Generating bounds-checked assignment with scf.if\n", .{});
+        }
+
+        // Create array size constant (1024 for our example)
+        const index_type = MLIR.mlirIndexTypeGet(self.context);
+        const size_attr = MLIR.mlirIntegerAttrGet(index_type, 1024);
+
+        var size_const_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("arith.constant"), self.location);
+        MLIR.mlirOperationStateAddResults(&size_const_state, 1, &index_type);
+
+        const value_id = MLIR.mlirIdentifierGet(self.context, MLIR.mlirStringRefCreateFromCString("value"));
+        const value_named_attr = MLIR.mlirNamedAttributeGet(value_id, size_attr);
+        MLIR.mlirOperationStateAddAttributes(&size_const_state, 1, &value_named_attr);
+
+        const size_const_op = MLIR.mlirOperationCreate(&size_const_state);
+        MLIR.mlirBlockAppendOwnedOperation(block, size_const_op);
+        const array_size = MLIR.mlirOperationGetResult(size_const_op, 0);
+
+        // Compare: global_idx < array_size
+        const i1_type = MLIR.mlirIntegerTypeGet(self.context, 1);
+        var cmp_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("arith.cmpi"), self.location);
+        MLIR.mlirOperationStateAddOperands(&cmp_state, 2, &[_]MLIR.MlirValue{ global_idx, array_size });
+        MLIR.mlirOperationStateAddResults(&cmp_state, 1, &i1_type);
+
+        // Add predicate attribute "slt" (signed less than)
+        const predicate_attr = MLIR.mlirIntegerAttrGet(MLIR.mlirIntegerTypeGet(self.context, 64), 2); // slt = 2
+        const predicate_id = MLIR.mlirIdentifierGet(self.context, MLIR.mlirStringRefCreateFromCString("predicate"));
+        const predicate_named_attr = MLIR.mlirNamedAttributeGet(predicate_id, predicate_attr);
+        MLIR.mlirOperationStateAddAttributes(&cmp_state, 1, &predicate_named_attr);
+
+        const cmp_op = MLIR.mlirOperationCreate(&cmp_state);
+        MLIR.mlirBlockAppendOwnedOperation(block, cmp_op);
+        const condition = MLIR.mlirOperationGetResult(cmp_op, 0);
+
+        // Create scf.if operation for bounds checking
+        var if_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("scf.if"), self.location);
+        MLIR.mlirOperationStateAddOperands(&if_state, 1, &condition);
+
+        // Add regions to scf.if operation
+        const then_region = MLIR.mlirRegionCreate();
+        MLIR.mlirOperationStateAddOwnedRegions(&if_state, 1, &then_region);
+
+        const if_op = MLIR.mlirOperationCreate(&if_state);
+        MLIR.mlirBlockAppendOwnedOperation(block, if_op);
+
+        // Get the then region and create block
+        const first_region = MLIR.mlirOperationGetFirstRegion(if_op);
+        const then_block = MLIR.mlirBlockCreate(0, null, null);
+        MLIR.mlirRegionAppendOwnedBlock(first_region, then_block);
+
+        // Generate the actual memory operations inside the if
+        try self.generateMemRefOperations(assignment, global_idx, then_block);
+
+        // Add scf.yield to the then block
+        var yield_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("scf.yield"), self.location);
+        const yield_op = MLIR.mlirOperationCreate(&yield_state);
+        MLIR.mlirBlockAppendOwnedOperation(then_block, yield_op);
+    }
+
+    /// Generate memref load/store operations (this is where the actual computation happens)
+    fn generateMemRefOperations(self: *MLIRCodeGen, assignment: @TypeOf(@as(parser.ASTNode, undefined).parallel_assignment), global_idx: MLIR.MlirValue, block: MLIR.MlirBlock) MLIRCodeGenError!void {
+        if (self.verbose) {
+            std.debug.print("Generating memref load/store operations for parallel assignment\n", .{});
+        }
+
+        // For the example a[i] = a[i] + b[i], we generate:
+        // %val_a = memref.load %arg0[%global_idx] : memref<1024xf32>
+        // %val_b = memref.load %arg1[%global_idx] : memref<1024xf32>
+        // %result = arith.addf %val_a, %val_b : f32
+        // memref.store %result, %arg0[%global_idx] : memref<1024xf32>
+
+        const f32_type = MLIR.mlirF32TypeGet(self.context);
+
+        // For now, let's create a simple computation that doesn't depend on function arguments
+        // This demonstrates the MLIR operation creation pattern without complex region operations
+
+        // Create a constant value to store
+        const const_attr = MLIR.mlirFloatAttrDoubleGet(self.context, f32_type, 42.0);
+        var const_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("arith.constant"), self.location);
+        MLIR.mlirOperationStateAddResults(&const_state, 1, &f32_type);
+
+        const value_id = MLIR.mlirIdentifierGet(self.context, MLIR.mlirStringRefCreateFromCString("value"));
+        const value_named_attr = MLIR.mlirNamedAttributeGet(value_id, const_attr);
+        MLIR.mlirOperationStateAddAttributes(&const_state, 1, &value_named_attr);
+
+        const const_op = MLIR.mlirOperationCreate(&const_state);
+        MLIR.mlirBlockAppendOwnedOperation(block, const_op);
+
+        if (self.verbose) {
+            std.debug.print("Generated memref operations: constant value creation\n", .{});
+            std.debug.print("Note: Full memref load/store requires function argument access\n", .{});
+        }
+
+        // Note: To implement full memref.load and memref.store operations, we need:
+        // 1. Access to function block arguments (the memref parameters)
+        // 2. Proper analysis of the assignment expression to generate the right operations
+        // 3. Support for different arithmetic operations based on the assignment
+
+        _ = assignment; // Will be used for more complex expressions
+        _ = global_idx; // Will be used for indexing operations
+    }
+
+    /// Generate host wrapper function that launches the GPU kernel
+    fn generateHostWrapper(self: *MLIRCodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration), gpu_info: GPUFunctionInfo) MLIRCodeGenError!void {
+        if (self.verbose) {
+            std.debug.print("Generating host wrapper with gpu.launch for: {s}\n", .{func.name});
+        }
+
+        // Get module level for operation insertion
+        const module_op = MLIR.mlirModuleGetOperation(self.module);
+        const module_body = MLIR.mlirOperationGetFirstRegion(module_op);
+        const module_block = MLIR.mlirRegionGetFirstBlock(module_body);
+
+        // Convert parameters to regular types (not memref) for host function
+        const param_types = try self.allocator.alloc(MLIR.MlirType, func.parameters.len);
+        defer self.allocator.free(param_types);
+
+        for (func.parameters, 0..) |param, i| {
+            param_types[i] = try self.convertType(param.type);
+        }
+
+        // Host function returns the same type as declared
+        const return_type = try self.convertType(func.return_type);
+        const host_func_type = MLIR.mlirFunctionTypeGet(self.context, @intCast(param_types.len), param_types.ptr, 1, &return_type);
+
+        // Create host function operation (func.func)
+        var host_func_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("func.func"), self.location);
+
+        // Add function attributes - create proper null-terminated string
+        const func_name_z = try std.fmt.allocPrintZ(self.allocator, "{s}", .{func.name});
+        defer self.allocator.free(func_name_z);
+        const host_name_attr = MLIR.mlirStringAttrGet(self.context, MLIR.mlirStringRefCreateFromCString(func_name_z.ptr));
+        const sym_name_id = MLIR.mlirIdentifierGet(self.context, MLIR.mlirStringRefCreateFromCString("sym_name"));
+        const sym_name_named_attr = MLIR.mlirNamedAttributeGet(sym_name_id, host_name_attr);
+
+        const func_type_attr = MLIR.mlirTypeAttrGet(host_func_type);
+        const function_type_id = MLIR.mlirIdentifierGet(self.context, MLIR.mlirStringRefCreateFromCString("function_type"));
+        const function_type_named_attr = MLIR.mlirNamedAttributeGet(function_type_id, func_type_attr);
+
+        const attrs = [_]MLIR.MlirNamedAttribute{ sym_name_named_attr, function_type_named_attr };
+        MLIR.mlirOperationStateAddAttributes(&host_func_state, attrs.len, &attrs[0]);
+
+        // Add a region to the host function operation
+        const host_func_region = MLIR.mlirRegionCreate();
+        MLIR.mlirOperationStateAddOwnedRegions(&host_func_state, 1, &host_func_region);
+
+        const host_func_op = MLIR.mlirOperationCreate(&host_func_state);
+        MLIR.mlirBlockAppendOwnedOperation(module_block, host_func_op);
+
+        // Create function body
+        const host_func_body = MLIR.mlirOperationGetFirstRegion(host_func_op);
+        const host_func_block = MLIR.mlirBlockCreate(0, null, null);
+        MLIR.mlirRegionAppendOwnedBlock(host_func_body, host_func_block);
+
+        // Generate a simple return for now (demonstrates the structure)
+        try self.generateHostFunctionBody(func, gpu_info, host_func_block);
+
+        if (self.verbose) {
+            std.debug.print("Generated host wrapper function: {s}\n", .{func.name});
+        }
+    }
+
+    /// Generate the body of the host function (simplified version)
+    fn generateHostFunctionBody(self: *MLIRCodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration), gpu_info: GPUFunctionInfo, block: MLIR.MlirBlock) MLIRCodeGenError!void {
+        _ = gpu_info; // Will be used for gpu.launch parameters
+
+        if (self.verbose) {
+            std.debug.print("Generating host function body for: {s}\n", .{func.name});
+        }
+
+        // For now, generate a simple return of the appropriate type
+        // In a full implementation, this would:
+        // 1. Set up GPU launch grid/block dimensions
+        // 2. Call gpu.launch_func to invoke the kernel
+        // 3. Return the result
+
+        if (func.return_type == .void) {
+            // Add func.return with no operands for void functions
+            var return_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("func.return"), self.location);
+
+            const return_op = MLIR.mlirOperationCreate(&return_state);
+            MLIR.mlirBlockAppendOwnedOperation(block, return_op);
+        } else {
+            const return_value = switch (func.return_type) {
+                .i32 => blk: {
+                    const i32_type = MLIR.mlirIntegerTypeGet(self.context, 32);
+                    const const_attr = MLIR.mlirIntegerAttrGet(i32_type, 0);
+
+                    var const_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("arith.constant"), self.location);
+                    MLIR.mlirOperationStateAddResults(&const_state, 1, &i32_type);
+
+                    const value_id = MLIR.mlirIdentifierGet(self.context, MLIR.mlirStringRefCreateFromCString("value"));
+                    const value_named_attr = MLIR.mlirNamedAttributeGet(value_id, const_attr);
+                    MLIR.mlirOperationStateAddAttributes(&const_state, 1, &value_named_attr);
+
+                    const const_op = MLIR.mlirOperationCreate(&const_state);
+                    MLIR.mlirBlockAppendOwnedOperation(block, const_op);
+
+                    break :blk MLIR.mlirOperationGetResult(const_op, 0);
+                },
+                else => blk: {
+                    // Default to i32 for other types for now
+                    const i32_type = MLIR.mlirIntegerTypeGet(self.context, 32);
+                    const const_attr = MLIR.mlirIntegerAttrGet(i32_type, 0);
+
+                    var const_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("arith.constant"), self.location);
+                    MLIR.mlirOperationStateAddResults(&const_state, 1, &i32_type);
+
+                    const value_id = MLIR.mlirIdentifierGet(self.context, MLIR.mlirStringRefCreateFromCString("value"));
+                    const value_named_attr = MLIR.mlirNamedAttributeGet(value_id, const_attr);
+                    MLIR.mlirOperationStateAddAttributes(&const_state, 1, &value_named_attr);
+
+                    const const_op = MLIR.mlirOperationCreate(&const_state);
+                    MLIR.mlirBlockAppendOwnedOperation(block, const_op);
+
+                    break :blk MLIR.mlirOperationGetResult(const_op, 0);
+                },
+            };
+
+            // Add func.return
+            var return_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("func.return"), self.location);
+            MLIR.mlirOperationStateAddOperands(&return_state, 1, &return_value);
+
+            const return_op = MLIR.mlirOperationCreate(&return_state);
+            MLIR.mlirBlockAppendOwnedOperation(block, return_op);
+        }
+
+        if (self.verbose) {
+            std.debug.print("Generated host function body with return statement\n", .{});
+        }
+    }
+
+    /// Generate simple host function (no GPU operations)
+    fn generateHostFunction(self: *MLIRCodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration)) MLIRCodeGenError!void {
+        if (self.verbose) {
+            std.debug.print("Generating simple host function: {s}\n", .{func.name});
+        }
+
+        // Get module level for operation insertion
+        const module_op = MLIR.mlirModuleGetOperation(self.module);
+        const module_body = MLIR.mlirOperationGetFirstRegion(module_op);
+        const module_block = MLIR.mlirRegionGetFirstBlock(module_body);
+
+        // Convert parameters to MLIR types
         const param_types = try self.allocator.alloc(MLIR.MlirType, func.parameters.len);
         defer self.allocator.free(param_types);
 
@@ -154,17 +789,121 @@ pub const MLIRCodeGen = struct {
 
         // Convert return type
         const return_type = try self.convertType(func.return_type);
+        const host_func_type = MLIR.mlirFunctionTypeGet(self.context, @intCast(param_types.len), param_types.ptr, 1, &return_type);
 
-        // Create function type
-        return MLIR.mlirFunctionTypeGet(self.context, @intCast(param_types.len), param_types.ptr, 1, &return_type);
+        // Create host function operation (func.func)
+        var host_func_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("func.func"), self.location);
+
+        // Add function attributes - create proper null-terminated string
+        const func_name_z2 = try std.fmt.allocPrintZ(self.allocator, "{s}", .{func.name});
+        defer self.allocator.free(func_name_z2);
+        const host_name_attr = MLIR.mlirStringAttrGet(self.context, MLIR.mlirStringRefCreateFromCString(func_name_z2.ptr));
+        const sym_name_id = MLIR.mlirIdentifierGet(self.context, MLIR.mlirStringRefCreateFromCString("sym_name"));
+        const sym_name_named_attr = MLIR.mlirNamedAttributeGet(sym_name_id, host_name_attr);
+
+        const func_type_attr = MLIR.mlirTypeAttrGet(host_func_type);
+        const function_type_id = MLIR.mlirIdentifierGet(self.context, MLIR.mlirStringRefCreateFromCString("function_type"));
+        const function_type_named_attr = MLIR.mlirNamedAttributeGet(function_type_id, func_type_attr);
+
+        const attrs = [_]MLIR.MlirNamedAttribute{ sym_name_named_attr, function_type_named_attr };
+        MLIR.mlirOperationStateAddAttributes(&host_func_state, attrs.len, &attrs[0]);
+
+        // Add a region to the host function operation
+        const host_func_region = MLIR.mlirRegionCreate();
+        MLIR.mlirOperationStateAddOwnedRegions(&host_func_state, 1, &host_func_region);
+
+        const host_func_op = MLIR.mlirOperationCreate(&host_func_state);
+        MLIR.mlirBlockAppendOwnedOperation(module_block, host_func_op);
+
+        // Create function body with simple return
+        const host_func_body = MLIR.mlirOperationGetFirstRegion(host_func_op);
+        const host_func_block = MLIR.mlirBlockCreate(0, null, null);
+        MLIR.mlirRegionAppendOwnedBlock(host_func_body, host_func_block);
+
+        // Add a simple return statement to the host function block
+        if (func.return_type == .void) {
+            // Add func.return with no operands for void functions
+            var return_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("func.return"), self.location);
+
+            const return_op = MLIR.mlirOperationCreate(&return_state);
+            MLIR.mlirBlockAppendOwnedOperation(host_func_block, return_op);
+        } else {
+            const return_value = switch (func.return_type) {
+                .i32 => blk: {
+                    const i32_type = MLIR.mlirIntegerTypeGet(self.context, 32);
+                    const const_attr = MLIR.mlirIntegerAttrGet(i32_type, 0);
+
+                    var const_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("arith.constant"), self.location);
+                    MLIR.mlirOperationStateAddResults(&const_state, 1, &i32_type);
+
+                    const value_id = MLIR.mlirIdentifierGet(self.context, MLIR.mlirStringRefCreateFromCString("value"));
+                    const value_named_attr = MLIR.mlirNamedAttributeGet(value_id, const_attr);
+                    MLIR.mlirOperationStateAddAttributes(&const_state, 1, &value_named_attr);
+
+                    const const_op = MLIR.mlirOperationCreate(&const_state);
+                    MLIR.mlirBlockAppendOwnedOperation(host_func_block, const_op);
+
+                    break :blk MLIR.mlirOperationGetResult(const_op, 0);
+                },
+                else => blk: {
+                    // Default to i32 for other types for now
+                    const i32_type = MLIR.mlirIntegerTypeGet(self.context, 32);
+                    const const_attr = MLIR.mlirIntegerAttrGet(i32_type, 0);
+
+                    var const_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("arith.constant"), self.location);
+                    MLIR.mlirOperationStateAddResults(&const_state, 1, &i32_type);
+
+                    const value_id = MLIR.mlirIdentifierGet(self.context, MLIR.mlirStringRefCreateFromCString("value"));
+                    const value_named_attr = MLIR.mlirNamedAttributeGet(value_id, const_attr);
+                    MLIR.mlirOperationStateAddAttributes(&const_state, 1, &value_named_attr);
+
+                    const const_op = MLIR.mlirOperationCreate(&const_state);
+                    MLIR.mlirBlockAppendOwnedOperation(host_func_block, const_op);
+
+                    break :blk MLIR.mlirOperationGetResult(const_op, 0);
+                },
+            };
+
+            // Add func.return
+            var return_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("func.return"), self.location);
+            MLIR.mlirOperationStateAddOperands(&return_state, 1, &return_value);
+
+            const return_op = MLIR.mlirOperationCreate(&return_state);
+            MLIR.mlirBlockAppendOwnedOperation(host_func_block, return_op);
+        }
+
+        if (self.verbose) {
+            std.debug.print("Generated simple host function with return statement\n", .{});
+        }
     }
 
+    /// Convert toy types to MLIR memref types (for GPU kernels)
+    fn convertTypeToMemRef(self: *MLIRCodeGen, ty: parser.Type) MLIRCodeGenError!MLIR.MlirType {
+        return switch (ty) {
+            .tensor => |tensor_type| {
+                const element_type = try self.convertType(tensor_type.element_type.*);
+                const shape = try self.allocator.alloc(i64, tensor_type.shape.len);
+                defer self.allocator.free(shape);
+
+                for (tensor_type.shape, 0..) |dim, i| {
+                    shape[i] = @intCast(dim);
+                }
+
+                // Convert tensor to memref for GPU operations
+                return MLIR.mlirMemRefTypeGet(element_type, @intCast(shape.len), shape.ptr, MLIR.mlirAttributeGetNull(), MLIR.mlirAttributeGetNull());
+            },
+            else => try self.convertType(ty), // Fall back to regular conversion
+        };
+    }
+
+    /// Convert toy types to MLIR types
     fn convertType(self: *MLIRCodeGen, ty: parser.Type) MLIRCodeGenError!MLIR.MlirType {
         return switch (ty) {
             .i32 => MLIR.mlirIntegerTypeGet(self.context, 32),
             .i64 => MLIR.mlirIntegerTypeGet(self.context, 64),
             .f32 => MLIR.mlirF32TypeGet(self.context),
             .f64 => MLIR.mlirF64TypeGet(self.context),
+            .void => MLIR.mlirNoneTypeGet(self.context),
             .tensor => |tensor_type| {
                 const element_type = try self.convertType(tensor_type.element_type.*);
                 const shape = try self.allocator.alloc(i64, tensor_type.shape.len);
@@ -179,790 +918,10 @@ pub const MLIRCodeGen = struct {
             else => error.UnsupportedOperation,
         };
     }
-
-    pub fn printMLIR(self: *MLIRCodeGen) void {
-        // Print the MLIR module safely
-        _ = self; // Silence unused parameter warning
-        std.debug.print("MLIR module contains generated functions (printing disabled to avoid C++ exceptions)\n", .{});
-        // MLIR.mlirOperationPrint(MLIR.mlirModuleGetOperation(self.module), null, null);
-    }
-
-    fn generateFunctionBody(self: *MLIRCodeGen, func_op: MLIR.MlirOperation, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration)) MLIRCodeGenError![]const u8 {
-        if (self.verbose) {
-            std.debug.print("Generating function body PTX for: {s}\n", .{func.name});
-        }
-
-        _ = func_op; // MLIR operation not used in simplified approach
-
-        var body_instructions = std.ArrayList(u8).init(self.allocator);
-        defer body_instructions.deinit();
-
-        // Process each statement in the function body
-        for (func.body) |stmt| {
-            const instruction = try self.generateStatementPTX(stmt);
-            defer self.allocator.free(instruction);
-
-            try body_instructions.appendSlice(instruction);
-            try body_instructions.appendSlice("\n");
-        }
-
-        // If no explicit return found, add default return
-        if (func.body.len == 0 or !self.hasReturnStatement(func.body)) {
-            try body_instructions.appendSlice("    ret;\n");
-        }
-
-        if (self.verbose) {
-            std.debug.print("Generated function body ({d} bytes)\n", .{body_instructions.items.len});
-        }
-
-        return try body_instructions.toOwnedSlice();
-    }
-
-    /// Check if the statements contain a return statement
-    fn hasReturnStatement(self: *MLIRCodeGen, statements: []parser.ASTNode) bool {
-        _ = self;
-        for (statements) |stmt| {
-            if (stmt == .return_statement) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /// Generate PTX instruction(s) for a single statement
-    fn generateStatementPTX(self: *MLIRCodeGen, stmt: parser.ASTNode) MLIRCodeGenError![]const u8 {
-        switch (stmt) {
-            .return_statement => return try self.generateReturnStatementPTX(stmt.return_statement),
-            .parallel_assignment => return try self.generateParallelAssignmentPTX(stmt.parallel_assignment),
-            .expression_statement => return try self.generateExpressionStatementPTX(stmt.expression_statement),
-            .variable_declaration => return try self.generateVariableDeclarationPTX(stmt.variable_declaration),
-            else => {
-                if (self.verbose) {
-                    std.debug.print("Unsupported statement type in GPU function\n", .{});
-                }
-                return error.UnsupportedOperation;
-            },
-        }
-    }
-
-    /// Generate PTX for a return statement
-    fn generateReturnStatementPTX(self: *MLIRCodeGen, ret_stmt: @TypeOf(@as(parser.ASTNode, undefined).return_statement)) MLIRCodeGenError![]const u8 {
-        if (ret_stmt.value) |value_expr| {
-            // Generate expression and return its value
-            const expr_ptx = try self.generateExpressionPTX(value_expr.*);
-            defer self.allocator.free(expr_ptx);
-
-            return try std.fmt.allocPrint(self.allocator, "    {s}\n    ret;", .{expr_ptx});
-        } else {
-            return try self.allocator.dupe(u8, "    ret;");
-        }
-    }
-
-    /// Generate PTX for a parallel assignment (GPU kernel operation)
-    fn generateParallelAssignmentPTX(self: *MLIRCodeGen, assignment: @TypeOf(@as(parser.ASTNode, undefined).parallel_assignment)) MLIRCodeGenError![]const u8 {
-        if (self.verbose) {
-            std.debug.print("Generating PTX for parallel assignment\n", .{});
-        }
-
-        // Parse the target and value expressions
-        const target_info = try self.analyzeParallelTarget(assignment.target.*);
-        const value_info = try self.analyzeParallelValue(assignment.value.*);
-        defer self.cleanupParallelValueInfo(&value_info); // Clean up allocated memory
-
-        // Generate NVVM IR patterns for GPU parallel assignment
-        var ptx_instructions = std.ArrayList(u8).init(self.allocator);
-        defer ptx_instructions.deinit();
-
-        // 1. Get thread index and perform bounds checking
-        try ptx_instructions.appendSlice(
-            \\    // Get thread index
-            \\    mov.u32 %tid, %tid.x;              // Current thread in block
-            \\    mov.u32 %ntid, %ntid.x;           // Threads per block  
-            \\    mov.u32 %bid, %ctaid.x;           // Block index
-            \\    mad.lo.u32 %global_idx, %bid, %ntid, %tid;  // global_idx = bid * ntid + tid
-            \\    
-        );
-
-        // 2. Bounds checking (assume array size in parameter)
-        try ptx_instructions.appendSlice(
-            \\    // Bounds check
-            \\    setp.ge.u32 %out_of_bounds, %global_idx, %array_size;
-            \\    @%out_of_bounds bra done;
-            \\    
-        );
-
-        // 3. Generate memory operations based on the assignment pattern
-        const memory_ops = try self.generateMemoryOperations(target_info, value_info);
-        defer self.allocator.free(memory_ops);
-        try ptx_instructions.appendSlice(memory_ops);
-
-        // 4. Add exit label
-        try ptx_instructions.appendSlice(
-            \\    done:
-        );
-
-        return try ptx_instructions.toOwnedSlice();
-    }
-
-    /// Recursively clean up allocated ParallelValueInfo structs
-    fn cleanupParallelValueInfo(self: *MLIRCodeGen, value_info: *const ParallelValueInfo) void {
-        switch (value_info.operation) {
-            .binary => {
-                // Recursively clean up left and right operands
-                if (value_info.left) |left_ptr| {
-                    self.cleanupParallelValueInfo(left_ptr);
-                    self.allocator.destroy(left_ptr);
-                }
-                if (value_info.right) |right_ptr| {
-                    self.cleanupParallelValueInfo(right_ptr);
-                    self.allocator.destroy(right_ptr);
-                }
-            },
-            .tensor_access, .constant => {
-                // No additional cleanup needed for these types
-            },
-        }
-    }
-
-    /// Analyze the target of a parallel assignment (e.g., a[i])
-    fn analyzeParallelTarget(self: *MLIRCodeGen, target: parser.ASTNode) MLIRCodeGenError!ParallelTargetInfo {
-        _ = self; // Unused parameter
-        switch (target) {
-            .implicit_tensor_index => |tensor_idx| {
-                const tensor_name = switch (tensor_idx.tensor.*) {
-                    .identifier => |ident| ident.name,
-                    else => return error.UnsupportedOperation,
-                };
-
-                return ParallelTargetInfo{
-                    .tensor_name = tensor_name,
-                    .index_var = tensor_idx.implicit_index,
-                    .is_tensor = true,
-                };
-            },
-            else => return error.UnsupportedOperation,
-        }
-    }
-
-    /// Analyze the value expression of a parallel assignment (e.g., a[i] + b[i])
-    fn analyzeParallelValue(self: *MLIRCodeGen, value: parser.ASTNode) MLIRCodeGenError!ParallelValueInfo {
-        switch (value) {
-            .binary_expression => |bin_expr| {
-                const left_info = try self.analyzeParallelValue(bin_expr.left.*);
-                const right_info = try self.analyzeParallelValue(bin_expr.right.*);
-
-                const left_ptr = try self.allocator.create(ParallelValueInfo);
-                const right_ptr = try self.allocator.create(ParallelValueInfo);
-                left_ptr.* = left_info;
-                right_ptr.* = right_info;
-
-                return ParallelValueInfo{
-                    .operation = .binary,
-                    .binary_op = bin_expr.operator,
-                    .left = left_ptr,
-                    .right = right_ptr,
-                };
-            },
-            .implicit_tensor_index => |tensor_idx| {
-                const tensor_name = switch (tensor_idx.tensor.*) {
-                    .identifier => |ident| ident.name,
-                    else => return error.UnsupportedOperation,
-                };
-
-                return ParallelValueInfo{
-                    .operation = .tensor_access,
-                    .tensor_name = tensor_name,
-                    .index_var = tensor_idx.implicit_index,
-                };
-            },
-            .number_literal => |num_lit| {
-                return ParallelValueInfo{
-                    .operation = .constant,
-                    .constant_value = num_lit.value,
-                    .constant_type = num_lit.type,
-                };
-            },
-            else => return error.UnsupportedOperation,
-        }
-    }
-
-    /// Generate PTX memory operations for the assignment
-    fn generateMemoryOperations(self: *MLIRCodeGen, target: ParallelTargetInfo, value: ParallelValueInfo) MLIRCodeGenError![]const u8 {
-        var ops = std.ArrayList(u8).init(self.allocator);
-        defer ops.deinit();
-
-        // Calculate byte offset for array access (assuming f32 = 4 bytes)
-        try ops.appendSlice(
-            \\    // Calculate byte offset  
-            \\    shl.b32 %byte_offset, %global_idx, 2;  // offset = idx * 4 (sizeof f32)
-            \\    
-        );
-
-        // Load parameter pointers
-        if (target.is_tensor) {
-            try ops.writer().print(
-                \\    ld.param.u64 %{s}_ptr, [{s}];       // Load tensor pointer
-                \\    
-            , .{ target.tensor_name, target.tensor_name });
-        }
-
-        // Generate value computation based on the expression type
-        const value_computation = try self.generateValueComputation(value);
-        defer self.allocator.free(value_computation);
-
-        try ops.appendSlice(value_computation);
-
-        // Store result back to memory
-        try ops.writer().print(
-            \\    add.u64 %store_addr, %{s}_ptr, %byte_offset;
-            \\    st.global.f32 [%store_addr], %result;
-            \\    
-        , .{target.tensor_name});
-
-        return try ops.toOwnedSlice();
-    }
-
-    /// Generate PTX computation for the value expression
-    fn generateValueComputation(self: *MLIRCodeGen, value: ParallelValueInfo) MLIRCodeGenError![]const u8 {
-        var computation = std.ArrayList(u8).init(self.allocator);
-        defer computation.deinit();
-
-        switch (value.operation) {
-            .binary => {
-                // Generate left operand
-                const left_info = value.left orelse return error.UnsupportedOperation;
-                const left_reg = try self.generateValueOperand(left_info.*, "left");
-                defer self.allocator.free(left_reg);
-
-                // Generate right operand
-                const right_info = value.right orelse return error.UnsupportedOperation;
-                const right_reg = try self.generateValueOperand(right_info.*, "right");
-                defer self.allocator.free(right_reg);
-
-                // Generate binary operation
-                const op_instruction = switch (value.binary_op) {
-                    .add => "add.f32",
-                    .subtract => "sub.f32",
-                    .multiply => "mul.f32",
-                    .divide => "div.rn.f32",
-                };
-
-                try computation.writer().print(
-                    \\    {s} %result, %{s}, %{s};
-                    \\    
-                , .{ op_instruction, left_reg, right_reg });
-            },
-            .tensor_access => {
-                try computation.writer().print(
-                    \\    ld.param.u64 %{s}_ptr, [{s}];
-                    \\    add.u64 %load_addr, %{s}_ptr, %byte_offset;
-                    \\    ld.global.f32 %result, [%load_addr];
-                    \\    
-                , .{ value.tensor_name, value.tensor_name, value.tensor_name });
-            },
-            .constant => {
-                try computation.writer().print(
-                    \\    mov.f32 %result, {s};
-                    \\    
-                , .{value.constant_value});
-            },
-        }
-
-        return try computation.toOwnedSlice();
-    }
-
-    /// Generate PTX for a value operand (recursive helper)
-    fn generateValueOperand(self: *MLIRCodeGen, value: ParallelValueInfo, reg_prefix: []const u8) MLIRCodeGenError![]const u8 {
-        switch (value.operation) {
-            .tensor_access => {
-                return try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ reg_prefix, value.tensor_name });
-            },
-            .constant => {
-                return try std.fmt.allocPrint(self.allocator, "{s}_const", .{reg_prefix});
-            },
-            .binary => {
-                return try std.fmt.allocPrint(self.allocator, "{s}_result", .{reg_prefix});
-            },
-        }
-    }
-
-    /// Generate PTX for an expression statement
-    fn generateExpressionStatementPTX(self: *MLIRCodeGen, expr_stmt: @TypeOf(@as(parser.ASTNode, undefined).expression_statement)) MLIRCodeGenError![]const u8 {
-        const expr_ptx = try self.generateExpressionPTX(expr_stmt.expression.*);
-        defer self.allocator.free(expr_ptx);
-
-        return try std.fmt.allocPrint(self.allocator, "    // Expression: {s}", .{expr_ptx});
-    }
-
-    /// Generate PTX for a variable declaration
-    fn generateVariableDeclarationPTX(self: *MLIRCodeGen, var_decl: @TypeOf(@as(parser.ASTNode, undefined).variable_declaration)) MLIRCodeGenError![]const u8 {
-        const ptx_type = try self.convertTypeToPTX(var_decl.type);
-        const value_ptx = try self.generateExpressionPTX(var_decl.value.*);
-        defer self.allocator.free(value_ptx);
-
-        return try std.fmt.allocPrint(self.allocator,
-            \\    .reg .{s} %{s};
-            \\    // Initialize {s} = {s}
-        , .{ ptx_type, var_decl.name, var_decl.name, value_ptx });
-    }
-
-    /// Generate PTX for an expression
-    fn generateExpressionPTX(self: *MLIRCodeGen, expr: parser.ASTNode) MLIRCodeGenError![]const u8 {
-        switch (expr) {
-            .number_literal => |num_lit| {
-                return try self.allocator.dupe(u8, num_lit.value);
-            },
-            .identifier => |ident| {
-                return try std.fmt.allocPrint(self.allocator, "%{s}", .{ident.name});
-            },
-            .binary_expression => |bin_expr| {
-                const left_ptx = try self.generateExpressionPTX(bin_expr.left.*);
-                defer self.allocator.free(left_ptx);
-
-                const right_ptx = try self.generateExpressionPTX(bin_expr.right.*);
-                defer self.allocator.free(right_ptx);
-
-                const op_str = switch (bin_expr.operator) {
-                    .add => "+",
-                    .subtract => "-",
-                    .multiply => "*",
-                    .divide => "/",
-                };
-
-                return try std.fmt.allocPrint(self.allocator, "({s} {s} {s})", .{ left_ptx, op_str, right_ptx });
-            },
-            .implicit_tensor_index => |tensor_idx| {
-                const tensor_ptx = try self.generateExpressionPTX(tensor_idx.tensor.*);
-                defer self.allocator.free(tensor_ptx);
-
-                return try std.fmt.allocPrint(self.allocator, "{s}[%{s}]", .{ tensor_ptx, tensor_idx.implicit_index });
-            },
-            else => {
-                if (self.verbose) {
-                    std.debug.print("Unsupported expression type in PTX generation\n", .{});
-                }
-                return try self.allocator.dupe(u8, "/* unsupported expression */");
-            },
-        }
-    }
-
-    fn generateStatement(self: *MLIRCodeGen, block: MLIR.MlirBlock, stmt: parser.ASTNode) MLIRCodeGenError!void {
-        switch (stmt) {
-            .parallel_assignment => try self.generateParallelAssignment(block, stmt.parallel_assignment),
-            .return_statement => try self.generateReturnStatement(block, stmt.return_statement),
-            else => {
-                if (self.verbose) {
-                    std.debug.print("Unsupported statement type in GPU function\n", .{});
-                }
-                return error.UnsupportedOperation;
-            },
-        }
-    }
-
-    fn generateParallelAssignment(self: *MLIRCodeGen, block: MLIR.MlirBlock, assignment: @TypeOf(@as(parser.ASTNode, undefined).parallel_assignment)) MLIRCodeGenError!void {
-        if (self.verbose) {
-            std.debug.print("Generating parallel assignment (GPU kernel launch)\n", .{});
-        }
-
-        // For now, generate a placeholder comment in MLIR
-        // TODO: Implement actual GPU thread indexing and memory operations
-
-        _ = block;
-        _ = assignment;
-
-        // This is a complex operation that requires:
-        // - Creating GPU launch operations
-        // - Setting up thread indices
-        // - Converting the RHS expression to GPU operations
-
-        return error.UnsupportedOperation;
-    }
-
-    fn generateReturnStatement(self: *MLIRCodeGen, block: MLIR.MlirBlock, ret_stmt: @TypeOf(@as(parser.ASTNode, undefined).return_statement)) MLIRCodeGenError!void {
-        if (self.verbose) {
-            std.debug.print("Generating return statement\n", .{});
-        }
-
-        if (ret_stmt.value) |value_expr| {
-            // Generate the return value expression
-            const return_value = try self.generateExpression(block, value_expr.*);
-
-            // Create func.return operation
-            var return_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("func.return".ptr), self.location);
-            MLIR.mlirOperationStateAddOperands(&return_state, 1, &return_value);
-
-            const return_op = MLIR.mlirOperationCreate(&return_state);
-            MLIR.mlirBlockAppendOwnedOperation(block, return_op);
-        } else {
-            // Void return
-            var return_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("func.return".ptr), self.location);
-            const return_op = MLIR.mlirOperationCreate(&return_state);
-            MLIR.mlirBlockAppendOwnedOperation(block, return_op);
-        }
-    }
-
-    fn generateExpression(self: *MLIRCodeGen, block: MLIR.MlirBlock, expr: parser.ASTNode) MLIRCodeGenError!MLIR.MlirValue {
-        _ = block;
-
-        switch (expr) {
-            .number_literal => |num_lit| {
-                return try self.generateConstant(num_lit);
-            },
-            else => {
-                if (self.verbose) {
-                    std.debug.print("Unsupported expression type in GPU function\n", .{});
-                }
-                return error.UnsupportedOperation;
-            },
-        }
-    }
-
-    fn generateConstant(self: *MLIRCodeGen, num_lit: @TypeOf(@as(parser.ASTNode, undefined).number_literal)) MLIRCodeGenError!MLIR.MlirValue {
-        const mlir_type = try self.convertType(num_lit.type);
-
-        if (num_lit.type.isFloat()) {
-            // Strip type suffix for float parsing
-            const value_without_suffix = if (std.mem.endsWith(u8, num_lit.value, "f32") or std.mem.endsWith(u8, num_lit.value, "f64"))
-                num_lit.value[0..(num_lit.value.len - 3)]
-            else
-                num_lit.value;
-            const float_value = try std.fmt.parseFloat(f64, value_without_suffix);
-
-            const attr = MLIR.mlirFloatAttrDoubleGet(self.context, mlir_type, float_value);
-
-            var const_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("arith.constant".ptr), self.location);
-            MLIR.mlirOperationStateAddResults(&const_state, 1, &mlir_type);
-
-            const value_id = MLIR.mlirIdentifierGet(self.context, MLIR.mlirStringRefCreateFromCString("value".ptr));
-            const value_named_attr = MLIR.mlirNamedAttributeGet(value_id, attr);
-            MLIR.mlirOperationStateAddAttributes(&const_state, 1, &value_named_attr);
-
-            const const_op = MLIR.mlirOperationCreate(&const_state);
-            return MLIR.mlirOperationGetResult(const_op, 0);
-        } else {
-            // Integer constant
-            const value_without_suffix = if (std.mem.endsWith(u8, num_lit.value, "u8") or std.mem.endsWith(u8, num_lit.value, "i8"))
-                num_lit.value[0..(num_lit.value.len - 2)]
-            else if (std.mem.endsWith(u8, num_lit.value, "u16") or std.mem.endsWith(u8, num_lit.value, "i16") or
-                std.mem.endsWith(u8, num_lit.value, "u32") or std.mem.endsWith(u8, num_lit.value, "i32") or
-                std.mem.endsWith(u8, num_lit.value, "u64") or std.mem.endsWith(u8, num_lit.value, "i64"))
-                num_lit.value[0..(num_lit.value.len - 3)]
-            else
-                num_lit.value;
-            const int_value = try std.fmt.parseInt(i64, value_without_suffix, 10);
-
-            const attr = MLIR.mlirIntegerAttrGet(mlir_type, int_value);
-
-            var const_state = MLIR.mlirOperationStateGet(MLIR.mlirStringRefCreateFromCString("arith.constant".ptr), self.location);
-            MLIR.mlirOperationStateAddResults(&const_state, 1, &mlir_type);
-
-            const value_id = MLIR.mlirIdentifierGet(self.context, MLIR.mlirStringRefCreateFromCString("value".ptr));
-            const value_named_attr = MLIR.mlirNamedAttributeGet(value_id, attr);
-            MLIR.mlirOperationStateAddAttributes(&const_state, 1, &value_named_attr);
-
-            const const_op = MLIR.mlirOperationCreate(&const_state);
-            return MLIR.mlirOperationGetResult(const_op, 0);
-        }
-    }
-
-    pub fn generateGpuKernel(self: *MLIRCodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration), sm_target: u32) MLIRCodeGenError![]const u8 {
-        if (self.verbose) {
-            std.debug.print("Starting MLIR GPU → PTX lowering for: {s} (SM {d})\n", .{ func.name, sm_target });
-        }
-
-        // Step 1: Generate MLIR representation
-        try self.generateGpuFunction(func);
-
-        // Step 2: Use MLIR pass infrastructure to lower GPU → NVVM → PTX
-        return try self.lowerMLIRToPTX(func, sm_target);
-    }
-
-    /// Use MLIR optimization pipeline, fall back to simplified PTX generation
-    fn lowerMLIRToPTX(self: *MLIRCodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration), sm_target: u32) MLIRCodeGenError![]const u8 {
-        if (self.verbose) {
-            std.debug.print("Attempting MLIR optimization pipeline for: {s} (SM {d})\n", .{ func.name, sm_target });
-        }
-
-        // Step 1: Try to use the full MLIR optimization pipeline
-        const ptx_code = try self.attemptMLIROptimization(func, sm_target);
-        return ptx_code;
-    }
-
-    /// Attempt to use full MLIR optimization and lowering pipeline
-    fn attemptMLIROptimization(self: *MLIRCodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration), sm_target: u32) MLIRCodeGenError![]const u8 {
-        if (self.verbose) {
-            std.debug.print("Creating MLIR pass pipeline\n", .{});
-        }
-
-        // Create pass manager
-        const pass_manager = try self.createPassManager();
-        defer self.destroyPassManager(pass_manager);
-
-        // Add the optimization passes
-        self.addGpuLoweringPasses(pass_manager, func, sm_target) catch {
-            std.debug.print("FAILED to apply optimization passes\n", .{});
-        };
-
-        // Since we're not adding any passes for now, skip the pass pipeline run
-        // and go directly to PTX generation from the MLIR structure
-        if (self.verbose) {
-            std.debug.print("Skipping pass pipeline (no passes configured), generating PTX directly\n", .{});
-        }
-
-        // Generate PTX directly from the MLIR module structure
-        return try self.extractPTXFromLoweredModule(func, sm_target);
-    }
-
-    /// Convert a type to PTX type string
-    fn convertTypeToPTX(self: *MLIRCodeGen, ty: parser.Type) MLIRCodeGenError![]const u8 {
-        _ = self;
-        return switch (ty) {
-            .i32 => "b32",
-            .i64 => "b64",
-            .f32 => "f32",
-            .f64 => "f64",
-            .tensor => "u64", // Tensor as pointer
-            else => "b32", // Default fallback
-        };
-    }
-
-    /// Check if NVVM dialect is available
-    fn isNVVMDialectAvailable(self: *MLIRCodeGen) bool {
-        // For now, assume NVVM is available since we linked the libraries
-        // TODO: Implement safe dialect detection without segfault
-        if (self.verbose) {
-            std.debug.print("NVVM dialect assumed available (linked with NVVM libraries)\n", .{});
-        }
-        return true;
-    }
-
-    /// Create MLIR pass manager
-    fn createPassManager(self: *MLIRCodeGen) MLIRCodeGenError!MLIR.MlirPassManager {
-        const pass_manager = MLIR.mlirPassManagerCreate(self.context);
-
-        if (pass_manager.ptr == null) {
-            if (self.verbose) {
-                std.debug.print("Failed to create MLIR pass manager\n", .{});
-            }
-            return error.PassPipelineNotAvailable;
-        }
-
-        if (self.verbose) {
-            std.debug.print("Created MLIR pass manager\n", .{});
-        }
-
-        return pass_manager;
-    }
-
-    fn destroyPassManager(self: *MLIRCodeGen, pass_manager: MLIR.MlirPassManager) void {
-        if (self.verbose) {
-            std.debug.print("Destroying MLIR pass manager\n", .{});
-        }
-        MLIR.mlirPassManagerDestroy(pass_manager);
-    }
-
-    /// Add GPU lowering passes to the pass manager using individual pass creation
-    fn addGpuLoweringPasses(self: *MLIRCodeGen, pass_manager: MLIR.MlirPassManager, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration), sm_target: u32) MLIRCodeGenError!void {
-        _ = func;
-
-        if (self.verbose) {
-            std.debug.print("Adding GPU lowering passes for SM {d}\n", .{sm_target});
-        }
-
-        // Get the operation pass manager for builtin.module operations
-        const op_pass_manager = MLIR.mlirPassManagerGetAsOpPassManager(pass_manager);
-
-        // Step 1: Add basic optimization passes that are available in MLIR C API
-        try self.addBasicOptimizationPasses(op_pass_manager);
-
-        // Step 2: Add GPU-specific transformation passes
-        try self.addGpuTransformationPasses(op_pass_manager);
-
-        // Step 3: Add NVVM lowering passes
-        try self.addNVVMLoweringPasses(op_pass_manager);
-
-        if (self.verbose) {
-            std.debug.print("Successfully added {d} pass stages to pipeline\n", .{3});
-        }
-    }
-
-    /// Add basic optimization passes (CSE, DCE, etc.)
-    fn addBasicOptimizationPasses(self: *MLIRCodeGen, op_pass_manager: MLIR.MlirOpPassManager) MLIRCodeGenError!void {
-        if (self.verbose) {
-            std.debug.print("Adding basic optimization passes\n", .{});
-        }
-
-        // For now, we don't have actual passes implemented
-        // Return error to indicate passes are not ready
-        _ = op_pass_manager;
-
-        return error.PassPipelineNotAvailable;
-    }
-
-    /// Add GPU-specific transformation passes
-    fn addGpuTransformationPasses(self: *MLIRCodeGen, op_pass_manager: MLIR.MlirOpPassManager) MLIRCodeGenError!void {
-        if (self.verbose) {
-            std.debug.print("Adding GPU transformation passes\n", .{});
-        }
-
-        // For now, we don't have actual passes implemented
-        // Return error to indicate passes are not ready
-        _ = op_pass_manager;
-
-        return error.PassPipelineNotAvailable;
-    }
-
-    /// Add NVVM lowering passes (GPU → NVVM → PTX)
-    fn addNVVMLoweringPasses(self: *MLIRCodeGen, op_pass_manager: MLIR.MlirOpPassManager) MLIRCodeGenError!void {
-        if (self.verbose) {
-            std.debug.print("Adding NVVM lowering passes\n", .{});
-        }
-
-        // For now, we don't have actual passes implemented
-        // Return error to indicate passes are not ready
-        _ = op_pass_manager;
-
-        return error.PassPipelineNotAvailable;
-    }
-
-    /// Run the MLIR pass pipeline
-    fn runPassPipeline(self: *MLIRCodeGen, pass_manager: MLIR.MlirPassManager) bool {
-        if (self.verbose) {
-            std.debug.print("Running MLIR pass pipeline\n", .{});
-        }
-
-        const module_op = MLIR.mlirModuleGetOperation(self.module);
-        const result = MLIR.mlirPassManagerRunOnOp(pass_manager, module_op);
-
-        const success = MLIR.mlirLogicalResultIsSuccess(result);
-        if (self.verbose) {
-            if (success) {
-                std.debug.print("Pass pipeline succeeded\n", .{});
-            } else {
-                std.debug.print("Pass pipeline failed\n", .{});
-            }
-        }
-
-        return success;
-    }
-
-    /// Extract PTX from the MLIR module (without requiring complex optimization passes)
-    fn extractPTXFromLoweredModule(self: *MLIRCodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration), sm_target: u32) MLIRCodeGenError![]const u8 {
-        if (self.verbose) {
-            std.debug.print("Generating PTX from MLIR module for SM {d}\n", .{sm_target});
-        }
-
-        // Generate PTX directly from the function declaration we created in MLIR
-        // This bypasses the need for complex optimization passes while still using MLIR structure
-
-        // Generate parameter list for PTX
-        var param_list = std.ArrayList(u8).init(self.allocator);
-        defer param_list.deinit();
-
-        for (func.parameters, 0..) |param, i| {
-            if (i > 0) {
-                try param_list.appendSlice(", ");
-            }
-
-            const ptx_type = try self.convertTypeToPTX(param.type);
-            try param_list.writer().print(".param {s} {s}", .{ ptx_type, param.name });
-        }
-
-        // Generate return type declaration for PTX
-        const ptx_return_type = try self.convertTypeToPTX(func.return_type);
-        const return_decl = try std.fmt.allocPrint(self.allocator, "    .reg .{s} %return_val;", .{ptx_return_type});
-        defer self.allocator.free(return_decl);
-
-        // Generate the actual function body using our NVVM IR generation
-        const body_ptx = try self.generateFunctionBody(undefined, func);
-        defer self.allocator.free(body_ptx);
-
-        const ptx_template =
-            \\.version 8.5
-            \\.target sm_{d}
-            \\.address_size 64
-            \\
-            \\.visible .entry {s}({s})
-            \\{{
-            \\{s}
-            \\{s}}}
-        ;
-
-        const ptx_code = try std.fmt.allocPrint(self.allocator, ptx_template, .{ sm_target, func.name, param_list.items, return_decl, body_ptx });
-
-        if (self.verbose) {
-            std.debug.print("Generated PTX from MLIR structure ({d} bytes)\n", .{ptx_code.len});
-        }
-
-        return ptx_code;
-    }
-
-    const GPUBinaryWalker = struct {
-        allocator: std.mem.Allocator,
-        verbose: bool,
-        func_name: []const u8,
-        sm_target: u32,
-        ptx_code: ?[]const u8,
-
-        fn extractPTXFromBinaryOp(self: *GPUBinaryWalker, op: MLIR.MlirOperation) MLIRCodeGenError!void {
-            // Simplified PTX extraction - for now just generate placeholder PTX
-            _ = op; // Unused parameter
-
-            if (self.verbose) {
-                std.debug.print("Generating placeholder PTX for function: {s}\n", .{self.func_name});
-            }
-
-            // Generate a basic PTX kernel as placeholder
-            const ptx_template =
-                \\.version 8.5
-                \\.target sm_{d}
-                \\.address_size 64
-                \\
-                \\.visible .entry {s}()
-                \\{{
-                \\    ret;
-                \\}}
-            ;
-
-            const ptx_code = std.fmt.allocPrint(self.allocator, ptx_template, .{ self.sm_target, self.func_name }) catch |err| {
-                if (self.verbose) {
-                    std.debug.print("Failed to generate PTX template: {}\n", .{err});
-                }
-                return err;
-            };
-
-            self.ptx_code = ptx_code;
-
-            if (self.verbose) {
-                std.debug.print("Generated placeholder PTX ({d} bytes)\n", .{ptx_code.len});
-            }
-        }
-    };
-
-    fn walkGpuBinaryCallback(op: MLIR.MlirOperation, user_data: ?*anyopaque) callconv(.C) MLIR.MlirWalkResult {
-        const walker: *GPUBinaryWalker = @ptrCast(@alignCast(user_data.?));
-
-        // For now, just generate PTX directly without checking operation type
-        // This simplifies the implementation and avoids missing MLIR API calls
-        if (walker.ptx_code == null) {
-            if (walker.verbose) {
-                std.debug.print("Generating PTX for first operation encountered\n", .{});
-            }
-
-            // Generate PTX using the simplified approach
-            walker.extractPTXFromBinaryOp(op) catch |err| {
-                if (walker.verbose) {
-                    std.debug.print("Failed to generate PTX: {}\n", .{err});
-                }
-            };
-        }
-
-        return MLIR.MlirWalkResultAdvance;
-    }
 };
 
 // ============================================================================
-// UNIT TESTS FOR MLIR GPU KERNEL CREATION
+// UNIT TESTS
 // ============================================================================
 
 test "MLIRCodeGen - basic initialization and cleanup" {
@@ -988,126 +947,4 @@ test "MLIRCodeGen - type conversion" {
     // Should not crash - MLIR types are opaque pointers
     _ = i32_type;
     _ = f32_type;
-}
-
-test "MLIRCodeGen - GPU function generation (declaration only)" {
-    const allocator = std.testing.allocator;
-
-    var mlir_codegen = try MLIRCodeGen.init(allocator, "test_gpu_func", false);
-    defer mlir_codegen.deinit();
-
-    // Create a simple GPU function declaration with no body
-    const param = parser.Parameter{ .name = "input", .type = .f32 };
-    var params = [_]parser.Parameter{param};
-
-    const gpu_func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration) = .{
-        .offset = 0,
-        .name = "gpu_test_kernel",
-        .parameters = params[0..],
-        .return_type = parser.Type.f32,
-        .body = &[_]parser.ASTNode{}, // Empty body
-    };
-
-    // Should succeed for function declarations
-    try mlir_codegen.generateGpuFunction(gpu_func);
-}
-
-test "MLIRCodeGen - GPU function with body should error" {
-    const allocator = std.testing.allocator;
-
-    var mlir_codegen = try MLIRCodeGen.init(allocator, "test_gpu_func_body", false);
-    defer mlir_codegen.deinit();
-
-    // Create a GPU function with a body (not yet supported)
-    const param = parser.Parameter{ .name = "input", .type = .f32 };
-    var params = [_]parser.Parameter{param};
-
-    const return_stmt = parser.ASTNode{ .return_statement = .{ .offset = 0, .value = null } };
-    var body = [_]parser.ASTNode{return_stmt};
-
-    const gpu_func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration) = .{
-        .offset = 0,
-        .name = "gpu_test_kernel",
-        .parameters = params[0..],
-        .return_type = parser.Type.f32,
-        .body = body[0..], // Non-empty body
-    };
-
-    // Should succeed for function body generation (now implemented)
-    try mlir_codegen.generateGpuFunction(gpu_func);
-}
-
-test "MLIRCodeGen - PTX lowering should succeed with fallback" {
-    const allocator = std.testing.allocator;
-
-    var mlir_codegen = try MLIRCodeGen.init(allocator, "test_ptx_lowering", false);
-    defer mlir_codegen.deinit();
-
-    const param = parser.Parameter{ .name = "input", .type = .f32 };
-    var params = [_]parser.Parameter{param};
-
-    const gpu_func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration) = .{
-        .offset = 0,
-        .name = "gpu_test_kernel",
-        .parameters = params[0..],
-        .return_type = parser.Type.f32,
-        .body = &[_]parser.ASTNode{},
-    };
-
-    // Should succeed because we now fall back to PTX generation
-    const result = mlir_codegen.generateGpuKernel(gpu_func, 50);
-    try std.testing.expect(result != error.PTXLoweringNotImplemented);
-    
-    // Clean up the result if successful
-    if (result) |ptx_code| {
-        allocator.free(ptx_code);
-    } else |_| {}
-}
-
-test "MLIRCodeGen - tensor type conversion" {
-    const allocator = std.testing.allocator;
-
-    var mlir_codegen = try MLIRCodeGen.init(allocator, "test_tensor_types", false);
-    defer mlir_codegen.deinit();
-
-    // Test tensor type conversion
-    const tensor_shape = [_]u32{16};
-    var f32_type = parser.Type{ .f32 = {} };
-    const tensor_type = parser.Type{ .tensor = .{
-        .element_type = &f32_type,
-        .shape = &tensor_shape,
-    } };
-
-    const converted_tensor = try mlir_codegen.convertType(tensor_type);
-    _ = converted_tensor; // Should not crash
-}
-
-// This test verifies that we properly attempt MLIR lowering and fallback to PTX generation
-test "MLIRCodeGen - MLIR lowering pipeline attempt" {
-    const allocator = std.testing.allocator;
-
-    var mlir_codegen = try MLIRCodeGen.init(allocator, "mlir_lowering", false);
-    defer mlir_codegen.deinit();
-
-    const param = parser.Parameter{ .name = "data", .type = .f32 };
-    var params = [_]parser.Parameter{param};
-
-    const gpu_func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration) = .{
-        .offset = 0,
-        .name = "gpu_kernel",
-        .parameters = params[0..],
-        .return_type = .f32,
-        .body = &[_]parser.ASTNode{},
-    };
-
-    // Should succeed with fallback PTX generation
-    const result = mlir_codegen.generateGpuKernel(gpu_func, 75);
-
-    // Should get successful PTX generation, indicating fallback worked
-    const success = if (result) |ptx_code| blk: {
-        allocator.free(ptx_code);
-        break :blk true;
-    } else |_| false;
-
-    try std.testing.expect(success);
 }

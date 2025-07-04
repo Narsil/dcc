@@ -22,7 +22,13 @@
           pkgs = import nixpkgs {
             inherit system;
             config.allowUnfree = true;
+          };
 
+          # Cross-compilation packages for x86_64-linux
+          pkgsCross = import nixpkgs {
+            inherit system;
+            crossSystem = "x86_64-linux";
+            config.allowUnfree = true;
           };
         in
         {
@@ -31,6 +37,9 @@
             mkShell {
               nativeBuildInputs = with pkgs; [
                 pkg-config
+                # Cross-compilation tools
+                gcc
+                binutils
               ];
               buildInputs = with pkgs; [
                 zig
@@ -42,6 +51,10 @@
                 gdb
                 claude-code
                 zlib
+                curl # For downloading CUDA toolkit
+
+                # Cross-compilation sysroot
+                pkgsCross.cudaPackages.cuda_cudart
               ];
 
               # Set LLVM environment variables for build.zig
@@ -51,6 +64,12 @@
               LLD_LIB_DIR = "${lld.lib}/lib";
               MLIR_INCLUDE_DIR = "${llvmPackages.mlir.dev}/include";
               MLIR_LIB_DIR = "${llvmPackages.mlir}/lib";
+
+              # CUDA cross-compilation environment (manual setup)
+              CUDA_INCLUDE_DIR = "${pkgsCross.cudaPackages.cuda_cudart.dev}/include";
+              CUDA_LIB_DIR = "${pkgsCross.cudaPackages.cuda_cudart.lib}/lib";
+              CUDA_STUB_DIR = "${pkgsCross.cudaPackages.cuda_cudart.lib}/lib/stubs";
+
             };
         }
       );
