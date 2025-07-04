@@ -329,11 +329,11 @@ fn compile(allocator: std.mem.Allocator, source_file: []const u8, target_triple:
 test "integration test" {
     const allocator = std.testing.allocator;
     const source =
-        \\fn add(a: i64, b: i64): i64 {
+        \\fn add(a: i64, b: i64) i64 {
         \\    return a + b;
         \\}
         \\
-        \\fn main(): i64 {
+        \\fn main() i64 {
         \\    let result: i64 = add(5i64, 3i64);
         \\    return result;
         \\}

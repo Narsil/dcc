@@ -550,11 +550,6 @@ pub const Parser = struct {
             return error.ParseError;
         }
 
-        if (!self.match(.colon)) {
-            self.reportError(self.peek().offset, "Expected ':' before return type");
-            return error.ParseError;
-        }
-
         const return_type = try self.parseType();
 
         if (!self.match(.left_brace)) {

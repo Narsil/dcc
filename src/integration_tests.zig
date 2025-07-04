@@ -202,7 +202,7 @@ test "type system - different integer types" {
     const allocator = std.testing.allocator;
     // Create a test file with different integer types
     const test_source =
-        \\fn main(): i64 {
+        \\fn main() i64 {
         \\    let x: u8 = 255u8;
         \\    let y: u16 = 65535u16;
         \\    let z: u32 = 4294967295u32;
@@ -223,7 +223,7 @@ test "type system - floating point types" {
 
     // Create a test file with floating point types
     const test_source =
-        \\fn main(): i64 {
+        \\fn main() i64 {
         \\    let x: f32 = 3.14f32;
         \\    let y: f64 = 2.718281828f64;
         \\    return 42i64;
@@ -241,19 +241,19 @@ test "type system - function with typed parameters" {
 
     // Create a test file with typed function parameters
     const test_source =
-        \\fn add_u8(a: u8, b: u8): u8 {
+        \\fn add_u8(a: u8, b: u8) u8 {
         \\    return a + b;
         \\}
         \\
-        \\fn add_i32(a: i32, b: i32): i32 {
+        \\fn add_i32(a: i32, b: i32) i32 {
         \\    return a + b;
         \\}
         \\
-        \\fn add_f64(a: f64, b: f64): f64 {
+        \\fn add_f64(a: f64, b: f64) f64 {
         \\    return a + b;
         \\}
         \\
-        \\fn main(): i64 {
+        \\fn main() i64 {
         \\    let x: u8 = add_u8(1u8, 2u8);
         \\    let y: i32 = add_i32(10i32, 20i32);
         \\    let z: f64 = add_f64(1.5f64, 2.5f64);
@@ -271,16 +271,16 @@ test "type system - missing parameter type annotation" {
     const allocator = std.testing.allocator;
 
     const test_source =
-        \\fn add(a, b: i64): i64 {
+        \\fn add(a, b: i64) i64 {
         \\    return a + b;
         \\}
         \\
-        \\fn main(): i64 {
+        \\fn main() i64 {
         \\    return 42i64;
         \\}
     ;
 
-    try assertCompileFailure(allocator, test_source, "test_missing_param_type.toy", "Expected ':' after parameter name", "fn add(a, b: i64): i64 {");
+    try assertCompileFailure(allocator, test_source, "test_missing_param_type.toy", "Expected ':' after parameter name", "fn add(a, b: i64) i64 {");
 
     std.debug.print("Missing parameter type error test passed\n", .{});
 }
@@ -293,12 +293,12 @@ test "type system - missing return type annotation" {
         \\    return a + b;
         \\}
         \\
-        \\fn main(): i64 {
+        \\fn main() i64 {
         \\    return 42i64;
         \\}
     ;
 
-    try assertCompileFailure(allocator, test_source, "test_missing_return_type.toy", "Expected ':' before return type", "fn add(a: i64, b: i64) {");
+    try assertCompileFailure(allocator, test_source, "test_missing_return_type.toy", "Error at line 1, column 24: Expected type", "fn add(a: i64, b: i64) {");
 
     std.debug.print("Missing return type error test passed\n", .{});
 }
@@ -307,7 +307,7 @@ test "type system - missing variable type annotation" {
     const allocator = std.testing.allocator;
 
     const test_source =
-        \\fn main(): i64 {
+        \\fn main() i64 {
         \\    let x = 42i64;
         \\    return x;
         \\}
@@ -322,7 +322,7 @@ test "type system - invalid type annotation" {
     const allocator = std.testing.allocator;
 
     const test_source =
-        \\fn main(): i64 {
+        \\fn main() i64 {
         \\    let x: invalid_type = 42i64;
         \\    return x;
         \\}
@@ -337,11 +337,11 @@ test "type system - type mismatch in function call" {
     const allocator = std.testing.allocator;
 
     const test_source =
-        \\fn add(a: i64, b: i64): i64 {
+        \\fn add(a: i64, b: i64) i64 {
         \\    return a + b;
         \\}
         \\
-        \\fn main(): i64 {
+        \\fn main() i64 {
         \\    let x: f64 = 3.14f64;
         \\    let result: i64 = add(x, 5i64);
         \\    return result;
@@ -357,7 +357,7 @@ test "type system - type mismatch in assignment" {
     const allocator = std.testing.allocator;
 
     const test_source =
-        \\fn main(): i64 {
+        \\fn main() i64 {
         \\    let x: i64 = 42i64;
         \\    let y: f64 = x;
         \\    return 0i64;
@@ -373,7 +373,7 @@ test "type system - type mismatch in return statement" {
     const allocator = std.testing.allocator;
 
     const test_source =
-        \\fn main(): i64 {
+        \\fn main() i64 {
         \\    return 3.14f64;
         \\}
     ;
@@ -387,7 +387,7 @@ test "type system - type mismatch in binary expression" {
     const allocator = std.testing.allocator;
 
     const test_source =
-        \\fn main(): i64 {
+        \\fn main() i64 {
         \\    let x: i64 = 42i64;
         \\    let y: f64 = 3.14f64;
         \\    let z: i64 = x + y;
@@ -404,11 +404,11 @@ test "type system - integer type mismatches" {
     const allocator = std.testing.allocator;
 
     const test_source =
-        \\fn add_u8(a: u8, b: u8): u8 {
+        \\fn add_u8(a: u8, b: u8) u8 {
         \\    return a + b;
         \\}
         \\
-        \\fn main(): i64 {
+        \\fn main() i64 {
         \\    let x: u8 = 255u8;
         \\    let y: i64 = 42i64;
         \\    let result: u8 = add_u8(x, y);
@@ -425,7 +425,7 @@ test "type system - signed vs unsigned mismatch" {
     const allocator = std.testing.allocator;
 
     const test_source =
-        \\fn main(): i64 {
+        \\fn main() i64 {
         \\    let x: u64 = 42u64;
         \\    let y: i64 = -10i64;
         \\    let z: u64 = x + y;
@@ -443,7 +443,7 @@ test "type system - tensor simple" {
 
     // Test tensor operations: vector initialization, element-wise addition, and indexing
     const test_source =
-        \\ fn main(): u32 {
+        \\ fn main() u32 {
         \\     // Create a vector of 5 elements initialized to zero
         \\     let vector: [5]u32 = [5]u32{0u32};
         \\     
@@ -465,7 +465,7 @@ test "tensor - out of bounds index" {
     const allocator = std.testing.allocator;
 
     const test_source =
-        \\fn main(): i64 {
+        \\fn main() i64 {
         \\    let vector: [5]u32 = [5]u32{0u32};
         \\    let x: u32 = vector[10];
         \\    return 0i64;
@@ -481,7 +481,7 @@ test "tensor - incorrect indexing rank (1D accessed with 2 indices)" {
     const allocator = std.testing.allocator;
 
     const test_source =
-        \\fn main(): i64 {
+        \\fn main() i64 {
         \\    let vector: [5]u32 = [5]u32{0u32};
         \\    let x: u32 = vector[1, 2];
         \\    return 0i64;
@@ -497,7 +497,7 @@ test "tensor - incorrect indexing rank (2D accessed with 1 index)" {
     const allocator = std.testing.allocator;
 
     const test_source =
-        \\fn main(): i64 {
+        \\fn main() i64 {
         \\    let matrix: [2, 2]u32 = [2, 2]u32{0u32};
         \\    let x: u32 = matrix[1];
         \\    return 0i64;
@@ -513,7 +513,7 @@ test "tensor - mismatching dtype in allocation" {
     const allocator = std.testing.allocator;
 
     const test_source =
-        \\fn main(): i64 {
+        \\fn main() i64 {
         \\    let vector: [5]u32 = [5]u32{0.0f32};
         \\    return 0i64;
         \\}
@@ -528,7 +528,7 @@ test "tensor - mismatching dtype in binary op" {
     const allocator = std.testing.allocator;
 
     const test_source =
-        \\fn main(): i64 {
+        \\fn main() i64 {
         \\    let a: [5]u32 = [5]u32{1u32};
         \\    let b: [5]i64 = [5]i64{1i64};
         \\    a[i] = a[i] + b[i];
@@ -546,12 +546,12 @@ test "gpu vector addition compilation with MLIR" {
     const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
 
     const gpu_source =
-        \\fn gpu_vector_add(a: [16]f32, b: [16]f32, c: [16]f32): i32 {
+        \\fn gpu_vector_add(a: [16]f32, b: [16]f32, c: [16]f32) i32 {
         \\    c[i] = a[i] + b[i];
         \\    return 0i32;
         \\}
         \\
-        \\fn main(): i32 {
+        \\fn main() i32 {
         \\    return 0i32;
         \\}
     ;
@@ -590,11 +590,11 @@ test "void functions - basic void function" {
     const allocator = std.testing.allocator;
 
     const test_source =
-        \\fn simple_void(): void {
+        \\fn simple_void() void {
         \\    return;
         \\}
         \\
-        \\fn main(): i64 {
+        \\fn main() i64 {
         \\    simple_void();
         \\    return 0i64;
         \\}
@@ -610,11 +610,11 @@ test "void functions - void function with variables" {
     const allocator = std.testing.allocator;
 
     const test_source =
-        \\fn void_with_variable(): void {
+        \\fn void_with_variable() void {
         \\    let x: i32 = 42i32;
         \\}
         \\
-        \\fn main(): i64 {
+        \\fn main() i64 {
         \\    void_with_variable();
         \\    return 0i64;
         \\}
@@ -630,21 +630,21 @@ test "void functions - void functions calling void functions" {
     const allocator = std.testing.allocator;
 
     const test_source =
-        \\fn simple_void(): void {
+        \\fn simple_void() void {
         \\    return;
         \\}
         \\
-        \\fn void_with_variable(): void {
+        \\fn void_with_variable() void {
         \\    let x: i32 = 42i32;
         \\}
         \\
-        \\fn void_calling_void(): void {
+        \\fn void_calling_void() void {
         \\    simple_void();
         \\    void_with_variable();
         \\    return;
         \\}
         \\
-        \\fn main(): i64 {
+        \\fn main() i64 {
         \\    void_calling_void();
         \\    return 0i64;
         \\}
@@ -660,11 +660,11 @@ test "void functions - error: return value from void function" {
     const allocator = std.testing.allocator;
 
     const test_source =
-        \\fn bad_void(): void {
+        \\fn bad_void() void {
         \\    return 42i32;
         \\}
         \\
-        \\fn main(): i64 {
+        \\fn main() i64 {
         \\    bad_void();
         \\    return 0i64;
         \\}
@@ -679,17 +679,17 @@ test "void functions - error: missing return from non-void function" {
     const allocator = std.testing.allocator;
 
     const test_source =
-        \\fn missing_return(): i32 {
+        \\fn missing_return() i32 {
         \\    let x: i32 = 42i32;
         \\}
         \\
-        \\fn main(): i64 {
+        \\fn main() i64 {
         \\    let result: i32 = missing_return();
         \\    return 0i64;
         \\}
     ;
 
-    try assertCompileFailure(allocator, test_source, "test_missing_return.toy", "Must return value from non-void function", "fn missing_return(): i32 {");
+    try assertCompileFailure(allocator, test_source, "test_missing_return.toy", "Must return value from non-void function", "fn missing_return() i32 {");
 
     std.debug.print("Missing return statement error test passed\n", .{});
 }

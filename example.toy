@@ -1,12 +1,12 @@
-fn add(a: i64, b: i64): i64 {
+fn add(a: i64, b: i64) i64 {
     return a + b;
 }
 
-fn multiply(x: i64, y: i64): i64 {
+fn multiply(x: i64, y: i64) i64 {
     return x * y;
 }
 
-fn main(): i64 {
+fn main() i64 {
     let result: i64 = add(5i64, 3i64);
     let product: i64 = multiply(result, 2i64);
     return product;

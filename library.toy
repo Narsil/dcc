@@ -1,12 +1,12 @@
-fn square(x: i64): i64 {
+fn square(x: i64) i64 {
     return x * x;
 }
 
-fn cube(x: i64): i64 {
+fn cube(x: i64) i64 {
     let squared: i64 = square(x);
     return squared * x;
 }
 
-fn factorial(n: i64): i64 {
+fn factorial(n: i64) i64 {
     return n * (n - 1);
 } 
