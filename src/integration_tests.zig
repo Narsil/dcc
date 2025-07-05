@@ -693,3 +693,30 @@ test "void functions - error: missing return from non-void function" {
 
     std.debug.print("Missing return statement error test passed\n", .{});
 }
+
+test "vector operations - add then multiply" {
+    const allocator = std.testing.allocator;
+
+    const test_source =
+        \\fn vector_add(a: [1024]i32, b: [1024]i32) void {
+        \\    a[i] = a[i] + b[i];
+        \\}
+        \\
+        \\fn vector_mul(a: [1024]i32, b: [1024]i32) void {
+        \\    a[i] = a[i] * b[i];
+        \\}
+        \\
+        \\fn main() i32 {
+        \\    let a: [1024]i32 = [1024]i32{2i32};
+        \\    let b: [1024]i32 = [1024]i32{3i32};
+        \\    vector_add(a, b);
+        \\    vector_mul(a, b);
+        \\    return a[0];
+        \\}
+    ;
+
+    try assertCompiles(allocator, test_source, "test_vector_ops.toy");
+    try assertReturns(allocator, 15);
+
+    std.debug.print("vector operations test passed - program correctly returns 15\n", .{});
+}

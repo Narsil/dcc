@@ -1,15 +1,15 @@
-fn gpu_vector_add(a: [1024]i32, b: [1024]i32) void {
+fn vector_add(a: [1024]i32, b: [1024]i32) void {
     a[i] = a[i] + b[i];
 }
 
-fn gpu_vector_mul(a: [1024]i32, b: [1024]i32) void {
+fn vector_mul(a: [1024]i32, b: [1024]i32) void {
     a[i] = a[i] * b[i];
 }
 
 fn main() i32 {
     let a: [1024]i32 = [1024]i32{2i32};
     let b: [1024]i32 = [1024]i32{3i32};
-    gpu_vector_add(a, b);
-    gpu_vector_mul(a, b);
+    vector_add(a, b);
+    vector_mul(a, b);
     return a[0];
 } 

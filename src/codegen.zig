@@ -145,7 +145,13 @@ pub const CodeGen = struct {
         defer self.allocator.free(param_types);
 
         for (func.parameters, 0..) |param, i| {
-            param_types[i] = param.type.toLLVMType(self.context);
+            if (param.type == .tensor) {
+                // Use pointer type for tensor parameters to allow in-place modification
+                const array_type = param.type.toLLVMType(self.context);
+                param_types[i] = LLVM.LLVMPointerType(array_type, 0);
+            } else {
+                param_types[i] = param.type.toLLVMType(self.context);
+            }
         }
 
         // Create function type
@@ -173,12 +179,18 @@ pub const CodeGen = struct {
             const param_name_z = try self.allocator.dupeZ(u8, param.name);
             defer self.allocator.free(param_name_z);
 
-            const param_type = param.type.toLLVMType(self.context);
-            const alloca = LLVM.LLVMBuildAlloca(self.builder, param_type, param_name_z.ptr);
-            LLVM.LLVMSetAlignment(alloca, 16); // 16-byte alignment for x86-64 System V ABI
-            const store_inst = LLVM.LLVMBuildStore(self.builder, param_value, alloca);
-            LLVM.LLVMSetAlignment(store_inst, 16); // Match alloca alignment
-            try self.variables.put(try self.allocator.dupe(u8, param.name), VarInfo{ .alloca = alloca, .ty = param.type });
+            if (param.type == .tensor) {
+                // For tensor parameters, use the passed pointer directly 
+                // (no need to create a local copy)
+                try self.variables.put(try self.allocator.dupe(u8, param.name), VarInfo{ .alloca = param_value, .ty = param.type });
+            } else {
+                const param_type = param.type.toLLVMType(self.context);
+                const alloca = LLVM.LLVMBuildAlloca(self.builder, param_type, param_name_z.ptr);
+                LLVM.LLVMSetAlignment(alloca, 16); // 16-byte alignment for x86-64 System V ABI
+                const store_inst = LLVM.LLVMBuildStore(self.builder, param_value, alloca);
+                LLVM.LLVMSetAlignment(store_inst, 16); // Match alloca alignment
+                try self.variables.put(try self.allocator.dupe(u8, param.name), VarInfo{ .alloca = alloca, .ty = param.type });
+            }
         }
 
         // Add dummy alloca for stack alignment in main
@@ -421,19 +433,15 @@ pub const CodeGen = struct {
                     defer self.allocator.free(args);
 
                     for (call.arguments, 0..) |arg, i| {
-                        args[i] = try self.generateExpression(arg);
+                        const arg_value = try self.generateExpression(arg);
+                        
+                        // For tensor arguments, pass the pointer directly
+                        // (no need to load the array value since functions expect pointers now)
+                        args[i] = arg_value;
                     }
 
-                    const int64_type = LLVM.LLVMInt64TypeInContext(self.context);
-                    const return_type = call.return_type.?.toLLVMType(self.context);
-                    const param_types = try self.allocator.alloc(LLVM.LLVMTypeRef, call.arguments.len);
-                    defer self.allocator.free(param_types);
-
-                    for (param_types) |*param_type| {
-                        param_type.* = int64_type;
-                    }
-
-                    const function_type = LLVM.LLVMFunctionType(return_type, param_types.ptr, @intCast(param_types.len), 0);
+                    // Get the actual function type from the stored function
+                    const function_type = LLVM.LLVMGlobalGetValueType(function);
 
                     return LLVM.LLVMBuildCall2(self.builder, function_type, function, args.ptr, @intCast(args.len), "call");
                 } else {
@@ -1282,12 +1290,18 @@ pub const CodeGen = struct {
     }
 
     fn generateGpuHostWrapper(self: *CodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration)) CodeGenError!void {
-        // Create a host function that sets up and launches the GPU kernel
+        // Create a host function that simulates the GPU kernel on CPU
         const param_types = try self.allocator.alloc(LLVM.LLVMTypeRef, func.parameters.len);
         defer self.allocator.free(param_types);
 
         for (func.parameters, 0..) |param, i| {
-            param_types[i] = param.type.toLLVMType(self.context);
+            if (param.type == .tensor) {
+                // Use pointer type for tensor parameters to allow in-place modification
+                const array_type = param.type.toLLVMType(self.context);
+                param_types[i] = LLVM.LLVMPointerType(array_type, 0);
+            } else {
+                param_types[i] = param.type.toLLVMType(self.context);
+            }
         }
 
         // Create function type
@@ -1305,19 +1319,58 @@ pub const CodeGen = struct {
         const entry_block = LLVM.LLVMAppendBasicBlockInContext(self.context, llvm_function, "entry");
         LLVM.LLVMPositionBuilderAtEnd(self.builder, entry_block);
 
-        // For now, just return a dummy value
-        const return_value = switch (func.return_type) {
-            .i32 => LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 0, 0),
-            .i64 => LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), 0, 0),
-            .f32 => LLVM.LLVMConstReal(LLVM.LLVMFloatTypeInContext(self.context), 0.0),
-            .f64 => LLVM.LLVMConstReal(LLVM.LLVMDoubleTypeInContext(self.context), 0.0),
-            else => LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 0, 0),
-        };
-        
-        _ = LLVM.LLVMBuildRet(self.builder, return_value);
+        // Set up parameter mapping for GPU function simulation
+        const old_variables = self.variables;
+        self.variables = std.HashMap([]const u8, VarInfo, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(self.allocator);
+        defer {
+            self.clearVariables();
+            self.variables = old_variables;
+        }
+
+        // Map function parameters to variables - create allocas and store param values
+        for (func.parameters, 0..) |param, i| {
+            const llvm_param = LLVM.LLVMGetParam(llvm_function, @intCast(i));
+            const param_name_z = try self.allocator.dupeZ(u8, param.name);
+            defer self.allocator.free(param_name_z);
+            
+            // Create alloca for parameter (like regular functions)
+            const param_type = param.type.toLLVMType(self.context);
+            const alloca = LLVM.LLVMBuildAlloca(self.builder, param_type, param_name_z.ptr);
+            LLVM.LLVMSetAlignment(alloca, 16); // 16-byte alignment for x86-64 System V ABI
+            
+            // Store parameter value into alloca
+            const store_inst = LLVM.LLVMBuildStore(self.builder, llvm_param, alloca);
+            LLVM.LLVMSetAlignment(store_inst, 16); // Match alloca alignment
+            
+            const param_name = try self.allocator.dupe(u8, param.name);
+            try self.variables.put(param_name, VarInfo{
+                .alloca = alloca,
+                .ty = param.type,
+            });
+        }
+
+        // Generate the GPU function body (simulate on CPU)
+        for (func.body) |stmt| {
+            try self.generateNode(stmt);
+        }
+
+        // Handle return based on function type
+        if (func.return_type == .void) {
+            _ = LLVM.LLVMBuildRetVoid(self.builder);
+        } else {
+            // For non-void functions, return a dummy value
+            const return_value = switch (func.return_type) {
+                .i32 => LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 0, 0),
+                .i64 => LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), 0, 0),
+                .f32 => LLVM.LLVMConstReal(LLVM.LLVMFloatTypeInContext(self.context), 0.0),
+                .f64 => LLVM.LLVMConstReal(LLVM.LLVMDoubleTypeInContext(self.context), 0.0),
+                else => LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 0, 0),
+            };
+            _ = LLVM.LLVMBuildRet(self.builder, return_value);
+        }
 
         if (self.verbose) {
-            std.debug.print("Generated host wrapper for GPU function: {s}\n", .{func.name});
+            std.debug.print("Generated GPU host wrapper with CPU simulation for function: {s}\n", .{func.name});
         }
     }
 };
