@@ -96,10 +96,8 @@ pub const MLIRCodeGen = struct {
     /// Print the MLIR module (for debugging)
     pub fn printMLIR(self: *MLIRCodeGen) void {
         if (self.verbose) {
-            std.debug.print("=== MLIR Module ===\n", .{});
             // Use mlirOperationDump for proper printing to stderr
             MLIR.mlirOperationDump(MLIR.mlirModuleGetOperation(self.module));
-            std.debug.print("\n=== End MLIR ===\n", .{});
         }
     }
 
@@ -122,17 +120,6 @@ pub const MLIRCodeGen = struct {
             MLIR.mlirOperationDump(module_op);
             std.debug.print("\n=== End MLIR ===\n", .{});
         }
-
-        // Step 4: Implement the official MLIR GPU compilation pipeline
-        // Based on: https://mlir.llvm.org/docs/Dialects/GPU/#default-nvvm-compilation-pipeline-gpu-lower-to-nvvm-pipeline
-        //
-        // mlir-opt example.mlir --pass-pipeline="builtin.module(
-        //   gpu-kernel-outlining,               # Outline gpu.launch body to a kernel.
-        //   nvvm-attach-target{chip=sm_90 O=3}, # Attach an NVVM target to a gpu.module op.
-        //   gpu.module(convert-gpu-to-nvvm),    # Convert GPU to NVVM.
-        //   gpu-to-llvm,                        # Convert GPU to LLVM.
-        //   gpu-module-to-binary                # Serialize GPU modules to binaries.
-        // )"
 
         if (self.verbose) {
             std.debug.print("Building official MLIR GPU → NVVM → PTX pass pipeline...\n", .{});

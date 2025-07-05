@@ -183,17 +183,195 @@ fn generatePTXFromPipeline(allocator: std.mem.Allocator, args: Args) ![]const u8
         std.debug.print("=== Generated MLIR (should look like simple_vector_add_gpu.mlir) ===\n", .{});
     }
 
-    // Print the generated MLIR
-    codegen.printMLIR();
+    // Capture the generated MLIR content as a string
+    const generated_mlir_content = try captureMLIRFromCodegen(allocator, &codegen, args.verbose);
+    defer allocator.free(generated_mlir_content);
 
     if (args.verbose) {
         std.debug.print("=== End Generated MLIR ===\n", .{});
-        std.debug.print("🎯 MLIR generation complete! For now, falling back to static pipeline to avoid breaking PTX export.\n", .{});
+        std.debug.print("🎯 MLIR generation complete! Now running through PTX pipeline...\n", .{});
     }
 
-    // For now, still return an error so we don't break the existing PTX pipeline
-    // TODO: Replace static pipeline with generated MLIR once we're confident in the output
-    return EmitPtxError.PipelineError;
+    // Use the same PTX generation pipeline as the static version
+    const ptx_content = try generatePTXFromMLIR(allocator, generated_mlir_content, args);
+    return ptx_content;
+}
+
+/// Capture MLIR content from mlir_codegen as a string
+fn captureMLIRFromCodegen(allocator: std.mem.Allocator, codegen: *mlir_codegen.MLIRCodeGen, verbose: bool) ![]const u8 {
+    if (verbose) {
+        std.debug.print("🔍 Capturing MLIR content from codegen...\n", .{});
+    }
+
+    // Create temporary file to capture stderr from mlirOperationDump
+    const temp_file_path = "temp_codegen_mlir_dump.txt";
+
+    // Save current stderr
+    const original_stderr = std.posix.dup(std.posix.STDERR_FILENO) catch |err| {
+        std.debug.print("Error duplicating stderr: {}\n", .{err});
+        return EmitPtxError.PipelineError;
+    };
+    defer std.posix.close(original_stderr);
+
+    // Create new file and redirect stderr to it
+    const temp_file = std.fs.cwd().createFile(temp_file_path, .{}) catch |err| {
+        std.debug.print("Error creating temp file: {}\n", .{err});
+        return EmitPtxError.PipelineError;
+    };
+    defer std.fs.cwd().deleteFile(temp_file_path) catch {};
+
+    const temp_fd = temp_file.handle;
+
+    // Redirect stderr to our temp file
+    std.posix.dup2(temp_fd, std.posix.STDERR_FILENO) catch |err| {
+        std.debug.print("Error redirecting stderr: {}\n", .{err});
+        return EmitPtxError.PipelineError;
+    };
+
+    // Print MLIR to the captured stderr
+    codegen.printMLIR();
+
+    // Restore original stderr
+    std.posix.dup2(original_stderr, std.posix.STDERR_FILENO) catch |err| {
+        std.debug.print("Error restoring stderr: {}\n", .{err});
+        return EmitPtxError.PipelineError;
+    };
+
+    // Ensure temp file is flushed and closed before reading
+    temp_file.close();
+
+    // Read the captured MLIR content from temp file
+    const raw_captured_mlir = std.fs.cwd().readFileAlloc(allocator, temp_file_path, 1024 * 1024) catch |err| {
+        std.debug.print("Error reading captured MLIR: {}\n", .{err});
+        return EmitPtxError.PipelineError;
+    };
+    defer allocator.free(raw_captured_mlir);
+
+    // Clean up the captured MLIR by removing debug headers
+    const cleaned_mlir = try cleanMLIRContent(allocator, raw_captured_mlir);
+
+    if (verbose) {
+        std.debug.print("✅ Successfully captured and cleaned MLIR content ({d} bytes)\n", .{cleaned_mlir.len});
+        // Save both raw and cleaned MLIR to files for inspection
+        std.fs.cwd().writeFile(.{ .sub_path = "generated_mlir_raw.mlir", .data = raw_captured_mlir }) catch |err| {
+            std.debug.print("Warning: Could not save raw MLIR to file: {}\n", .{err});
+        };
+        std.fs.cwd().writeFile(.{ .sub_path = "generated_mlir_cleaned.mlir", .data = cleaned_mlir }) catch |err| {
+            std.debug.print("Warning: Could not save cleaned MLIR to file: {}\n", .{err});
+        };
+        std.debug.print("📄 Generated MLIR saved to generated_mlir_*.mlir for inspection\n", .{});
+    }
+
+    return cleaned_mlir;
+}
+
+/// Clean MLIR content by removing debug headers and extracting pure MLIR
+fn cleanMLIRContent(allocator: std.mem.Allocator, raw_content: []const u8) ![]const u8 {
+    // Find the start and end markers
+    const start_marker = "=== MLIR Module ===\n";
+    const end_marker = "\n=== End MLIR ===";
+
+    const start_pos = std.mem.indexOf(u8, raw_content, start_marker);
+    const end_pos = std.mem.indexOf(u8, raw_content, end_marker);
+
+    if (start_pos == null or end_pos == null) {
+        // If markers not found, return the content as-is
+        return try allocator.dupe(u8, raw_content);
+    }
+
+    // Extract the content between markers
+    const mlir_start = start_pos.? + start_marker.len;
+    const mlir_end = end_pos.?;
+
+    if (mlir_start >= mlir_end) {
+        // Invalid range, return empty content
+        return try allocator.alloc(u8, 0);
+    }
+
+    const pure_mlir = raw_content[mlir_start..mlir_end];
+
+    // Convert generic form MLIR to assembly form for better parsing compatibility
+    const converted_mlir = try convertGenericToAssemblyForm(allocator, pure_mlir);
+    return converted_mlir;
+}
+
+/// Convert generic form MLIR to assembly form for better parsing compatibility
+fn convertGenericToAssemblyForm(allocator: std.mem.Allocator, generic_mlir: []const u8) ![]const u8 {
+    var result = try allocator.dupe(u8, generic_mlir);
+
+    // Define replacement pairs
+    const replacements = [_]struct { from: []const u8, to: []const u8 }{
+        // Fix dimension attributes: {dimension = "x"} -> {dimension = x}
+        .{ .from = "{dimension = \"x\"}", .to = "{dimension = x}" },
+        .{ .from = "{dimension = \"y\"}", .to = "{dimension = y}" },
+        .{ .from = "{dimension = \"z\"}", .to = "{dimension = z}" },
+
+        // Convert basic module structure
+        .{ .from = "\"builtin.module\"() ({", .to = "module {" },
+        .{ .from = "\"gpu.module\"() ({", .to = "gpu.module @kernels {" },
+
+        // Convert GPU operations to assembly form
+        .{ .from = "\"gpu.thread_id\"()", .to = "gpu.thread_id" },
+        .{ .from = "\"gpu.block_id\"()", .to = "gpu.block_id" },
+        .{ .from = "\"gpu.block_dim\"()", .to = "gpu.block_dim" },
+        .{ .from = "\"gpu.return\"() : () -> ()", .to = "gpu.return" },
+
+        // Convert arithmetic operations
+        .{ .from = "\"arith.muli\"", .to = "arith.muli" },
+        .{ .from = "\"arith.addi\"", .to = "arith.addi" },
+        .{ .from = "\"arith.constant\"", .to = "arith.constant" },
+        .{ .from = "\"arith.cmpi\"", .to = "arith.cmpi" },
+
+        // Convert SCF operations
+        .{ .from = "\"scf.if\"", .to = "scf.if" },
+        .{ .from = "\"scf.yield\"() : () -> ()", .to = "scf.yield" },
+
+        // Convert function operations
+        .{ .from = "\"func.func\"", .to = "func.func" },
+        .{ .from = "\"func.return\"() : () -> ()", .to = "func.return" },
+    };
+
+    // Apply all replacements, managing memory properly
+    for (replacements) |replacement| {
+        const new_result = try std.mem.replaceOwned(u8, allocator, result, replacement.from, replacement.to);
+        allocator.free(result); // Free the old result
+        result = new_result; // Use the new result
+    }
+
+    return result;
+}
+
+/// Generate PTX from MLIR content using the complete pipeline
+fn generatePTXFromMLIR(allocator: std.mem.Allocator, mlir_content: []const u8, args: Args) ![]const u8 {
+    if (args.verbose) {
+        std.debug.print("📝 Running fully integrated pipeline (MLIR passes + MLIR→LLVM IR + LLVM IR→PTX) - no external tools...\n", .{});
+    }
+
+    // Step 1: Apply MLIR passes to the input MLIR content
+    const transformed_mlir = try canonicalizeMLIRContent(allocator, mlir_content, args.verbose);
+    defer allocator.free(transformed_mlir);
+
+    // Step 2: Extract kernel function for standalone compilation
+    if (args.verbose) std.debug.print("🔧 Extracting kernel function...\n", .{});
+    const standalone_kernel = try extractKernelFunction(allocator, transformed_mlir);
+    defer allocator.free(standalone_kernel);
+
+    // Step 3: Fix NVVM operations for mlir-translate
+    if (args.verbose) std.debug.print("🔧 Fixing NVVM operations...\n", .{});
+    const fixed_mlir = try fixNVVMOperations(allocator, standalone_kernel);
+    defer allocator.free(fixed_mlir);
+
+    // Step 4: Translate MLIR to LLVM IR using MLIR C API (replaces external mlir-translate)
+    const llvm_ir_content = try translateMLIRToLLVMIR(allocator, fixed_mlir, args.verbose);
+    defer allocator.free(llvm_ir_content);
+
+    // Step 5: Compile LLVM IR to PTX using LLVM C API (replaces external llc)
+    const ptx_content = try compileLLVMIRToPTX(allocator, llvm_ir_content, args.sm_version, args.verbose);
+
+    // 🎉 No temporary files to clean up - fully integrated pipeline processes everything in memory!
+
+    if (args.verbose) std.debug.print("✅ PTX generation complete\n", .{});
+    return ptx_content;
 }
 
 fn generatePTXFromStatic(allocator: std.mem.Allocator, args: Args) ![]const u8 {
@@ -201,34 +379,15 @@ fn generatePTXFromStatic(allocator: std.mem.Allocator, args: Args) ![]const u8 {
         std.debug.print("Using static GPU MLIR from simple_vector_add_gpu.mlir\n", .{});
     }
 
-    // Steps 1-11: Canonicalize, GPU kernel outlining, SCF to CF, GPU to NVVM, NVVM to LLVM, finalize MemRef, convert Func, reconcile unrealized casts, MLIR→LLVM IR, LLVM IR→PTX - all using C APIs
-    if (args.verbose) std.debug.print("📝 Running fully integrated pipeline (MLIR passes + MLIR→LLVM IR + LLVM IR→PTX) - no external tools...\n", .{});
-    const transformed_mlir = try canonicalizeMLIRFile(allocator, "simple_vector_add_gpu.mlir", args.verbose);
-    defer allocator.free(transformed_mlir);
+    // Read the static MLIR file
+    const static_mlir_content = std.fs.cwd().readFileAlloc(allocator, "simple_vector_add_gpu.mlir", 1024 * 1024) catch |err| {
+        std.debug.print("Error reading static MLIR file: {}\n", .{err});
+        return EmitPtxError.PipelineError;
+    };
+    defer allocator.free(static_mlir_content);
 
-    // Steps 1-11 are now fully integrated: MLIR passes + MLIR→LLVM translation + LLVM→PTX compilation via C APIs
-
-    // Step 8: Extract kernel function for standalone compilation
-    if (args.verbose) std.debug.print("🔧 Extracting kernel function...\n", .{});
-    const standalone_kernel = try extractKernelFunction(allocator, transformed_mlir);
-    defer allocator.free(standalone_kernel);
-
-    // Step 9: Fix NVVM operations for mlir-translate
-    if (args.verbose) std.debug.print("🔧 Fixing NVVM operations...\n", .{});
-    const fixed_mlir = try fixNVVMOperations(allocator, standalone_kernel);
-    defer allocator.free(fixed_mlir);
-
-    // Step 10: Translate MLIR to LLVM IR using MLIR C API (replaces external mlir-translate)
-    const llvm_ir_content = try translateMLIRToLLVMIR(allocator, fixed_mlir, args.verbose);
-    defer allocator.free(llvm_ir_content);
-
-    // Step 11: Compile LLVM IR to PTX using LLVM C API (replaces external llc)
-    const ptx_content = try compileLLVMIRToPTX(allocator, llvm_ir_content, args.sm_version, args.verbose);
-
-    // 🎉 No temporary files to clean up - fully integrated pipeline processes everything in memory!
-
-    if (args.verbose) std.debug.print("✅ PTX generation complete\n", .{});
-    return ptx_content;
+    // Use the same PTX generation pipeline as the dynamic version
+    return generatePTXFromMLIR(allocator, static_mlir_content, args);
 }
 
 fn runCommand(allocator: std.mem.Allocator, argv: []const []const u8) !void {
@@ -512,18 +671,11 @@ fn compileLLVMIRToPTX(allocator: std.mem.Allocator, llvm_ir_content: []const u8,
     return ptx_content;
 }
 
-/// Run integrated MLIR passes: canonicalize, GPU kernel outlining, SCF to CF, GPU to NVVM (with bare ptr), NVVM to LLVM, finalize MemRef to LLVM, convert Func to LLVM (with bare ptr), and reconcile unrealized casts
-fn canonicalizeMLIRFile(allocator: std.mem.Allocator, input_file: []const u8, verbose: bool) ![]const u8 {
+/// Run integrated MLIR passes on MLIR content: canonicalize, GPU kernel outlining, SCF to CF, GPU to NVVM (with bare ptr), NVVM to LLVM, finalize MemRef to LLVM, convert Func to LLVM (with bare ptr), and reconcile unrealized casts
+fn canonicalizeMLIRContent(allocator: std.mem.Allocator, input_content: []const u8, verbose: bool) ![]const u8 {
     if (verbose) {
         std.debug.print("🔧 Steps 1-7: Integrated MLIR passes using C API (part of fully integrated pipeline)\n", .{});
     }
-
-    // Read the input MLIR file for practical output
-    const input_content = std.fs.cwd().readFileAlloc(allocator, input_file, 1024 * 1024) catch |err| {
-        std.debug.print("Error reading input MLIR file: {}\n", .{err});
-        return EmitPtxError.PipelineError;
-    };
-    defer allocator.free(input_content);
 
     // Create null-terminated version for MLIR C API (C APIs expect null termination)
     const null_terminated_content = try allocator.allocSentinel(u8, input_content.len, 0);
