@@ -23,6 +23,19 @@ MLIR_CAPI_EXPORTED MlirPass mlirCreateConversionConvertGpuOpsToNVVMOpsWithOption
 // Convenience function to create pass with bare pointer call convention enabled
 MLIR_CAPI_EXPORTED MlirPass mlirCreateConversionConvertGpuOpsToNVVMOpsWithBarePtr(void);
 
+// Mirror the C++ options struct for ConvertFuncToLLVM
+struct MlirConvertFuncToLLVMPassOptions {
+    bool useBarePtrCallConv;
+    unsigned indexBitwidth;
+};
+
+// Create ConvertFuncToLLVM pass with full options control
+MLIR_CAPI_EXPORTED MlirPass mlirCreateConversionConvertFuncToLLVMPassWithOptions(
+    struct MlirConvertFuncToLLVMPassOptions options);
+
+// Convenience function to create ConvertFuncToLLVM pass with bare pointer call convention enabled
+MLIR_CAPI_EXPORTED MlirPass mlirCreateConversionConvertFuncToLLVMPassWithBarePtr(void);
+
 #ifdef __cplusplus
 }
 #endif

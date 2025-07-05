@@ -37,4 +37,32 @@ MLIR_CAPI_EXPORTED MlirPass mlirCreateConversionConvertGpuOpsToNVVMOpsWithBarePt
     return wrap(mlir::createConvertGpuOpsToNVVMOps(options).release());
 }
 
+// Mirror the C++ options struct for ConvertFuncToLLVM
+struct MlirConvertFuncToLLVMPassOptions {
+    bool useBarePtrCallConv;
+    unsigned indexBitwidth;
+};
+
+// Create ConvertFuncToLLVM pass with options
+MLIR_CAPI_EXPORTED MlirPass mlirCreateConversionConvertFuncToLLVMPassWithOptions(
+    struct MlirConvertFuncToLLVMPassOptions options) {
+    
+    // Convert C options to C++ options
+    mlir::ConvertFuncToLLVMPassOptions cppOptions;
+    cppOptions.useBarePtrCallConv = options.useBarePtrCallConv;
+    cppOptions.indexBitwidth = options.indexBitwidth;
+    
+    // Create the pass with options
+    return wrap(mlir::createConvertFuncToLLVMPass(cppOptions).release());
+}
+
+// Convenience function to create ConvertFuncToLLVM pass with bare pointer call convention
+MLIR_CAPI_EXPORTED MlirPass mlirCreateConversionConvertFuncToLLVMPassWithBarePtr(void) {
+    mlir::ConvertFuncToLLVMPassOptions options;
+    options.useBarePtrCallConv = true;  // Enable bare pointer call convention
+    options.indexBitwidth = 0;
+    
+    return wrap(mlir::createConvertFuncToLLVMPass(options).release());
+}
+
 } // extern "C" 
