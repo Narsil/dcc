@@ -250,6 +250,24 @@ pub fn build(b: *std.Build) !void {
     // Link emit_ptx with the same libraries as main dcc
     try createLinking(b, emit_ptx_exe, llvm_include_dir, llvm_lib_dir, lld_include_dir, lld_lib_dir, false);
 
+    // Add our custom GPU to NVVM wrapper for emit_ptx
+    const mlir_include_dir = std.process.getEnvVarOwned(b.allocator, "MLIR_INCLUDE_DIR") catch null;
+    const mlir_lib_dir = std.process.getEnvVarOwned(b.allocator, "MLIR_LIB_DIR") catch null;
+    
+    if (mlir_include_dir != null and mlir_lib_dir != null) {
+        defer b.allocator.free(mlir_include_dir.?);
+        defer b.allocator.free(mlir_lib_dir.?);
+        
+        // Add our GPU to NVVM wrapper
+        emit_ptx_exe.addCSourceFile(.{
+            .file = b.path("src/gpu_to_nvvm_wrapper.cpp"),
+            .flags = &.{"-std=c++17"},
+        });
+        
+        // Add include path for our wrapper header
+        emit_ptx_exe.addIncludePath(.{ .cwd_relative = "src" });
+    }
+
     // Install emit_ptx executable
     b.installArtifact(emit_ptx_exe);
 
