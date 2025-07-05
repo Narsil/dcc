@@ -51,6 +51,7 @@
                 gdb
                 claude-code
                 zlib
+                libxml2
                 curl # For downloading CUDA toolkit
 
                 # Cross-compilation sysroot
