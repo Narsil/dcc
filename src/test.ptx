@@ -1,0 +1,51 @@
+// PTX kernel for in-place vector addition: a[i] = a[i] + b[i]
+// For 1024 float elements
+
+.version 7.0
+.target sm_50
+.address_size 64
+
+.visible .entry gpu_add_kernel(
+    .param .u64 gpu_add_kernel_param_0,  // a[] (input/output)
+    .param .u64 gpu_add_kernel_param_1   // b[] (input)
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<4>;
+    .reg .f32 %f<4>;
+    .reg .b64 %rd<5>;
+
+    // Calculate global thread index
+    mov.u32 %r1, %ctaid.x;       // block ID
+    mov.u32 %r2, %ntid.x;        // block size
+    mov.u32 %r3, %tid.x;         // thread ID within block
+    mad.lo.s32 %r1, %r1, %r2, %r3;  // global_id = blockIdx.x * blockDim.x + threadIdx.x
+
+    // Bounds check: if (global_id >= 1024) return;
+    setp.ge.s32 %p1, %r1, 1024;
+    @%p1 bra BB0_2;
+
+    // Load parameters (array pointers)
+    ld.param.u64 %rd1, [gpu_add_kernel_param_0];  // a[]
+    ld.param.u64 %rd2, [gpu_add_kernel_param_1];  // b[]
+
+    // Convert thread index to byte offset (index * 4 bytes per float)
+    mul.wide.s32 %rd3, %r1, 4;
+
+    // Calculate addresses: a_addr = a + offset, b_addr = b + offset
+    add.s64 %rd1, %rd1, %rd3;
+    add.s64 %rd2, %rd2, %rd3;
+
+    // Load values: f1 = a[i], f2 = b[i]
+    ld.global.f32 %f1, [%rd1];
+    ld.global.f32 %f2, [%rd2];
+
+    // Perform addition: f3 = a[i] + b[i]
+    add.f32 %f3, %f1, %f2;
+
+    // Store result back to a[i]
+    st.global.f32 [%rd1], %f3;
+
+BB0_2:
+    ret;
+} 
