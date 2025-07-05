@@ -6,21 +6,21 @@ pub const TypeCheckError = error{
     TypeMismatch,
     UndefinedVariable,
     UndefinedFunction,
-    InvalidBinaryOperation,
-    InvalidUnaryOperation,
-    InvalidFunctionCall,
     InvalidReturnType,
-    InvalidVariableType,
+    InvalidExpression,
+    DuplicateFunction,
+    InvalidFunctionCall,
     TargetMustBeTensor,
     ImplicitIndexConflictsWithVariable,
     IndexCountMismatch,
     InvalidIndexType,
-    InvalidExpression,
-    OutOfMemory,
     IndexOutOfBounds,
+    InvalidBinaryOperation,
+    InvalidUnaryOperation,
+    InvalidVariableType,
 } || std.mem.Allocator.Error;
 
-const FunctionInfo = struct {
+pub const FunctionSignature = struct {
     params: []parser.Parameter,
     return_type: parser.Type,
 };
@@ -29,20 +29,28 @@ pub const TypeChecker = struct {
     allocator: std.mem.Allocator,
     source: []const u8,
     variables: std.HashMap([]const u8, parser.Type, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
-    functions: std.HashMap([]const u8, FunctionInfo, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
+    functions: std.HashMap([]const u8, FunctionSignature, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
     current_function_return_type: ?parser.Type,
+    allocated_types: std.ArrayList(parser.Type),
 
     pub fn init(allocator: std.mem.Allocator, source: []const u8) TypeChecker {
         return TypeChecker{
             .allocator = allocator,
             .source = source,
             .variables = std.HashMap([]const u8, parser.Type, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
-            .functions = std.HashMap([]const u8, FunctionInfo, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
+            .functions = std.HashMap([]const u8, FunctionSignature, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .current_function_return_type = null,
+            .allocated_types = std.ArrayList(parser.Type).init(allocator),
         };
     }
 
     pub fn deinit(self: *TypeChecker) void {
+        // Free all dynamically allocated types created during type checking
+        for (self.allocated_types.items) |allocated_type| {
+            parser.freeType(self.allocator, allocated_type);
+        }
+        self.allocated_types.deinit();
+
         // Free all duplicated strings used as keys
         var var_iter = self.variables.iterator();
         while (var_iter.next()) |entry| {
@@ -406,6 +414,9 @@ pub const TypeChecker = struct {
         const result = parser.Type{
             .tensor = try parser.Type.TensorType.init(self.allocator, tensor_lit.shape, element_type_ptr, false),
         };
+
+        // Track the allocated type for cleanup
+        try self.allocated_types.append(result);
 
         std.debug.print("DEBUG: typeCheckTensorLiteral - created tensor type: {}\n", .{result});
 

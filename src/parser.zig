@@ -1325,7 +1325,7 @@ test "parser error - calling expression" {
     try std.testing.expectError(error.ParseError, result);
 }
 
-fn freeType(allocator: std.mem.Allocator, type_info: Type) void {
+pub fn freeType(allocator: std.mem.Allocator, type_info: Type) void {
     switch (type_info) {
         .tensor => |tensor_type| {
             // Free the shape array
@@ -1399,6 +1399,8 @@ pub fn freeAST(allocator: std.mem.Allocator, node: ASTNode) void {
             allocator.free(call.arguments);
         },
         .tensor_literal => |tensor_lit| {
+            // Free the shape array
+            allocator.free(tensor_lit.shape);
             // Free the tensor literal type
             freeType(allocator, tensor_lit.element_type);
             freeAST(allocator, tensor_lit.value.*);
