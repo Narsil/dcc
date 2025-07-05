@@ -404,7 +404,7 @@ pub const TypeChecker = struct {
 
         // Return the tensor type
         const result = parser.Type{
-            .tensor = try parser.Type.TensorType.init(self.allocator, tensor_lit.shape, element_type_ptr),
+            .tensor = try parser.Type.TensorType.init(self.allocator, tensor_lit.shape, element_type_ptr, false),
         };
 
         std.debug.print("DEBUG: typeCheckTensorLiteral - created tensor type: {}\n", .{result});

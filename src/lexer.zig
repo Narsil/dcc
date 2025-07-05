@@ -5,19 +5,19 @@ pub const TokenType = enum {
     number,
     identifier,
     type, // For type identifiers like u32, i64, f32, etc.
-    
+
     // Keywords
     let,
     fn_,
     return_,
-    
+
     // Operators
     plus,
     minus,
     multiply,
     divide,
     assign,
-    
+
     // Delimiters
     left_paren,
     right_paren,
@@ -28,14 +28,14 @@ pub const TokenType = enum {
     comma,
     semicolon,
     colon, // For type annotations
-    
+
     // Comparison operators
     greater_than,
-    
+
     // Special
     eof,
     invalid,
-    
+
     /// Returns the fixed length for tokens that have a known length
     /// Returns 0 for variable-length tokens (number, identifier, keywords, type)
     pub fn length(self: TokenType) usize {
@@ -48,7 +48,7 @@ pub const TokenType = enum {
             .number, .identifier, .type, .eof, .invalid => 0, // Variable length
         };
     }
-    
+
     /// Returns true if this token type has a fixed length
     pub fn hasFixedLength(self: TokenType) bool {
         return self.length() > 0;
@@ -59,7 +59,7 @@ pub const Token = struct {
     type: TokenType,
     offset: usize,
     length: usize, // Only used for variable-length tokens
-    
+
     /// Get the actual length of this token
     pub fn getLength(self: Token) usize {
         if (self.type.hasFixedLength()) {
@@ -74,7 +74,7 @@ pub const Lexer = struct {
     source: []const u8,
     current: usize,
     allocator: std.mem.Allocator,
-    
+
     pub fn init(allocator: std.mem.Allocator, source: []const u8) Lexer {
         return Lexer{
             .source = source,
@@ -82,11 +82,11 @@ pub const Lexer = struct {
             .allocator = allocator,
         };
     }
-    
+
     pub fn tokenize(self: *Lexer) ![]Token {
         var tokens = std.ArrayList(Token).init(self.allocator);
         defer tokens.deinit();
-        
+
         while (!self.isAtEnd()) {
             const token = self.nextToken();
             try tokens.append(token);
@@ -96,19 +96,19 @@ pub const Lexer = struct {
                 std.debug.print("Invalid token at line {}, column {}: '{s}'\n", .{ pos.line, pos.column, lexeme });
             }
         }
-        
+
         try tokens.append(Token{
             .type = .eof,
             .offset = self.current,
             .length = 0,
         });
-        
+
         return tokens.toOwnedSlice();
     }
-    
+
     fn nextToken(self: *Lexer) Token {
         self.skipWhitespace();
-        
+
         if (self.isAtEnd()) {
             return Token{
                 .type = .eof,
@@ -116,10 +116,10 @@ pub const Lexer = struct {
                 .length = 0,
             };
         }
-        
+
         const start = self.current;
         const c = self.advance();
-        
+
         return switch (c) {
             '+' => self.makeToken(.plus, start),
             '-' => self.makeToken(.minus, start),
@@ -151,12 +151,12 @@ pub const Lexer = struct {
             },
         };
     }
-    
+
     fn number(self: *Lexer, start: usize) Token {
         while (!self.isAtEnd() and std.ascii.isDigit(self.peek())) {
             _ = self.advance();
         }
-        
+
         // Check for decimal point
         if (!self.isAtEnd() and self.peek() == '.') {
             _ = self.advance(); // consume '.'
@@ -164,12 +164,12 @@ pub const Lexer = struct {
                 _ = self.advance();
             }
         }
-        
+
         // Check for type suffix
         if (!self.isAtEnd()) {
             const suffix_start = self.current;
             const c = self.peek();
-            
+
             // Check for unsigned integer types
             if (c == 'u') {
                 _ = self.advance(); // consume 'u'
@@ -207,15 +207,15 @@ pub const Lexer = struct {
                 }
             }
         }
-        
+
         return self.makeToken(.number, start);
     }
-    
+
     fn identifier(self: *Lexer, start: usize) Token {
         while (!self.isAtEnd() and (std.ascii.isAlphanumeric(self.peek()) or self.peek() == '_')) {
             _ = self.advance();
         }
-        
+
         const text = self.source[start..self.current];
         const token_type = self.identifierType(text);
         return Token{
@@ -224,18 +224,18 @@ pub const Lexer = struct {
             .length = self.current - start,
         };
     }
-    
+
     fn identifierType(self: *Lexer, text: []const u8) TokenType {
         if (std.mem.eql(u8, text, "let")) return .let;
         if (std.mem.eql(u8, text, "fn")) return .fn_;
         if (std.mem.eql(u8, text, "return")) return .return_;
-        
+
         // Check if it's a type identifier
         if (self.isTypeIdentifier(text)) return .type;
-        
+
         return .identifier;
     }
-    
+
     fn isTypeIdentifier(_: *Lexer, text: []const u8) bool {
         // Check for supported types
         const types = [_][]const u8{ "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64", "void" };
@@ -244,7 +244,7 @@ pub const Lexer = struct {
         }
         return false;
     }
-    
+
     fn makeToken(self: *Lexer, token_type: TokenType, start: usize) Token {
         return Token{
             .type = token_type,
@@ -252,7 +252,7 @@ pub const Lexer = struct {
             .length = if (token_type.hasFixedLength()) 0 else self.current - start,
         };
     }
-    
+
     fn skipWhitespace(self: *Lexer) void {
         while (!self.isAtEnd()) {
             const c = self.peek();
@@ -275,34 +275,34 @@ pub const Lexer = struct {
             }
         }
     }
-    
+
     fn isAtEnd(self: *Lexer) bool {
         return self.current >= self.source.len;
     }
-    
+
     fn advance(self: *Lexer) u8 {
         if (self.isAtEnd()) return 0;
         const c = self.source[self.current];
         self.current += 1;
         return c;
     }
-    
+
     fn peek(self: *Lexer) u8 {
         if (self.isAtEnd()) return 0;
         return self.source[self.current];
     }
-    
+
     fn peekNext(self: *Lexer) u8 {
         if (self.current + 1 >= self.source.len) return 0;
         return self.source[self.current + 1];
     }
-    
+
     /// Convert an offset back to line and column numbers
     /// This is useful for error reporting when you need human-readable positions
     pub fn offsetToLineColumn(source: []const u8, offset: usize) struct { line: u32, column: u32 } {
         var line: u32 = 1;
         var column: u32 = 1;
-        
+
         for (source[0..@min(offset, source.len)]) |c| {
             if (c == '\n') {
                 line += 1;
@@ -311,7 +311,7 @@ pub const Lexer = struct {
                 column += 1;
             }
         }
-        
+
         return .{ .line = line, .column = column };
     }
 };
@@ -319,11 +319,11 @@ pub const Lexer = struct {
 test "lexer basic tokens" {
     const allocator = std.testing.allocator;
     const source = "let x = 42;";
-    
+
     var lexer = Lexer.init(allocator, source);
     const tokens = try lexer.tokenize();
     defer allocator.free(tokens);
-    
+
     try std.testing.expect(tokens.len == 6); // let, x, =, 42, ;, eof
     try std.testing.expect(tokens[0].type == .let);
     try std.testing.expect(tokens[1].type == .identifier);
@@ -335,44 +335,45 @@ test "lexer basic tokens" {
 
 test "offset to line column conversion" {
     const source = "hello\nworld\ntest";
-    
+
     // Test offset 0 (start of file)
     var pos = Lexer.offsetToLineColumn(source, 0);
     try std.testing.expect(pos.line == 1);
     try std.testing.expect(pos.column == 1);
-    
+
     // Test offset 3 (middle of first line)
     pos = Lexer.offsetToLineColumn(source, 3);
     try std.testing.expect(pos.line == 1);
     try std.testing.expect(pos.column == 4);
-    
+
     // Test offset 5 (newline character)
     pos = Lexer.offsetToLineColumn(source, 5);
     try std.testing.expect(pos.line == 1);
     try std.testing.expect(pos.column == 6);
-    
+
     // Test offset 6 (start of second line)
     pos = Lexer.offsetToLineColumn(source, 6);
     try std.testing.expect(pos.line == 2);
     try std.testing.expect(pos.column == 1);
-    
+
     // Test offset 10 (middle of second line)
     pos = Lexer.offsetToLineColumn(source, 10);
     try std.testing.expect(pos.line == 2);
     try std.testing.expect(pos.column == 5);
-    
+
     // Test offset 11 (newline character)
     pos = Lexer.offsetToLineColumn(source, 11);
     try std.testing.expect(pos.line == 2);
     try std.testing.expect(pos.column == 6);
-    
+
     // Test offset 12 (start of third line)
     pos = Lexer.offsetToLineColumn(source, 12);
     try std.testing.expect(pos.line == 3);
     try std.testing.expect(pos.column == 1);
-    
+
     // Test offset 15 (end of file)
     pos = Lexer.offsetToLineColumn(source, 15);
     try std.testing.expect(pos.line == 3);
     try std.testing.expect(pos.column == 4);
-} 
+}
+

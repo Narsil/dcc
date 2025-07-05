@@ -280,7 +280,7 @@ fn compile(allocator: std.mem.Allocator, source_file: []const u8, target_triple:
     }
 
     // Parse
-    var parse = parser.Parser.init(allocator, tokens, source);
+    var parse = parser.Parser.init(allocator, tokens, source, verbose);
     const ast = try parse.parse();
     defer parser.freeAST(allocator, ast);
 
@@ -345,7 +345,7 @@ test "integration test" {
     defer allocator.free(tokens);
 
     // Parse
-    var parse = parser.Parser.init(allocator, tokens, source);
+    var parse = parser.Parser.init(allocator, tokens, source, false);
     const ast = try parse.parse();
     defer parser.freeAST(allocator, ast);
 

@@ -80,7 +80,7 @@ pub const CodeGen = struct {
             .verbose = verbose,
             .variables = std.HashMap([]const u8, VarInfo, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .functions = std.HashMap([]const u8, LLVM.LLVMValueRef, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
-            .mlir_codegen = mlir_codegen.MLIRCodeGen.init(allocator, "gpu_module", verbose) catch null,
+            .mlir_codegen = mlir_codegen.MLIRCodeGen.init(allocator, 50, verbose) catch null,
         };
     }
 

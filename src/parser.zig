@@ -23,7 +23,7 @@ pub const Type = union(enum) {
     i64,
     f32,
     f64,
-    
+
     // Special types
     void,
 
@@ -34,8 +34,10 @@ pub const Type = union(enum) {
         shape: []const u32,
         element_type: *Type,
 
-        pub fn init(allocator: std.mem.Allocator, shape: []const u32, element_type: *const Type) !TensorType {
-            std.debug.print("DEBUG: TensorType.init - element_type ptr: {any}, value: {}\n", .{ element_type, element_type.* });
+        pub fn init(allocator: std.mem.Allocator, shape: []const u32, element_type: *const Type, verbose: bool) !TensorType {
+            if (verbose) {
+                std.debug.print("DEBUG: TensorType.init - element_type ptr: {any}, value: {}\n", .{ element_type, element_type.* });
+            }
             return TensorType{
                 .shape = try allocator.dupe(u32, shape),
                 .element_type = @constCast(element_type),
@@ -274,13 +276,15 @@ pub const Parser = struct {
     current: usize,
     allocator: std.mem.Allocator,
     source: []const u8,
+    verbose: bool,
 
-    pub fn init(allocator: std.mem.Allocator, tokens: []lexer.Token, source: []const u8) Parser {
+    pub fn init(allocator: std.mem.Allocator, tokens: []lexer.Token, source: []const u8, verbose: bool) Parser {
         return Parser{
             .tokens = tokens,
             .current = 0,
             .allocator = allocator,
             .source = source,
+            .verbose = verbose,
         };
     }
 
@@ -464,10 +468,14 @@ pub const Parser = struct {
     }
 
     fn parseStatement(self: *Parser) ParseError!ASTNode {
-        std.debug.print("DEBUG: parseStatement - checking for let, current token: {}\n", .{self.peek().type});
+        if (self.verbose) {
+            std.debug.print("DEBUG: parseStatement - checking for let, current token: {}\n", .{self.peek().type});
+        }
 
         if (self.match(.let)) {
-            std.debug.print("DEBUG: parseStatement - match(.let) succeeded, current token: {}\n", .{self.peek().type});
+            if (self.verbose) {
+                std.debug.print("DEBUG: parseStatement - match(.let) succeeded, current token: {}\n", .{self.peek().type});
+            }
             return try self.parseVariableDeclaration();
         }
 
@@ -482,7 +490,9 @@ pub const Parser = struct {
         // Expression statement
         const expr = try self.parseAssignment();
 
-        std.debug.print("DEBUG: parseStatement - current token type: {}\n", .{self.peek().type});
+        if (self.verbose) {
+            std.debug.print("DEBUG: parseStatement - current token type: {}\n", .{self.peek().type});
+        }
 
         if (!self.match(.semicolon)) {
             self.cleanupASTNode(&expr);
@@ -587,22 +597,30 @@ pub const Parser = struct {
     }
 
     fn parseVariableDeclaration(self: *Parser) ParseError!ASTNode {
-        std.debug.print("DEBUG: parseVariableDeclaration - starting\n", .{});
+        if (self.verbose) {
+            std.debug.print("DEBUG: parseVariableDeclaration - starting\n", .{});
+        }
 
         // Note: 'let' token has already been consumed by match(.let) in parseStatement
 
         const name = try self.consume(.identifier, "Expected variable name");
         const name_lexeme = self.source[name.offset .. name.offset + name.getLength()];
 
-        std.debug.print("DEBUG: parseVariableDeclaration - variable name: {s}\n", .{name_lexeme});
+        if (self.verbose) {
+            std.debug.print("DEBUG: parseVariableDeclaration - variable name: {s}\n", .{name_lexeme});
+        }
 
         _ = try self.consume(.colon, "Expected ':' after variable name");
 
-        std.debug.print("DEBUG: parseVariableDeclaration - before parseType\n", .{});
+        if (self.verbose) {
+            std.debug.print("DEBUG: parseVariableDeclaration - before parseType\n", .{});
+        }
 
         const var_type = try self.parseType();
 
-        std.debug.print("DEBUG: Parsed variable type: {}\n", .{var_type});
+        if (self.verbose) {
+            std.debug.print("DEBUG: Parsed variable type: {}\n", .{var_type});
+        }
 
         _ = try self.consume(.assign, "Expected '=' after type");
 
@@ -892,7 +910,9 @@ pub const Parser = struct {
     }
 
     fn parseNumberWithType(self: *Parser, lexeme: []const u8) ParseError!struct { value: []const u8, type: Type } {
-        std.debug.print("DEBUG: parseNumberWithType - parsing lexeme: '{s}'\n", .{lexeme});
+        if (self.verbose) {
+            std.debug.print("DEBUG: parseNumberWithType - parsing lexeme: '{s}'\n", .{lexeme});
+        }
 
         // Find the type suffix
         var type_start: ?usize = null;
@@ -907,19 +927,25 @@ pub const Parser = struct {
             const number_part = lexeme[0..start];
             const type_part = lexeme[start..];
 
-            std.debug.print("DEBUG: parseNumberWithType - number_part: '{s}', type_part: '{s}'\n", .{ number_part, type_part });
+            if (self.verbose) {
+                std.debug.print("DEBUG: parseNumberWithType - number_part: '{s}', type_part: '{s}'\n", .{ number_part, type_part });
+            }
 
             const parsed_type = Type.fromString(type_part) orelse {
                 self.reportError(0, "Invalid type suffix");
                 return error.ParseError;
             };
 
-            std.debug.print("DEBUG: parseNumberWithType - parsed type: {}\n", .{parsed_type});
+            if (self.verbose) {
+                std.debug.print("DEBUG: parseNumberWithType - parsed type: {}\n", .{parsed_type});
+            }
 
             return .{ .value = number_part, .type = parsed_type };
         } else {
             // Default to i64 if no type suffix
-            std.debug.print("DEBUG: parseNumberWithType - no type suffix, defaulting to i64\n", .{});
+            if (self.verbose) {
+                std.debug.print("DEBUG: parseNumberWithType - no type suffix, defaulting to i64\n", .{});
+            }
             return .{ .value = lexeme, .type = .i64 };
         }
     }
@@ -951,14 +977,18 @@ pub const Parser = struct {
         const type_token = try self.consume(.type, "Expected type");
         const type_str = self.source[type_token.offset .. type_token.offset + type_token.getLength()];
 
-        std.debug.print("DEBUG: parseType - parsing type string: '{s}'\n", .{type_str});
+        if (self.verbose) {
+            std.debug.print("DEBUG: parseType - parsing type string: '{s}'\n", .{type_str});
+        }
 
         const parsed_type = Type.fromString(type_str) orelse {
             self.reportError(type_token.offset, "Invalid type");
             return error.ParseError;
         };
 
-        std.debug.print("DEBUG: parseType - parsed type: {}\n", .{parsed_type});
+        if (self.verbose) {
+            std.debug.print("DEBUG: parseType - parsed type: {}\n", .{parsed_type});
+        }
 
         return parsed_type;
     }
@@ -995,10 +1025,12 @@ pub const Parser = struct {
         element_type_ptr.* = element_type;
 
         // Create tensor type
-        const tensor_type = try Type.TensorType.init(self.allocator, dimensions.items, element_type_ptr);
+        const tensor_type = try Type.TensorType.init(self.allocator, dimensions.items, element_type_ptr, self.verbose);
         const result = Type{ .tensor = tensor_type };
 
-        std.debug.print("DEBUG: parseTensorType - created tensor type: {}\n", .{result});
+        if (self.verbose) {
+            std.debug.print("DEBUG: parseTensorType - created tensor type: {}\n", .{result});
+        }
 
         return result;
     }
@@ -1167,7 +1199,7 @@ test "parser simple variable" {
     const tokens = try lex.tokenize();
     defer allocator.free(tokens);
 
-    var parser = Parser.init(allocator, tokens, source);
+    var parser = Parser.init(allocator, tokens, source, false);
     const ast = try parser.parse();
     defer freeAST(allocator, ast);
 
@@ -1184,7 +1216,7 @@ test "parser error - calling non-function" {
     const tokens = try lex.tokenize();
     defer allocator.free(tokens);
 
-    var parser = Parser.init(allocator, tokens, source);
+    var parser = Parser.init(allocator, tokens, source, false);
     const result = parser.parse();
     try std.testing.expectError(error.ParseError, result);
 }
@@ -1197,7 +1229,7 @@ test "parser error - missing function parentheses" {
     const tokens = try lex.tokenize();
     defer allocator.free(tokens);
 
-    var parser = Parser.init(allocator, tokens, source);
+    var parser = Parser.init(allocator, tokens, source, false);
     const result = parser.parse();
     try std.testing.expectError(error.ParseError, result);
 }
@@ -1210,7 +1242,7 @@ test "parser error - missing closing parenthesis" {
     const tokens = try lex.tokenize();
     defer allocator.free(tokens);
 
-    var parser = Parser.init(allocator, tokens, source);
+    var parser = Parser.init(allocator, tokens, source, false);
     const result = parser.parse();
     try std.testing.expectError(error.ParseError, result);
 }
@@ -1223,7 +1255,7 @@ test "parser error - missing opening brace" {
     const tokens = try lex.tokenize();
     defer allocator.free(tokens);
 
-    var parser = Parser.init(allocator, tokens, source);
+    var parser = Parser.init(allocator, tokens, source, false);
     const result = parser.parse();
     try std.testing.expectError(error.ParseError, result);
 }
@@ -1236,7 +1268,7 @@ test "parser error - missing closing brace" {
     const tokens = try lex.tokenize();
     defer allocator.free(tokens);
 
-    var parser = Parser.init(allocator, tokens, source);
+    var parser = Parser.init(allocator, tokens, source, false);
     const result = parser.parse();
     try std.testing.expectError(error.ParseError, result);
 }
@@ -1249,7 +1281,7 @@ test "parser error - missing assignment operator" {
     const tokens = try lex.tokenize();
     defer allocator.free(tokens);
 
-    var parser = Parser.init(allocator, tokens, source);
+    var parser = Parser.init(allocator, tokens, source, false);
     const result = parser.parse();
     try std.testing.expectError(error.ParseError, result);
 }
@@ -1262,7 +1294,7 @@ test "parser error - missing semicolon after variable" {
     const tokens = try lex.tokenize();
     defer allocator.free(tokens);
 
-    var parser = Parser.init(allocator, tokens, source);
+    var parser = Parser.init(allocator, tokens, source, false);
     const result = parser.parse();
     try std.testing.expectError(error.ParseError, result);
 }
@@ -1275,7 +1307,7 @@ test "parser error - missing closing parenthesis in expression" {
     const tokens = try lex.tokenize();
     defer allocator.free(tokens);
 
-    var parser = Parser.init(allocator, tokens, source);
+    var parser = Parser.init(allocator, tokens, source, false);
     const result = parser.parse();
     try std.testing.expectError(error.ParseError, result);
 }
@@ -1288,7 +1320,7 @@ test "parser error - calling expression" {
     const tokens = try lex.tokenize();
     defer allocator.free(tokens);
 
-    var parser = Parser.init(allocator, tokens, source);
+    var parser = Parser.init(allocator, tokens, source, false);
     const result = parser.parse();
     try std.testing.expectError(error.ParseError, result);
 }
@@ -1323,10 +1355,10 @@ pub fn freeAST(allocator: std.mem.Allocator, node: ASTNode) void {
                 freeType(allocator, param.type);
             }
             allocator.free(func.parameters);
-            
+
             // Free return type
             freeType(allocator, func.return_type);
-            
+
             for (func.body) |stmt| {
                 freeAST(allocator, stmt);
             }
