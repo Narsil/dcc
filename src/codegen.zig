@@ -11,7 +11,7 @@ const LLVM = @cImport({
     @cInclude("llvm-c/Object.h");
 });
 
-pub const CodeGenError = error{ InvalidTopLevelNode, InvalidStatement, InvalidExpression, InvalidCallee, UndefinedVariable, UndefinedFunction, TargetError, CodeGenError, MainFunctionNotFound, MissingMainFunction, LinkingFailed, GpuCompilationNotImplemented, InvalidCharacter, Overflow } || std.mem.Allocator.Error;
+pub const CodeGenError = error{ InvalidTopLevelNode, InvalidStatement, InvalidExpression, InvalidCallee, UndefinedVariable, UndefinedFunction, TargetError, CodeGenError, MainFunctionNotFound, MissingMainFunction, LinkingFailed, GpuCompilationNotImplemented, InvalidGpuTriplet, InvalidCharacter, Overflow } || std.mem.Allocator.Error;
 
 const VarInfo = struct {
     alloca: LLVM.LLVMValueRef,
@@ -50,7 +50,48 @@ pub const CodeGen = struct {
     functions: std.HashMap([]const u8, LLVM.LLVMValueRef, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
     mlir_codegen: ?mlir_codegen.MLIRCodeGen,
 
-    pub fn init(allocator: std.mem.Allocator, module_name: []const u8, verbose: bool) !CodeGen {
+    /// Parse GPU triplet and extract SM version
+    /// Expected format: nvidia-ptx-smXX (e.g., nvidia-ptx-sm50)
+    fn parseGpuTriplet(triplet: []const u8) !u32 {
+        // Split by '-' to get parts
+        var parts = std.mem.splitSequence(u8, triplet, "-");
+        
+        // Part 1: vendor (must be "nvidia")
+        const vendor = parts.next() orelse return error.InvalidGpuTriplet;
+        if (!std.mem.eql(u8, vendor, "nvidia")) {
+            return error.InvalidGpuTriplet;
+        }
+        
+        // Part 2: target (must be "ptx")
+        const target = parts.next() orelse return error.InvalidGpuTriplet;
+        if (!std.mem.eql(u8, target, "ptx")) {
+            return error.InvalidGpuTriplet;
+        }
+        
+        // Part 3: SM version (must be "smXX")
+        const sm_part = parts.next() orelse return error.InvalidGpuTriplet;
+        if (!std.mem.startsWith(u8, sm_part, "sm")) {
+            return error.InvalidGpuTriplet;
+        }
+        
+        // Make sure there are no more parts
+        if (parts.next() != null) {
+            return error.InvalidGpuTriplet;
+        }
+        
+        // Extract the numeric part after "sm"
+        const sm_version_str = sm_part[2..]; // Skip "sm"
+        const sm_version = std.fmt.parseInt(u32, sm_version_str, 10) catch return error.InvalidGpuTriplet;
+        
+        // Validate SM version is reasonable (20-90)
+        if (sm_version < 20 or sm_version > 90) {
+            return error.InvalidGpuTriplet;
+        }
+        
+        return sm_version;
+    }
+
+    pub fn init(allocator: std.mem.Allocator, module_name: []const u8, verbose: bool, gpu_triplet: ?[]const u8) !CodeGen {
         // Initialize LLVM X86 target (for x86_64 support)
         LLVM.LLVMInitializeX86TargetInfo();
         LLVM.LLVMInitializeX86Target();
@@ -72,6 +113,17 @@ pub const CodeGen = struct {
         const module = LLVM.LLVMModuleCreateWithNameInContext(module_name_z.ptr, context);
         const builder = LLVM.LLVMCreateBuilderInContext(context);
 
+        // Parse GPU triplet if provided
+        var mlir_gen: ?mlir_codegen.MLIRCodeGen = null;
+        if (gpu_triplet) |triplet| {
+            const sm_version = parseGpuTriplet(triplet) catch |err| {
+                std.debug.print("Error: Invalid GPU triplet '{s}': {}\n", .{ triplet, err });
+                std.debug.print("Expected format: nvidia-ptx-smXX (e.g., nvidia-ptx-sm50)\n", .{});
+                return error.CodeGenError;
+            };
+            mlir_gen = mlir_codegen.MLIRCodeGen.init(allocator, sm_version, verbose) catch null;
+        }
+
         return CodeGen{
             .context = context,
             .module = module,
@@ -80,7 +132,7 @@ pub const CodeGen = struct {
             .verbose = verbose,
             .variables = std.HashMap([]const u8, VarInfo, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .functions = std.HashMap([]const u8, LLVM.LLVMValueRef, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
-            .mlir_codegen = mlir_codegen.MLIRCodeGen.init(allocator, 50, verbose) catch null,
+            .mlir_codegen = mlir_gen,
         };
     }
 
@@ -1281,11 +1333,9 @@ pub const CodeGen = struct {
             // Generate host wrapper function that calls the GPU kernel
             try self.generateGpuHostWrapper(func);
         } else {
-            if (self.verbose) {
-                std.debug.print("MLIR not available for GPU compilation\n", .{});
-            }
-            // Generate a simple host wrapper for now
-            try self.generateGpuHostWrapper(func);
+            std.debug.print("Error: Cannot compile GPU function '{s}' without --gpu flag\n", .{func.name});
+            std.debug.print("GPU functions require GPU compilation support. Use --gpu flag to enable.\n", .{});
+            return error.GpuCompilationNotImplemented;
         }
     }
 

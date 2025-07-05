@@ -88,14 +88,15 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     if (args.len < 2) {
-        std.debug.print("Usage: {s} <source_file> [--target <target_triplet>] [--verbose]\n", .{args[0]});
-        std.debug.print("Example: {s} program.toy --target x86_64-pc-linux-gnu --verbose\n", .{args[0]});
+        std.debug.print("Usage: {s} <source_file> [--target <target_triplet>] [--verbose] [--gpu <gpu_triplet>]\n", .{args[0]});
+        std.debug.print("Example: {s} program.toy --target x86_64-pc-linux-gnu --verbose --gpu nvidia-ptx-sm50\n", .{args[0]});
         return;
     }
 
     var source_file: []const u8 = undefined;
     var target_triple: ?[]const u8 = null;
     var verbose: bool = false;
+    var gpu_triplet: ?[]const u8 = null;
 
     // Parse arguments
     var i: usize = 1;
@@ -111,6 +112,13 @@ pub fn main() !void {
             target_triple = args[i];
         } else if (std.mem.eql(u8, arg, "--verbose")) {
             verbose = true;
+        } else if (std.mem.eql(u8, arg, "--gpu")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: --gpu requires a GPU triplet (e.g., nvidia-ptx-sm50)\n", .{});
+                return;
+            }
+            gpu_triplet = args[i];
         } else if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.print("Error: Unknown option: {s}\n", .{arg});
             return;
@@ -135,7 +143,7 @@ pub fn main() !void {
     }
 
     // Wrap compilation in catch block to handle normal errors gracefully
-    const result = compile(allocator, source_file, target_triple, verbose);
+    const result = compile(allocator, source_file, target_triple, verbose, gpu_triplet);
     if (result) |_| {
         // Compilation successful
     } else |err| {
@@ -219,6 +227,10 @@ pub fn main() !void {
                 std.debug.print("Error: GPU compilation not implemented\n", .{});
                 std.process.exit(1);
             },
+            codegen.CodeGenError.InvalidGpuTriplet => {
+                std.debug.print("Error: Invalid GPU triplet format\n", .{});
+                std.process.exit(1);
+            },
             // Type checker errors (normal compilation errors)
             typechecker.TypeCheckError.TypeMismatch => {
                 // Type checker already prints the error message, just exit
@@ -253,7 +265,7 @@ pub fn main() !void {
     }
 }
 
-fn compile(allocator: std.mem.Allocator, source_file: []const u8, target_triple: ?[]const u8, verbose: bool) !void {
+fn compile(allocator: std.mem.Allocator, source_file: []const u8, target_triple: ?[]const u8, verbose: bool, gpu_triplet: ?[]const u8) !void {
     if (verbose) {
         std.debug.print("Compiling: {s}\n", .{source_file});
     }
@@ -302,7 +314,7 @@ fn compile(allocator: std.mem.Allocator, source_file: []const u8, target_triple:
 
     // Generate LLVM IR using C bindings
     std.debug.print("CodeGen\n", .{});
-    var code_gen = try codegen.CodeGen.init(allocator, "toy_program", verbose);
+    var code_gen = try codegen.CodeGen.init(allocator, "toy_program", verbose, gpu_triplet);
     defer code_gen.deinit();
 
     try code_gen.generate(ast);

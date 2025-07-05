@@ -50,6 +50,47 @@ fn assertReturns(allocator: std.mem.Allocator, expected: usize) !void {
     }
 }
 
+// Assert that GPU compilation fails without --gpu flag
+fn assertGpuCompileFailure(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    filename: []const u8,
+) !void {
+    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
+
+    // Write the temporary source file
+    {
+        const file = try std.fs.cwd().createFile(filename, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(source);
+    }
+    defer std.fs.cwd().deleteFile(filename) catch {};
+
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, filename } });
+    defer allocator.free(out.stdout);
+    defer allocator.free(out.stderr);
+
+    // Expect non-zero exit status
+    switch (out.term) {
+        .Exited => |code| {
+            if (code == 0) {
+                std.debug.print("Expected GPU compilation to fail without --gpu flag\n", .{});
+                std.debug.print("stdout: {s}\n", .{out.stdout});
+                std.debug.print("stderr: {s}\n", .{out.stderr});
+                return error.UnexpectedSuccess;
+            }
+        },
+        else => return error.UnexpectedTermination,
+    }
+
+    // Check that the error message contains the expected GPU error text
+    if (!std.mem.containsAtLeast(u8, out.stderr, 1, "Cannot compile GPU function") or
+        !std.mem.containsAtLeast(u8, out.stderr, 1, "without --gpu flag")) {
+        std.debug.print("Expected GPU error message not found in stderr:\n{s}\n", .{out.stderr});
+        return error.MissingGpuError;
+    }
+}
+
 // Assert that compilation fails and stderr contains the expected substring (if provided)
 fn assertCompileFailure(
     allocator: std.mem.Allocator,
@@ -541,7 +582,7 @@ test "tensor - mismatching dtype in binary op" {
     std.debug.print("Tensor dtype mismatch in binary op error test passed\n", .{});
 }
 
-test "gpu vector addition compilation with MLIR" {
+test "gpu vector addition compilation without --gpu flag" {
     const allocator = std.testing.allocator;
     const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
 
@@ -572,9 +613,84 @@ test "gpu vector addition compilation with MLIR" {
 
     switch (out.term) {
         .Exited => |code| {
-            // Expect successful compilation now that MLIR GPU infrastructure is implemented
+            // Expect compilation failure because GPU functions require --gpu flag
+            if (code == 0) {
+                std.debug.print("Expected GPU compilation to fail without --gpu flag\n", .{});
+                std.debug.print("stdout: {s}\n", .{out.stdout});
+                std.debug.print("stderr: {s}\n", .{out.stderr});
+                return error.TestFailed;
+            }
+            // Check that the error message contains the expected text
+            if (!std.mem.containsAtLeast(u8, out.stderr, 1, "Cannot compile GPU function") or
+                !std.mem.containsAtLeast(u8, out.stderr, 1, "without --gpu flag")) {
+                std.debug.print("Expected error message about missing --gpu flag\n", .{});
+                std.debug.print("stderr: {s}\n", .{out.stderr});
+                return error.TestFailed;
+            }
+        },
+        else => return error.TestFailed,
+    }
+
+    std.debug.print("GPU compilation without --gpu flag test passed\n", .{});
+}
+
+test "gpu function compilation failure without --gpu flag" {
+    const allocator = std.testing.allocator;
+
+    const gpu_function_source =
+        \\fn gpu_vector_add(a: [8]i32, b: [8]i32) void {
+        \\    a[i] = a[i] + b[i];
+        \\}
+        \\
+        \\fn main() i32 {
+        \\    let x: [8]i32 = [8]i32{1i32};
+        \\    let y: [8]i32 = [8]i32{2i32};
+        \\    gpu_vector_add(x, y);
+        \\    return x[0];
+        \\}
+    ;
+
+    try assertGpuCompileFailure(allocator, gpu_function_source, "test_gpu_compile_failure.toy");
+
+    std.debug.print("GPU function compilation failure test passed\n", .{});
+}
+
+test "gpu function compilation with valid triplet" {
+    const allocator = std.testing.allocator;
+    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
+
+    const gpu_source =
+        \\fn gpu_vector_add(a: [8]i32, b: [8]i32) void {
+        \\    a[i] = a[i] + b[i];
+        \\}
+        \\
+        \\fn main() i32 {
+        \\    let x: [8]i32 = [8]i32{1i32};
+        \\    let y: [8]i32 = [8]i32{2i32};
+        \\    gpu_vector_add(x, y);
+        \\    return x[0];
+        \\}
+    ;
+
+    const filename = "test_gpu_triplet_valid.toy";
+
+    // Write the temporary source file
+    {
+        const file = try std.fs.cwd().createFile(filename, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(gpu_source);
+    }
+    defer std.fs.cwd().deleteFile(filename) catch {};
+
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, filename, "--gpu", "nvidia-ptx-sm50" } });
+    defer allocator.free(out.stdout);
+    defer allocator.free(out.stderr);
+
+    switch (out.term) {
+        .Exited => |code| {
+            // Expect successful compilation with valid GPU triplet
             if (code != 0) {
-                std.debug.print("GPU compilation failed with exit code {}\n", .{code});
+                std.debug.print("GPU compilation with valid triplet failed with exit code {}\n", .{code});
                 std.debug.print("stdout: {s}\n", .{out.stdout});
                 std.debug.print("stderr: {s}\n", .{out.stderr});
                 return error.TestFailed;
@@ -583,7 +699,58 @@ test "gpu vector addition compilation with MLIR" {
         else => return error.TestFailed,
     }
 
-    std.debug.print("GPU vector addition compilation with MLIR test passed\n", .{});
+    std.debug.print("GPU compilation with valid triplet test passed\n", .{});
+}
+
+test "gpu function compilation with invalid triplet" {
+    const allocator = std.testing.allocator;
+    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
+
+    const gpu_source =
+        \\fn gpu_vector_add(a: [8]i32, b: [8]i32) void {
+        \\    a[i] = a[i] + b[i];
+        \\}
+        \\
+        \\fn main() i32 {
+        \\    return 0i32;
+        \\}
+    ;
+
+    const filename = "test_gpu_triplet_invalid.toy";
+
+    // Write the temporary source file
+    {
+        const file = try std.fs.cwd().createFile(filename, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(gpu_source);
+    }
+    defer std.fs.cwd().deleteFile(filename) catch {};
+
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, filename, "--gpu", "invalid-triplet" } });
+    defer allocator.free(out.stdout);
+    defer allocator.free(out.stderr);
+
+    switch (out.term) {
+        .Exited => |code| {
+            // Expect compilation failure with invalid GPU triplet
+            if (code == 0) {
+                std.debug.print("Expected GPU compilation to fail with invalid triplet\n", .{});
+                std.debug.print("stdout: {s}\n", .{out.stdout});
+                std.debug.print("stderr: {s}\n", .{out.stderr});
+                return error.TestFailed;
+            }
+            // Check that the error message contains the expected text
+            if (!std.mem.containsAtLeast(u8, out.stderr, 1, "Invalid GPU triplet") or
+                !std.mem.containsAtLeast(u8, out.stderr, 1, "Expected format: nvidia-ptx-smXX")) {
+                std.debug.print("Expected error message about invalid GPU triplet format\n", .{});
+                std.debug.print("stderr: {s}\n", .{out.stderr});
+                return error.TestFailed;
+            }
+        },
+        else => return error.TestFailed,
+    }
+
+    std.debug.print("GPU compilation with invalid triplet test passed\n", .{});
 }
 
 test "void functions - basic void function" {
