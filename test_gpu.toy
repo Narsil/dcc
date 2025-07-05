@@ -1,0 +1,7 @@
+fn gpu_vector_add(a: [1024]f32, b: [1024]f32) void {
+    a[i] = a[i] + b[i];
+}
+
+fn main() i32 {
+    return 0;
+} 

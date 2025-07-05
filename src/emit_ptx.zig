@@ -1,6 +1,7 @@
 const std = @import("std");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
+const mlir_codegen = @import("mlir_codegen.zig");
 
 // MLIR C API bindings
 const MLIR = @cImport({
@@ -156,8 +157,42 @@ fn generatePTXFromPipeline(allocator: std.mem.Allocator, args: Args) ![]const u8
         std.debug.print("Found function: {s}\n", .{func_decl.name});
     }
 
-    // For now, if we reach here, we'll fall back to static
-    // TODO: Implement dynamic GPU MLIR generation from AST
+    // Generate MLIR using mlir_codegen
+    if (args.verbose) {
+        std.debug.print("🔧 Generating MLIR code using mlir_codegen...\n", .{});
+    }
+
+    var codegen = mlir_codegen.MLIRCodeGen.init(allocator, "kernels", args.verbose) catch |err| {
+        if (args.verbose) {
+            std.debug.print("❌ Failed to initialize MLIR codegen: {}\n", .{err});
+        }
+        return EmitPtxError.PipelineError;
+    };
+    defer codegen.deinit();
+
+    // Generate GPU function
+    codegen.generateGpuFunction(func_decl) catch |err| {
+        if (args.verbose) {
+            std.debug.print("❌ Failed to generate GPU function: {}\n", .{err});
+        }
+        return EmitPtxError.PipelineError;
+    };
+
+    if (args.verbose) {
+        std.debug.print("✅ Successfully generated MLIR GPU code for function: {s}\n", .{func_decl.name});
+        std.debug.print("=== Generated MLIR (should look like simple_vector_add_gpu.mlir) ===\n", .{});
+    }
+
+    // Print the generated MLIR
+    codegen.printMLIR();
+
+    if (args.verbose) {
+        std.debug.print("=== End Generated MLIR ===\n", .{});
+        std.debug.print("🎯 MLIR generation complete! For now, falling back to static pipeline to avoid breaking PTX export.\n", .{});
+    }
+
+    // For now, still return an error so we don't break the existing PTX pipeline
+    // TODO: Replace static pipeline with generated MLIR once we're confident in the output
     return EmitPtxError.PipelineError;
 }
 
@@ -183,7 +218,7 @@ fn generatePTXFromStatic(allocator: std.mem.Allocator, args: Args) ![]const u8 {
     const fixed_mlir = try fixNVVMOperations(allocator, standalone_kernel);
     defer allocator.free(fixed_mlir);
 
-        // Step 10: Translate MLIR to LLVM IR using MLIR C API (replaces external mlir-translate)
+    // Step 10: Translate MLIR to LLVM IR using MLIR C API (replaces external mlir-translate)
     const llvm_ir_content = try translateMLIRToLLVMIR(allocator, fixed_mlir, args.verbose);
     defer allocator.free(llvm_ir_content);
 
@@ -394,11 +429,7 @@ fn compileLLVMIRToPTX(allocator: std.mem.Allocator, llvm_ir_content: []const u8,
     defer MLIR.LLVMContextDispose(llvm_context);
 
     // Create memory buffer copy (safer approach)
-    const memory_buffer = MLIR.LLVMCreateMemoryBufferWithMemoryRangeCopy(
-        llvm_ir_content.ptr,
-        llvm_ir_content.len,
-        "llvm_ir"
-    );
+    const memory_buffer = MLIR.LLVMCreateMemoryBufferWithMemoryRangeCopy(llvm_ir_content.ptr, llvm_ir_content.len, "llvm_ir");
     // Don't dispose yet - will be handled manually later
 
     // Parse LLVM IR from memory buffer
@@ -439,15 +470,8 @@ fn compileLLVMIRToPTX(allocator: std.mem.Allocator, llvm_ir_content: []const u8,
     const cpu_str = try std.fmt.allocPrintZ(allocator, "sm_{d}", .{sm_version});
     defer allocator.free(cpu_str);
 
-    const target_machine = MLIR.LLVMCreateTargetMachine(
-        target,
-        target_triple,
-        cpu_str.ptr,
-        "", // features
-        MLIR.LLVMCodeGenLevelDefault,
-        MLIR.LLVMRelocDefault,
-        MLIR.LLVMCodeModelDefault
-    );
+    const target_machine = MLIR.LLVMCreateTargetMachine(target, target_triple, cpu_str.ptr, "", // features
+        MLIR.LLVMCodeGenLevelDefault, MLIR.LLVMRelocDefault, MLIR.LLVMCodeModelDefault);
     defer MLIR.LLVMDisposeTargetMachine(target_machine);
 
     if (verbose) {
@@ -458,13 +482,9 @@ fn compileLLVMIRToPTX(allocator: std.mem.Allocator, llvm_ir_content: []const u8,
     var ptx_memory_buffer: MLIR.LLVMMemoryBufferRef = undefined;
     var emit_error_msg: [*c]u8 = undefined;
 
-    if (MLIR.LLVMTargetMachineEmitToMemoryBuffer(
-        target_machine,
-        llvm_module,
-        MLIR.LLVMAssemblyFile, // Emit assembly (PTX)
-        &emit_error_msg,
-        &ptx_memory_buffer
-    ) != 0) {
+    if (MLIR.LLVMTargetMachineEmitToMemoryBuffer(target_machine, llvm_module, MLIR.LLVMAssemblyFile, // Emit assembly (PTX)
+        &emit_error_msg, &ptx_memory_buffer) != 0)
+    {
         defer MLIR.LLVMDisposeMessage(emit_error_msg);
         if (verbose) {
             std.debug.print("❌ Failed to emit PTX: {s}\n", .{emit_error_msg});
@@ -600,10 +620,6 @@ fn canonicalizeMLIRFile(allocator: std.mem.Allocator, input_file: []const u8, ve
     }
 
     const input_str_ref = MLIR.mlirStringRefCreateFromCString(null_terminated_content);
-
-    if (verbose) {
-        std.debug.print("🔍 Created string reference {s}, calling mlirModuleCreateParse...\n", .{null_terminated_content});
-    }
 
     const module = MLIR.mlirModuleCreateParse(context, input_str_ref);
 
