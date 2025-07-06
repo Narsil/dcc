@@ -657,6 +657,13 @@ test "gpu function compilation failure without --gpu flag" {
 
 test "gpu function compilation with valid triplet" {
     const allocator = std.testing.allocator;
+    
+    // Skip this test on non-Linux systems since GPU targets only work on Linux (for now)
+    if (builtin.target.os.tag != .linux) {
+        std.debug.print("GPU compilation test skipped on {s} (GPU targets only supported on Linux)\n", .{@tagName(builtin.target.os.tag)});
+        return;
+    }
+    
     const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
 
     const gpu_source =

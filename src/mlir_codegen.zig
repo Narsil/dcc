@@ -243,6 +243,13 @@ pub const MLIRCodeGen = struct {
     /// Generate MLIR code for the specific operation
     fn generateOperationMLIR(self: *MLIRCodeGen, writer: anytype, param_info: []ParameterInfo, operation_info: OperationInfo) !void {
         _ = self; // Unused parameter for now
+        
+        // Early return if no parameters to work with
+        if (param_info.len == 0) {
+            try writer.writeAll("      // No parameters provided for operation\n");
+            return;
+        }
+        
         // Generate load operations for source parameters
         for (operation_info.source_params, 0..) |param_idx, i| {
             if (param_idx < param_info.len) {
