@@ -173,7 +173,7 @@ fn generatePTXFromPipeline(allocator: std.mem.Allocator, args: Args) ![]const u8
     }
 
     // Use the integrated PTX generation pipeline in mlir_codegen
-    const ptx_content = codegen.lowerMLIRToPTX() catch |err| {
+    const ptx_content = codegen.lowerMLIRToPTX(args.function_name) catch |err| {
         if (args.verbose) {
             std.debug.print("❌ Failed to lower MLIR to PTX: {}\n", .{err});
         }

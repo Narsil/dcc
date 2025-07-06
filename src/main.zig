@@ -301,7 +301,7 @@ fn compile(allocator: std.mem.Allocator, source_file: []const u8, target_triple:
     }
 
     // Type check
-    var type_checker = typechecker.TypeChecker.init(allocator, source);
+    var type_checker = typechecker.TypeChecker.init(allocator, source, verbose);
     defer type_checker.deinit();
     try type_checker.typeCheck(ast);
 
@@ -313,12 +313,16 @@ fn compile(allocator: std.mem.Allocator, source_file: []const u8, target_triple:
     const has_main = hasMainFunction(ast);
 
     // Generate LLVM IR using C bindings
-    std.debug.print("CodeGen\n", .{});
+    if (verbose) {
+        std.debug.print("CodeGen\n", .{});
+    }
     var code_gen = try codegen.CodeGen.init(allocator, "toy_program", verbose, gpu_triplet);
     defer code_gen.deinit();
 
     try code_gen.generate(ast);
-    code_gen.printIR();
+    if (verbose) {
+        code_gen.printIR();
+    }
 
     // Use LLVM directly for linking (no need for external linker detection)
     const actual_target_triple = if (target_triple) |triple| triple else null;

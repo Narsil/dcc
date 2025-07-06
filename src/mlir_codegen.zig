@@ -59,8 +59,6 @@ pub const MLIRCodeGen = struct {
         self.generated_mlir.deinit();
     }
 
-
-
     /// Print the MLIR module (for debugging)
     pub fn printMLIR(self: *MLIRCodeGen) void {
         if (self.verbose) {
@@ -84,16 +82,37 @@ pub const MLIRCodeGen = struct {
         }
     }
 
-    /// Generate the GPU module MLIR that exactly matches simple_vector_add_gpu.mlir
+    /// Generate the GPU module MLIR based on the actual function declaration
     fn generateGpuModuleMLIR(self: *MLIRCodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration)) MLIRCodeGenError!void {
         const writer = self.generated_mlir.writer();
-        
-        // Generate the exact structure from simple_vector_add_gpu.mlir
+
+        // Analyze function parameters to determine dimensions and types
+        const param_info = try self.analyzeParameters(func.parameters);
+        defer self.allocator.free(param_info);
+
+        // Analyze function body to determine the operation
+        const operation_info = try self.analyzeOperation(func.body);
+        defer self.allocator.free(operation_info.source_params);
+
+        // Generate MLIR based on the analyzed information
         try writer.writeAll("gpu.module @kernels {\n");
-        try writer.print("  gpu.func @gpu_add_kernel(%arg0: memref<1024xf32>, %arg1: memref<1024xf32>) kernel {{\n", .{});
+        
+        // Create the function signature based on actual parameters
+        try writer.print("  gpu.func @{s}(", .{func.name});
+        for (param_info, 0..) |param, i| {
+            if (i > 0) try writer.writeAll(", ");
+            try writer.print("%arg{d}: memref<{d}x{s}>", .{i, param.dimension, param.mlir_type});
+        }
+        try writer.writeAll(") kernel {\n");
+
+        // Generate constants based on the actual dimensions
         try writer.writeAll("    %c0 = arith.constant 0 : index\n");
-        try writer.writeAll("    %c1024 = arith.constant 1024 : index\n");
+        if (param_info.len > 0) {
+            try writer.print("    %c{d} = arith.constant {d} : index\n", .{param_info[0].dimension, param_info[0].dimension});
+        }
         try writer.writeAll("    \n");
+
+        // Generate GPU thread indexing code
         try writer.writeAll("    // Calculate global thread index: blockIdx.x * blockDim.x + threadIdx.x\n");
         try writer.writeAll("    %block_id = gpu.block_id x\n");
         try writer.writeAll("    %block_dim = gpu.block_dim x\n");
@@ -101,18 +120,17 @@ pub const MLIRCodeGen = struct {
         try writer.writeAll("    %block_offset = arith.muli %block_id, %block_dim : index\n");
         try writer.writeAll("    %global_id = arith.addi %block_offset, %thread_id : index\n");
         try writer.writeAll("    \n");
-        try writer.writeAll("    // Bounds check: if (global_id >= 1024) return\n");
-        try writer.writeAll("    %cond = arith.cmpi ult, %global_id, %c1024 : index\n");
+
+        // Generate bounds check
+        if (param_info.len > 0) {
+            try writer.print("    // Bounds check: if (global_id >= {d}) return\n", .{param_info[0].dimension});
+            try writer.print("    %cond = arith.cmpi ult, %global_id, %c{d} : index\n", .{param_info[0].dimension});
+        }
         try writer.writeAll("    scf.if %cond {\n");
-        try writer.writeAll("      // Load values: val1 = a[i], val2 = b[i]\n");
-        try writer.writeAll("      %val1 = memref.load %arg0[%global_id] : memref<1024xf32>\n");
-        try writer.writeAll("      %val2 = memref.load %arg1[%global_id] : memref<1024xf32>\n");
-        try writer.writeAll("      \n");
-        try writer.writeAll("      // Perform addition: result = a[i] + b[i]\n");
-        try writer.writeAll("      %sum = arith.addf %val1, %val2 : f32\n");
-        try writer.writeAll("      \n");
-        try writer.writeAll("      // Store result back to a[i] (in-place)\n");
-        try writer.writeAll("      memref.store %sum, %arg0[%global_id] : memref<1024xf32>\n");
+
+        // Generate the actual operation based on function body analysis
+        try self.generateOperationMLIR(writer, param_info, operation_info);
+
         try writer.writeAll("    }\n");
         try writer.writeAll("    gpu.return\n");
         try writer.writeAll("  }\n");
@@ -126,14 +144,158 @@ pub const MLIRCodeGen = struct {
             };
             std.debug.print("📄 Generated MLIR saved to generated_mlir.mlir\n", .{});
         }
-
-        _ = func; // Function name not used in this simplified version
     }
 
-    /// Lower MLIR module to PTX assembly using the complete pipeline
-    pub fn lowerMLIRToPTX(self: *MLIRCodeGen) MLIRCodeGenError![]const u8 {
+    /// Parameter information for MLIR generation
+    const ParameterInfo = struct {
+        dimension: u32,
+        mlir_type: []const u8,
+        element_type: parser.Type,
+    };
+
+    /// Operation information extracted from function body
+    const OperationInfo = struct {
+        operation: parser.BinaryOperator,
+        target_param: usize,
+        source_params: []usize,
+    };
+
+    /// Analyze function parameters to extract dimension and type information
+    fn analyzeParameters(self: *MLIRCodeGen, parameters: []parser.Parameter) ![]ParameterInfo {
+        var param_info = try self.allocator.alloc(ParameterInfo, parameters.len);
+        
+        for (parameters, 0..) |param, i| {
+            switch (param.type) {
+                .tensor => |tensor_type| {
+                    // Extract dimension (assume 1D tensor for now)
+                    const dimension = if (tensor_type.shape.len > 0) tensor_type.shape[0] else 1024;
+                    
+                    // Convert element type to MLIR type
+                    const mlir_type = switch (tensor_type.element_type.*) {
+                        .i32 => "i32",
+                        .i64 => "i64",
+                        .f32 => "f32",
+                        .f64 => "f64",
+                        .u32 => "i32", // MLIR uses signed types
+                        .u64 => "i64", // MLIR uses signed types
+                        else => "f32", // Default fallback
+                    };
+                    
+                    param_info[i] = ParameterInfo{
+                        .dimension = dimension,
+                        .mlir_type = mlir_type,
+                        .element_type = tensor_type.element_type.*,
+                    };
+                },
+                else => {
+                    // Default for non-tensor types
+                    param_info[i] = ParameterInfo{
+                        .dimension = 1024,
+                        .mlir_type = "f32",
+                        .element_type = parser.Type.f32,
+                    };
+                }
+            }
+        }
+        
+        return param_info;
+    }
+
+    /// Analyze function body to determine the operation being performed
+    fn analyzeOperation(self: *MLIRCodeGen, body: []parser.ASTNode) !OperationInfo {
+        // Look for parallel assignment pattern: a[i] = a[i] + b[i]
+        for (body) |stmt| {
+            if (stmt == .parallel_assignment) {
+                const pa = stmt.parallel_assignment;
+                
+                // Check if the value is a binary expression
+                if (pa.value.* == .binary_expression) {
+                    const bin_expr = pa.value.*.binary_expression;
+                    
+                    // Create source params slice
+                    const source_params = try self.allocator.alloc(usize, 2);
+                    source_params[0] = 0;
+                    source_params[1] = 1;
+                    
+                    // For now, assume the first parameter is the target
+                    // and extract the operation type
+                    return OperationInfo{
+                        .operation = bin_expr.operator,
+                        .target_param = 0,
+                        .source_params = source_params,
+                    };
+                }
+            }
+        }
+        
+        // Default to addition if no clear pattern found
+        const default_source_params = try self.allocator.alloc(usize, 2);
+        default_source_params[0] = 0;
+        default_source_params[1] = 1;
+        
+        return OperationInfo{
+            .operation = parser.BinaryOperator.add,
+            .target_param = 0,
+            .source_params = default_source_params,
+        };
+    }
+
+    /// Generate MLIR code for the specific operation
+    fn generateOperationMLIR(self: *MLIRCodeGen, writer: anytype, param_info: []ParameterInfo, operation_info: OperationInfo) !void {
+        _ = self; // Unused parameter for now
+        // Generate load operations for source parameters
+        for (operation_info.source_params, 0..) |param_idx, i| {
+            if (param_idx < param_info.len) {
+                try writer.print("      %val{d} = memref.load %arg{d}[%global_id] : memref<{d}x{s}>\n", 
+                    .{i + 1, param_idx, param_info[param_idx].dimension, param_info[param_idx].mlir_type});
+            }
+        }
+        try writer.writeAll("      \n");
+
+        // Generate the operation based on the binary operator
+        const op_name = switch (operation_info.operation) {
+            .add => if (std.mem.eql(u8, param_info[0].mlir_type, "f32") or std.mem.eql(u8, param_info[0].mlir_type, "f64")) "arith.addf" else "arith.addi",
+            .subtract => if (std.mem.eql(u8, param_info[0].mlir_type, "f32") or std.mem.eql(u8, param_info[0].mlir_type, "f64")) "arith.subf" else "arith.subi",
+            .multiply => if (std.mem.eql(u8, param_info[0].mlir_type, "f32") or std.mem.eql(u8, param_info[0].mlir_type, "f64")) "arith.mulf" else "arith.muli",
+            .divide => if (std.mem.eql(u8, param_info[0].mlir_type, "f32") or std.mem.eql(u8, param_info[0].mlir_type, "f64")) "arith.divf" else "arith.divsi",
+        };
+
+        const op_comment = switch (operation_info.operation) {
+            .add => "addition",
+            .subtract => "subtraction", 
+            .multiply => "multiplication",
+            .divide => "division",
+        };
+
+        try writer.print("      // Perform {s}: result = a[i] {s} b[i]\n", .{op_comment, switch (operation_info.operation) {
+            .add => "+",
+            .subtract => "-", 
+            .multiply => "*",
+            .divide => "/",
+        }});
+
+        // Generate the operation instruction
+        if (operation_info.source_params.len >= 2) {
+            try writer.print("      %result = {s} %val1, %val2 : {s}\n", .{op_name, param_info[0].mlir_type});
+        } else {
+            // Fallback for single operand (shouldn't happen in normal cases)
+            try writer.print("      %result = {s} %val1, %val1 : {s}\n", .{op_name, param_info[0].mlir_type});
+        }
+        try writer.writeAll("      \n");
+
+        // Generate store operation (in-place modification)
+        const target_param = operation_info.target_param;
+        if (target_param < param_info.len) {
+            try writer.writeAll("      // Store result back to a[i] (in-place)\n");
+            try writer.print("      memref.store %result, %arg{d}[%global_id] : memref<{d}x{s}>\n", 
+                .{target_param, param_info[target_param].dimension, param_info[target_param].mlir_type});
+        }
+    }
+
+    /// Lower MLIR to PTX using the integrated pipeline
+    pub fn lowerMLIRToPTX(self: *MLIRCodeGen, function_name: []const u8) ![]const u8 {
         if (self.verbose) {
-            std.debug.print("📝 Running fully integrated pipeline (MLIR passes + MLIR→LLVM IR + LLVM IR→PTX) - no external tools...\n", .{});
+            std.debug.print("🎯 Starting integrated PTX generation pipeline...\n", .{});
         }
 
         const mlir_content = self.generated_mlir.items;
@@ -144,7 +306,7 @@ pub const MLIRCodeGen = struct {
 
         // Step 2: Extract kernel function for standalone compilation
         if (self.verbose) std.debug.print("🔧 Extracting kernel function...\n", .{});
-        const standalone_kernel = try self.extractKernelFunction(transformed_mlir);
+        const standalone_kernel = try self.extractKernelFunction(transformed_mlir, function_name);
         defer self.allocator.free(standalone_kernel);
 
         // Step 3: Fix NVVM operations for mlir-translate
@@ -318,10 +480,14 @@ pub const MLIRCodeGen = struct {
     }
 
     /// Extract kernel function for standalone compilation
-    fn extractKernelFunction(self: *MLIRCodeGen, input_content: []const u8) ![]const u8 {
+    fn extractKernelFunction(self: *MLIRCodeGen, input_content: []const u8, function_name: []const u8) ![]const u8 {
+        // Create the kernel function name to search for (without _kernel suffix)
+        const kernel_name = try std.fmt.allocPrint(self.allocator, "llvm.func @{s}", .{function_name});
+        defer self.allocator.free(kernel_name);
+
         // Find the kernel function and extract it
-        const kernel_start = std.mem.indexOf(u8, input_content, "llvm.func @gpu_add_kernel") orelse {
-            std.debug.print("Error: Could not find kernel function\n", .{});
+        const kernel_start = std.mem.indexOf(u8, input_content, kernel_name) orelse {
+            std.debug.print("Error: Could not find kernel function '{s}'\n", .{kernel_name});
             return MLIRCodeGenError.PipelineError;
         };
 
@@ -603,7 +769,7 @@ test "MLIRCodeGen - generate GPU function" {
 
     // Should generate without crashing
     try mlir_codegen.generateGpuFunction(func_decl);
-    
+
     // Check that some MLIR was generated
     try std.testing.expect(mlir_codegen.generated_mlir.items.len > 0);
 }

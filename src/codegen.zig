@@ -656,7 +656,9 @@ pub const CodeGen = struct {
             break :blk normalized_triple;
         };
 
-        std.debug.print("Target triple: {s}\n", .{final_triple});
+        if (self.verbose) {
+            std.debug.print("Target triple: {s}\n", .{final_triple});
+        }
 
         const triple_z = try self.allocator.dupeZ(u8, final_triple);
         defer self.allocator.free(triple_z);
@@ -695,7 +697,9 @@ pub const CodeGen = struct {
             return error.CodeGenError;
         }
 
-        std.debug.print("Generated object file: {s}\n", .{obj_path});
+        if (self.verbose) {
+            std.debug.print("Generated object file: {s}\n", .{obj_path});
+        }
 
         // Link object file into executable
         try self.linkExecutable(obj_path, output_path, final_triple);
@@ -756,7 +760,9 @@ pub const CodeGen = struct {
         try args.append(try self.allocator.dupeZ(u8, obj_path));
 
         // Call lld_main with all arguments
-        std.debug.print("Arguments {s}", .{args.items});
+        if (self.verbose) {
+            std.debug.print("Arguments {s}", .{args.items});
+        }
         const result = lld_main(args.items.ptr, @intCast(args.items.len));
 
         if (result != 0) {
@@ -764,7 +770,9 @@ pub const CodeGen = struct {
             return error.LinkingFailed;
         }
 
-        std.debug.print("Generated executable: {s}\n", .{output_path});
+        if (self.verbose) {
+            std.debug.print("Generated executable: {s}\n", .{output_path});
+        }
     }
 
     pub fn generateSharedLibrary(self: *CodeGen, output_path: []const u8, target_triple: ?[]const u8) CodeGenError!void {
@@ -789,7 +797,9 @@ pub const CodeGen = struct {
             break :blk normalized_triple;
         };
 
-        std.debug.print("Target triple: {s}\n", .{final_triple});
+        if (self.verbose) {
+            std.debug.print("Target triple: {s}\n", .{final_triple});
+        }
 
         const triple_z = try self.allocator.dupeZ(u8, final_triple);
         defer self.allocator.free(triple_z);
@@ -822,7 +832,9 @@ pub const CodeGen = struct {
             return error.CodeGenError;
         }
 
-        std.debug.print("Generated object file: {s}\n", .{obj_path});
+        if (self.verbose) {
+            std.debug.print("Generated object file: {s}\n", .{obj_path});
+        }
 
         // Determine the appropriate shared library extension
         const is_darwin = std.mem.indexOf(u8, final_triple, "darwin") != null;
@@ -899,7 +911,9 @@ pub const CodeGen = struct {
             return error.LinkingFailed;
         }
 
-        std.debug.print("Generated shared library: {s}\n", .{output_path});
+        if (self.verbose) {
+            std.debug.print("Generated shared library: {s}\n", .{output_path});
+        }
     }
 
     // Executable format creation functions
@@ -1207,9 +1221,11 @@ pub const CodeGen = struct {
     }
 
     pub fn printIR(self: *CodeGen) void {
-        const ir_string = LLVM.LLVMPrintModuleToString(self.module);
-        defer LLVM.LLVMDisposeMessage(ir_string);
-        std.debug.print("Generated LLVM IR:\n{s}\n", .{ir_string});
+        if (self.verbose) {
+            const ir_string = LLVM.LLVMPrintModuleToString(self.module);
+            defer LLVM.LLVMDisposeMessage(ir_string);
+            std.debug.print("Generated LLVM IR:\n{s}\n", .{ir_string});
+        }
     }
 
     fn generateStartFunction(self: *CodeGen) CodeGenError!void {

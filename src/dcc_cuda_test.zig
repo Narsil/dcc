@@ -128,7 +128,7 @@ pub fn main() !void {
     // Get kernel function
     std.debug.print("Getting gpu_add_kernel kernel function...\n", .{});
     var kernel_func: cuda.CUfunction = undefined;
-    try checkCudaError(cuda.cuModuleGetFunction(&kernel_func, module, "gpu_add_kernel"), "cuModuleGetFunction");
+    try checkCudaError(cuda.cuModuleGetFunction(&kernel_func, module, "gpu_vector_mul"), "cuModuleGetFunction");
 
     // Set up test data
     const array_size: u32 = 1024;

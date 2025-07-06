@@ -18,8 +18,7 @@
 )
 {
 	.reg .pred 	%p<2>;
-	.reg .b32 	%r<4>;
-	.reg .f32 	%f<4>;
+	.reg .b32 	%r<7>;
 	.reg .b64 	%rd<9>;
 
 	mov.u32 	%r1, %ctaid.x;
@@ -35,10 +34,10 @@
 	shl.b64 	%rd8, %rd7, 2;
 	add.s64 	%rd1, %rd3, %rd8;
 	add.s64 	%rd2, %rd4, %rd8;
-	ld.f32 	%f1, [%rd1];
-	ld.f32 	%f2, [%rd2];
-	mul.rn.f32 	%f3, %f1, %f2;
-	st.f32 	[%rd1], %f3;
+	ld.u32 	%r4, [%rd1];
+	ld.u32 	%r5, [%rd2];
+	mul.lo.s32 	%r6, %r4, %r5;
+	st.u32 	[%rd1], %r6;
 $L__BB0_2:
 	ret;
 

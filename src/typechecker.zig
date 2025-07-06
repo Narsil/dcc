@@ -28,15 +28,17 @@ pub const FunctionSignature = struct {
 pub const TypeChecker = struct {
     allocator: std.mem.Allocator,
     source: []const u8,
+    verbose: bool,
     variables: std.HashMap([]const u8, parser.Type, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
     functions: std.HashMap([]const u8, FunctionSignature, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
     current_function_return_type: ?parser.Type,
     allocated_types: std.ArrayList(parser.Type),
 
-    pub fn init(allocator: std.mem.Allocator, source: []const u8) TypeChecker {
+    pub fn init(allocator: std.mem.Allocator, source: []const u8, verbose: bool) TypeChecker {
         return TypeChecker{
             .allocator = allocator,
             .source = source,
+            .verbose = verbose,
             .variables = std.HashMap([]const u8, parser.Type, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .functions = std.HashMap([]const u8, FunctionSignature, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .current_function_return_type = null,
@@ -66,20 +68,26 @@ pub const TypeChecker = struct {
     }
 
     pub fn typeCheck(self: *TypeChecker, ast: parser.ASTNode) TypeCheckError!void {
-        std.debug.print("DEBUG: Entering typeCheck\n", .{});
+        if (self.verbose) {
+            std.debug.print("DEBUG: Entering typeCheck\n", .{});
+        }
         switch (ast) {
             .program => |prog| {
                 // First pass: collect function signatures
                 for (prog.statements) |stmt| {
                     if (stmt == .function_declaration) {
-                        std.debug.print("DEBUG: Collecting signature for function '{s}'\n", .{stmt.function_declaration.name});
+                        if (self.verbose) {
+                            std.debug.print("DEBUG: Collecting signature for function '{s}'\n", .{stmt.function_declaration.name});
+                        }
                         try self.collectFunctionSignature(stmt.function_declaration);
                     }
                 }
 
                 // Second pass: type check all statements
                 for (prog.statements) |stmt| {
-                    std.debug.print("DEBUG: Type checking statement of type {}\n", .{stmt});
+                    if (self.verbose) {
+                        std.debug.print("DEBUG: Type checking statement of type {}\n", .{stmt});
+                    }
                     try self.typeCheckStatement(stmt);
                 }
             },
@@ -93,7 +101,9 @@ pub const TypeChecker = struct {
             .params = func.parameters,
             .return_type = func.return_type,
         });
-        std.debug.print("DEBUG: Collected function signature '{s}' -> return type {}\n", .{ func.name, func.return_type });
+        if (self.verbose) {
+            std.debug.print("DEBUG: Collected function signature '{s}' -> return type {}\n", .{ func.name, func.return_type });
+        }
     }
 
     fn typeCheckStatement(self: *TypeChecker, stmt: parser.ASTNode) TypeCheckError!void {
@@ -126,7 +136,9 @@ pub const TypeChecker = struct {
         self.variables = std.HashMap([]const u8, parser.Type, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(self.allocator);
         self.current_function_return_type = func.return_type;
 
-        std.debug.print("DEBUG: Entering function '{s}' with return type {}\n", .{ func.name, func.return_type });
+        if (self.verbose) {
+            std.debug.print("DEBUG: Entering function '{s}' with return type {}\n", .{ func.name, func.return_type });
+        }
 
         // Add parameters to scope
         for (func.parameters) |param| {
@@ -172,18 +184,21 @@ pub const TypeChecker = struct {
         self.variables = old_variables;
         self.current_function_return_type = old_return_type;
 
-        std.debug.print("DEBUG: Exiting function '{s}'\n", .{func.name});
+        if (self.verbose) {
+            std.debug.print("DEBUG: Exiting function '{s}'\n", .{func.name});
+        }
     }
 
     fn typeCheckVariableDeclaration(self: *TypeChecker, var_decl: @TypeOf(@as(parser.ASTNode, undefined).variable_declaration)) TypeCheckError!void {
         const declared_type = var_decl.type;
         const value_type = try self.typeCheckExpression(var_decl.value);
-        std.debug.print("DEBUG: typeCheckNode - variable_declaration: declared_type={}, value_type={} (tag: {s})\n", .{ declared_type, value_type, @tagName(value_type) });
-        if (declared_type == .tensor and value_type == .tensor) {
-            std.debug.print("DEBUG: declared_type.element_type ptr: {any}, value: {}\n", .{ declared_type.tensor.element_type, declared_type.tensor.element_type.* });
-            std.debug.print("DEBUG: value_type.element_type ptr: {any}, value: {}\n", .{ value_type.tensor.element_type, value_type.tensor.element_type.* });
+        if (self.verbose) {
+            std.debug.print("DEBUG: typeCheckNode - variable_declaration: declared_type={}, value_type={} (tag: {s})\n", .{ declared_type, value_type, @tagName(value_type) });
+            if (declared_type == .tensor and value_type == .tensor) {
+                std.debug.print("DEBUG: declared_type.element_type ptr: {any}, value: {}\n", .{ declared_type.tensor.element_type, declared_type.tensor.element_type.* });
+                std.debug.print("DEBUG: value_type.element_type ptr: {any}, value: {}\n", .{ value_type.tensor.element_type, value_type.tensor.element_type.* });
+            }
         }
-        std.debug.print("Somethingsomething\n", .{});
         if (!self.typesCompatible(declared_type, value_type)) {
             const pos = self.getNodePosition(var_decl.value.*);
             std.debug.print("Error at line {}, column {}: Cannot assign value of type {} to variable of type {}\n", .{ pos.line, pos.column, value_type, declared_type });
@@ -205,7 +220,9 @@ pub const TypeChecker = struct {
             return error.InvalidReturnType;
         };
 
-        std.debug.print("DEBUG: Return statement - expected type: {}\n", .{expected_type});
+        if (self.verbose) {
+            std.debug.print("DEBUG: Return statement - expected type: {}\n", .{expected_type});
+        }
 
         if (ret.value) |value| {
             // Return statement has a value
@@ -218,7 +235,9 @@ pub const TypeChecker = struct {
             }
             
             const actual_type = try self.typeCheckExpression(value);
-            std.debug.print("DEBUG: Return statement - actual type: {}\n", .{actual_type});
+            if (self.verbose) {
+                std.debug.print("DEBUG: Return statement - actual type: {}\n", .{actual_type});
+            }
 
             if (!self.typesCompatible(expected_type, actual_type)) {
                 const pos = self.getNodePosition(value.*);
@@ -258,7 +277,9 @@ pub const TypeChecker = struct {
             },
             else => return error.InvalidExpression,
         };
-        std.debug.print("DEBUG: typeCheckExpression - node tag: {any}, result_type: {}\n", .{ @tagName(node.*), result_type });
+        if (self.verbose) {
+            std.debug.print("DEBUG: typeCheckExpression - node tag: {any}, result_type: {}\n", .{ @tagName(node.*), result_type });
+        }
         return result_type;
     }
 
@@ -398,7 +419,9 @@ pub const TypeChecker = struct {
         // Check that the value type matches the tensor element type
         const value_type = try self.typeCheckExpression(tensor_lit.value);
 
-        std.debug.print("DEBUG: typeCheckTensorLiteral - shape={any}, element_type={}, value_type={}\n", .{ tensor_lit.shape, tensor_lit.element_type, value_type });
+        if (self.verbose) {
+            std.debug.print("DEBUG: typeCheckTensorLiteral - shape={any}, element_type={}, value_type={}\n", .{ tensor_lit.shape, tensor_lit.element_type, value_type });
+        }
         if (!self.typesCompatible(tensor_lit.element_type, value_type)) {
             const pos = self.getNodePosition(tensor_lit.value.*);
             std.debug.print("Error at line {}, column {}: Tensor literal value type {} does not match element type {}\n", .{ pos.line, pos.column, value_type, tensor_lit.element_type });
@@ -418,7 +441,9 @@ pub const TypeChecker = struct {
         // Track the allocated type for cleanup
         try self.allocated_types.append(result);
 
-        std.debug.print("DEBUG: typeCheckTensorLiteral - created tensor type: {}\n", .{result});
+        if (self.verbose) {
+            std.debug.print("DEBUG: typeCheckTensorLiteral - created tensor type: {}\n", .{result});
+        }
 
         return result;
     }
