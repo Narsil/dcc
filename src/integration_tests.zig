@@ -85,7 +85,8 @@ fn assertGpuCompileFailure(
 
     // Check that the error message contains the expected GPU error text
     if (!std.mem.containsAtLeast(u8, out.stderr, 1, "Cannot compile GPU function") or
-        !std.mem.containsAtLeast(u8, out.stderr, 1, "without --gpu flag")) {
+        !std.mem.containsAtLeast(u8, out.stderr, 1, "without --gpu flag"))
+    {
         std.debug.print("Expected GPU error message not found in stderr:\n{s}\n", .{out.stderr});
         return error.MissingGpuError;
     }
@@ -501,6 +502,28 @@ test "type system - tensor simple" {
 
     std.debug.print("Tensor basic test passed\n", .{});
 }
+test "type system - tensor float" {
+    const allocator = std.testing.allocator;
+
+    // Test tensor operations: vector initialization, element-wise addition, and indexing
+    const test_source =
+        \\ fn main() f32 {
+        \\     // Create a vector of 5 elements initialized to zero
+        \\     let vector: [5]f32 = [5]f32{2f32};
+        \\     
+        \\     // Add 1 to all elements (implicit parallelization)
+        \\     vector[i] = vector[i] + 1f32;
+        \\     
+        \\     // Return the first element (should be 1)
+        \\     return vector[0];
+        \\ }
+    ;
+
+    try assertCompiles(allocator, test_source, "test_tensor.toy");
+    try assertReturns(allocator, 3);
+
+    std.debug.print("Tensor float test passed\n", .{});
+}
 
 test "tensor - out of bounds index" {
     const allocator = std.testing.allocator;
@@ -622,7 +645,8 @@ test "gpu vector addition compilation without --gpu flag" {
             }
             // Check that the error message contains the expected text
             if (!std.mem.containsAtLeast(u8, out.stderr, 1, "Cannot compile GPU function") or
-                !std.mem.containsAtLeast(u8, out.stderr, 1, "without --gpu flag")) {
+                !std.mem.containsAtLeast(u8, out.stderr, 1, "without --gpu flag"))
+            {
                 std.debug.print("Expected error message about missing --gpu flag\n", .{});
                 std.debug.print("stderr: {s}\n", .{out.stderr});
                 return error.TestFailed;
@@ -657,13 +681,13 @@ test "gpu function compilation failure without --gpu flag" {
 
 test "gpu function compilation with valid triplet" {
     const allocator = std.testing.allocator;
-    
+
     // Skip this test on non-Linux systems since GPU targets only work on Linux (for now)
     if (builtin.target.os.tag != .linux) {
         std.debug.print("GPU compilation test skipped on {s} (GPU targets only supported on Linux)\n", .{@tagName(builtin.target.os.tag)});
         return;
     }
-    
+
     const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
 
     const gpu_source =
@@ -748,7 +772,8 @@ test "gpu function compilation with invalid triplet" {
             }
             // Check that the error message contains the expected text
             if (!std.mem.containsAtLeast(u8, out.stderr, 1, "Invalid GPU triplet") or
-                !std.mem.containsAtLeast(u8, out.stderr, 1, "Expected format: nvidia-ptx-smXX")) {
+                !std.mem.containsAtLeast(u8, out.stderr, 1, "Expected format: nvidia-ptx-smXX"))
+            {
                 std.debug.print("Expected error message about invalid GPU triplet format\n", .{});
                 std.debug.print("stderr: {s}\n", .{out.stderr});
                 return error.TestFailed;
