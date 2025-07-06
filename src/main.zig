@@ -231,6 +231,10 @@ pub fn main() !void {
                 std.debug.print("Error: Invalid GPU triplet format\n", .{});
                 std.process.exit(1);
             },
+            codegen.CodeGenError.CudaFunctionNotFound => {
+                std.debug.print("Error: CUDA function not found in module\n", .{});
+                std.process.exit(1);
+            },
             // Type checker errors (normal compilation errors)
             typechecker.TypeCheckError.TypeMismatch => {
                 // Type checker already prints the error message, just exit

@@ -1,6 +1,45 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+// Copy CUDA stub files from environment to src directory during build
+fn copyCudaStubFiles(b: *std.Build) void {
+    const cuda_include_dir = std.process.getEnvVarOwned(b.allocator, "CUDA_INCLUDE_DIR") catch {
+        std.debug.print("🔧 CUDA_INCLUDE_DIR not found, skipping CUDA stub file copying\n", .{});
+        return;
+    };
+    defer b.allocator.free(cuda_include_dir);
+    
+    const cuda_lib_dir = std.process.getEnvVarOwned(b.allocator, "CUDA_LIB_DIR") catch {
+        std.debug.print("🔧 CUDA_LIB_DIR not found, skipping CUDA stub file copying\n", .{});
+        return;
+    };
+    defer b.allocator.free(cuda_lib_dir);
+    
+    // Create destination directories
+    std.fs.cwd().makePath("src/cuda_stub/include") catch {};
+    std.fs.cwd().makePath("src/cuda_stub/lib") catch {};
+    
+    // Copy CUDA header
+    const src_header = std.fmt.allocPrint(b.allocator, "{s}/cuda.h", .{cuda_include_dir}) catch return;
+    defer b.allocator.free(src_header);
+    
+    std.fs.cwd().copyFile(src_header, std.fs.cwd(), "src/cuda_stub/include/cuda.h", .{}) catch |err| {
+        std.debug.print("⚠️  Failed to copy CUDA header: {}\n", .{err});
+        return;
+    };
+    
+    // Copy CUDA stub library
+    const src_lib = std.fmt.allocPrint(b.allocator, "{s}/stubs/libcuda.so", .{cuda_lib_dir}) catch return;
+    defer b.allocator.free(src_lib);
+    
+    std.fs.cwd().copyFile(src_lib, std.fs.cwd(), "src/cuda_stub/lib/libcuda.so", .{}) catch |err| {
+        std.debug.print("⚠️  Failed to copy CUDA stub library: {}\n", .{err});
+        return;
+    };
+    
+    std.debug.print("✅ CUDA stub files copied to src/cuda_stub/ during build\n", .{});
+}
+
 // Add this function to your build.zig file
 fn buildLldWrapper(b: *std.Build, llvm_include_dir: []u8, lld_include_dir: []u8, lld_lib_dir: []u8) *std.Build.Step {
     const command_args = [_][]const u8{
@@ -167,6 +206,9 @@ fn createLinking(b: *std.Build, exe: *std.Build.Step.Compile, llvm_include_dir: 
 // declaratively construct a build graph that will be executed by an external
 // runner.
 pub fn build(b: *std.Build) !void {
+    // Copy CUDA stub files at build time
+    copyCudaStubFiles(b);
+    
     // Standard target options allows the person running `zig build` to choose
     // what target to build for. Here we do not override the defaults, which
     // means any target is allowed, and the default is native. Other options
@@ -224,6 +266,24 @@ pub fn build(b: *std.Build) !void {
 
     try createLinking(b, exe, llvm_include_dir, llvm_lib_dir, lld_include_dir, lld_lib_dir, true);
 
+    // Add our custom GPU to NVVM wrapper to main dcc build
+    const mlir_include_dir_main = std.process.getEnvVarOwned(b.allocator, "MLIR_INCLUDE_DIR") catch null;
+    const mlir_lib_dir_main = std.process.getEnvVarOwned(b.allocator, "MLIR_LIB_DIR") catch null;
+    
+    if (mlir_include_dir_main != null and mlir_lib_dir_main != null) {
+        defer b.allocator.free(mlir_include_dir_main.?);
+        defer b.allocator.free(mlir_lib_dir_main.?);
+        
+        // Add our GPU to NVVM wrapper for main dcc
+        exe.addCSourceFile(.{
+            .file = b.path("src/gpu_to_nvvm_wrapper.cpp"),
+            .flags = &.{"-std=c++17"},
+        });
+        
+        // Add include path for our wrapper header
+        exe.addIncludePath(.{ .cwd_relative = "src" });
+    }
+
     // Add C++ wrapper for lld
 
     // Keep dynamic linkage for system libraries (required on macOS)
@@ -270,6 +330,24 @@ pub fn build(b: *std.Build) !void {
 
     // Install emit_ptx executable
     b.installArtifact(emit_ptx_exe);
+
+    // Create CUDA LLVM IR test executable
+    const cuda_llvm_ir_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/cuda_llvm_ir_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const cuda_llvm_ir_test_exe = b.addExecutable(.{
+        .name = "cuda_llvm_ir_test",
+        .root_module = cuda_llvm_ir_test_mod,
+    });
+
+    // Link cuda_llvm_ir_test with the same libraries as main dcc
+    try createLinking(b, cuda_llvm_ir_test_exe, llvm_include_dir, llvm_lib_dir, lld_include_dir, lld_lib_dir, false);
+
+    // Install cuda_llvm_ir_test executable
+    b.installArtifact(cuda_llvm_ir_test_exe);
 
     // Create CUDA test executable (cross-compile to x86_64-linux)
     const linux_target = b.resolveTargetQuery(.{
@@ -327,6 +405,17 @@ pub fn build(b: *std.Build) !void {
 
     const run_emit_ptx_step = b.step("emit-ptx", "Run the emit_ptx tool");
     run_emit_ptx_step.dependOn(&run_emit_ptx_cmd.step);
+
+    // Create run step for CUDA LLVM IR test
+    const run_cuda_llvm_ir_test_cmd = b.addRunArtifact(cuda_llvm_ir_test_exe);
+    run_cuda_llvm_ir_test_cmd.step.dependOn(b.getInstallStep());
+
+    if (b.args) |args| {
+        run_cuda_llvm_ir_test_cmd.addArgs(args);
+    }
+
+    const run_cuda_llvm_ir_test_step = b.step("cuda-llvm-ir-test", "Run the CUDA LLVM IR generator test");
+    run_cuda_llvm_ir_test_step.dependOn(&run_cuda_llvm_ir_test_cmd.step);
 
     // Create run step for CUDA test
     const run_cuda_test_cmd = b.addRunArtifact(cuda_test_exe);

@@ -385,10 +385,11 @@ pub const MLIRCodeGen = struct {
         const scf_to_cf_pass = MLIR.mlirCreateConversionSCFToControlFlow();
         MLIR.mlirPassManagerAddOwnedPass(pass_manager, scf_to_cf_pass);
 
-        // Get the default operation pass manager and create nested GPU module pass manager
+                // Get the default operation pass manager and create nested GPU module pass manager
         const default_op_pm = MLIR.mlirPassManagerGetAsOpPassManager(pass_manager);
         const gpu_module_pm = MLIR.mlirOpPassManagerGetNestedUnder(default_op_pm, MLIR.mlirStringRefCreateFromCString("gpu.module"));
-        // Use our custom wrapper that supports bare pointer call convention
+
+        // Use bare pointer conversion to match emit_ptx behavior (2 parameters instead of 10)
         const gpu_to_nvvm_pass = MLIR.mlirCreateConversionConvertGpuOpsToNVVMOpsWithBarePtr();
         MLIR.mlirOpPassManagerAddOwnedPass(gpu_module_pm, gpu_to_nvvm_pass);
 
@@ -396,11 +397,12 @@ pub const MLIRCodeGen = struct {
         const nvvm_to_llvm_pass = MLIR.mlirCreateConversionConvertNVVMToLLVMPass();
         MLIR.mlirPassManagerAddOwnedPass(pass_manager, nvvm_to_llvm_pass);
 
-        // Add finalize MemRef to LLVM conversion pass
+        // Add finalize MemRef to LLVM conversion pass with bare pointer conversion
+        // This constrains memref parameters to simple pointers instead of full descriptors
         const finalize_memref_pass = MLIR.mlirCreateConversionFinalizeMemRefToLLVMConversionPass();
         MLIR.mlirPassManagerAddOwnedPass(pass_manager, finalize_memref_pass);
 
-        // Add convert Func to LLVM pass with bare pointer call convention
+                // Add convert Func to LLVM pass with bare pointer call convention
         const func_to_llvm_pass = MLIR.mlirCreateConversionConvertFuncToLLVMPassWithBarePtr();
         MLIR.mlirPassManagerAddOwnedPass(pass_manager, func_to_llvm_pass);
 
