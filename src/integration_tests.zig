@@ -17,7 +17,7 @@ test "type system - different integer types" {
         \\}
     ;
     try assertCompiles(allocator, test_source, "test_integers.toy");
-    try assertReturns(allocator, 42);
+    try assertReturns(allocator, "test_integers.toy", 42);
 
     std.debug.print("Integer types test passed\n", .{});
 }
@@ -35,7 +35,7 @@ test "type system - floating point types" {
     ;
 
     try assertCompiles(allocator, test_source, "test_floats.toy");
-    try assertReturns(allocator, 42);
+    try assertReturns(allocator, "test_floats.toy", 42);
 
     std.debug.print("Float types test passed\n", .{});
 }
@@ -66,7 +66,7 @@ test "type system - function with typed parameters" {
     ;
 
     try assertCompiles(allocator, test_source, "test_functions.toy");
-    try assertReturns(allocator, 42);
+    try assertReturns(allocator, "test_functions.toy", 42);
 
     std.debug.print("Function types test passed\n", .{});
 }
@@ -260,7 +260,7 @@ test "type system - tensor simple" {
     ;
 
     try assertCompiles(allocator, test_source, "test_tensor.toy");
-    try assertReturns(allocator, 1);
+    try assertReturns(allocator, "test_tensor.toy", 1);
 
     std.debug.print("Tensor basic test passed\n", .{});
 }
@@ -561,7 +561,7 @@ test "void functions - basic void function" {
     ;
 
     try assertCompiles(allocator, test_source, "test_void_basic.toy");
-    try assertReturns(allocator, 0);
+    try assertReturns(allocator, "test_void_basic.toy", 0);
 
     std.debug.print("Basic void function test passed\n", .{});
 }
@@ -595,7 +595,7 @@ test "void functions - void function with variables" {
     ;
 
     try assertCompiles(allocator, test_source, "test_void_variables.toy");
-    try assertReturns(allocator, 0);
+    try assertReturns(allocator, "test_void_variables.toy", 0);
 
     std.debug.print("Void function with variables test passed\n", .{});
 }
@@ -625,7 +625,7 @@ test "void functions - void functions calling void functions" {
     ;
 
     try assertCompiles(allocator, test_source, "test_void_comprehensive.toy");
-    try assertReturns(allocator, 0);
+    try assertReturns(allocator, "test_void_comprehensive.toy", 0);
 
     std.debug.print("Comprehensive void function test passed\n", .{});
 }
@@ -690,7 +690,7 @@ test "vector operations - add then multiply" {
     ;
 
     try assertCompiles(allocator, test_source, "test_vector_ops.toy");
-    try assertReturns(allocator, 15);
+    try assertReturns(allocator, "test_vector_ops.toy", 15);
 
     std.debug.print("vector operations test passed - program correctly returns 15\n", .{});
 }
@@ -742,7 +742,7 @@ test "compile example.toy and verify exit code" {
     }
 
     // Test that the compiled binary produces exit code 16
-    try assertReturns(allocator, 16);
+    try assertReturns(allocator, "examples/example.toy", 16);
 }
 
 test "compile library.toy and verify it works" {
@@ -801,8 +801,18 @@ fn assertCompiles(allocator: std.mem.Allocator, source: []const u8, filename: []
     }
 }
 
-fn assertReturns(allocator: std.mem.Allocator, expected: usize) !void {
-    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{"./output"} });
+fn assertReturns(allocator: std.mem.Allocator, filename: []const u8, expected: usize) !void {
+    // Extract output name from source file (remove .toy extension)
+    const basename = std.fs.path.basename(filename);
+    const output_name = if (std.mem.endsWith(u8, basename, ".toy")) 
+        basename[0..basename.len - 4] 
+    else 
+        basename;
+    
+    const binary_path = try std.fmt.allocPrint(allocator, "./{s}", .{output_name});
+    defer allocator.free(binary_path);
+    
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{binary_path} });
     switch (out.term) {
         .Exited => |term| {
             if (term != expected) {
@@ -811,7 +821,7 @@ fn assertReturns(allocator: std.mem.Allocator, expected: usize) !void {
                 std.debug.print("stderr: {s}\n", .{out.stderr});
                 return error.UnexpectedExitCode;
             } else {
-                std.debug.print("Compiled test_tensor.toy produced correct exit code: {}\n", .{out.term.Exited});
+                std.debug.print("Compiled {s} produced correct exit code: {}\n", .{filename, out.term.Exited});
             }
         },
         else => {

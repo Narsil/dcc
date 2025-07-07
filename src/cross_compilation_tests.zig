@@ -10,7 +10,7 @@ const Target = struct {
 const targets = [_]Target{
     Target{
         .target = "x86_64-unknown-linux-gnu",
-        .remote = "home",
+        .remote = "home:",
     },
     // Target{
     //     .target = "arm64-apple-darwin",
@@ -109,8 +109,24 @@ fn assertCrossCompiles(allocator: std.mem.Allocator, source: []const u8, filenam
                 },
             }
         }
+
+        // Extract output name from source file (remove .toy extension)
+        const basename = std.fs.path.basename(filename);
+        const output_name = if (std.mem.endsWith(u8, basename, ".toy"))
+            basename[0 .. basename.len - 4]
+        else
+            basename;
+
+        const local_binary_path = try std.fmt.allocPrint(allocator, "./{s}", .{output_name});
+        defer allocator.free(local_binary_path);
+
+        const remote_binary_path = try std.fmt.allocPrint(allocator, "./{s}", .{output_name});
+        defer allocator.free(remote_binary_path);
+
         {
-            const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ "scp", "./output", target.remote } });
+            const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ "scp", local_binary_path, target.remote } });
+            defer allocator.free(out.stdout);
+            defer allocator.free(out.stderr);
             switch (out.term) {
                 .Exited => |term| {
                     if (term != 0) {
@@ -125,7 +141,9 @@ fn assertCrossCompiles(allocator: std.mem.Allocator, source: []const u8, filenam
                 },
             }
         }
-        const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ "ssh", target.remote, "./output" } });
+        const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ "ssh", target.remote, remote_binary_path } });
+        defer allocator.free(out.stdout);
+        defer allocator.free(out.stderr);
         switch (out.term) {
             .Exited => |term| {
                 if (term != expected) {
@@ -174,8 +192,22 @@ fn assertGpuCrossCompiles(allocator: std.mem.Allocator, source: []const u8, file
                 },
             }
         }
+
+        // Extract output name from source file (remove .toy extension)
+        const basename = std.fs.path.basename(filename);
+        const output_name = if (std.mem.endsWith(u8, basename, ".toy"))
+            basename[0 .. basename.len - 4]
+        else
+            basename;
+
+        const local_binary_path = try std.fmt.allocPrint(allocator, "./{s}", .{output_name});
+        defer allocator.free(local_binary_path);
+
+        const remote_binary_path = try std.fmt.allocPrint(allocator, "./{s}", .{output_name});
+        defer allocator.free(remote_binary_path);
+
         {
-            const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ "scp", "./output", target.remote } });
+            const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ "scp", local_binary_path, target.remote } });
             switch (out.term) {
                 .Exited => |term| {
                     if (term != 0) {
@@ -190,7 +222,7 @@ fn assertGpuCrossCompiles(allocator: std.mem.Allocator, source: []const u8, file
                 },
             }
         }
-        const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ "ssh", target.remote, "./output" } });
+        const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ "ssh", target.remote, remote_binary_path } });
         switch (out.term) {
             .Exited => |term| {
                 if (term != expected) {

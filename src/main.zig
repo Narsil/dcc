@@ -338,17 +338,22 @@ fn compile(allocator: std.mem.Allocator, source_file: []const u8, target_triple:
     var code_gen = try codegen.CodeGen.init(allocator, "toy_program", verbose, gpu_triplet);
     defer code_gen.deinit();
 
+    // Extract output name from source file (remove .toy extension)
+    const basename = std.fs.path.basename(source_file);
+    const output_name = if (std.mem.endsWith(u8, basename, ".toy")) 
+        basename[0..basename.len - 4] 
+    else 
+        basename;
+
     // Choose compilation mode based on presence of main function
     if (has_main) {
         try code_gen.generateWithMode(ast, .executable);
         // Generate executable binary
-        const bin_file = "output";
-        try code_gen.generateExecutable(bin_file, target_triple);
+        try code_gen.generateExecutable(output_name, target_triple);
     } else {
         try code_gen.generateWithMode(ast, .library);
         // Generate shared library
-        const lib_file = "output";
-        try code_gen.generateSharedLibrary(lib_file, target_triple);
+        try code_gen.generateSharedLibrary(output_name, target_triple);
     }
 
     if (verbose) {
