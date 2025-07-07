@@ -775,8 +775,8 @@ pub const CodeGen = struct {
             const default_triple = LLVM.LLVMGetDefaultTargetTriple();
             const triple_str = std.mem.span(default_triple);
             const triple_copy = try self.allocator.dupe(u8, triple_str);
-            std.debug.print("Target triple: {s}\n", .{triple_str});
-            LLVM.LLVMDisposeMessage(default_triple);
+            defer LLVM.LLVMDisposeMessage(default_triple);
+            defer self.allocator.free(triple_copy);
 
             const normalized_triple = if (std.mem.startsWith(u8, triple_copy, "arm64-apple-darwin"))
                 "arm64-apple-darwin"
@@ -787,10 +787,8 @@ pub const CodeGen = struct {
             else
                 triple_copy;
 
-            std.debug.print("Target triple norm: {s}\n", .{normalized_triple});
             break :blk normalized_triple;
         };
-        defer self.allocator.free(final_triple);
 
         if (self.verbose) {
             // Debug print for target triple value, length, and bytes
@@ -1000,6 +998,7 @@ pub const CodeGen = struct {
             const triple_str = std.mem.span(default_triple);
             const triple_copy = try self.allocator.dupe(u8, triple_str);
             defer LLVM.LLVMDisposeMessage(default_triple);
+            defer self.allocator.free(triple_copy);
 
             const normalized_triple = if (std.mem.startsWith(u8, triple_copy, "arm64-apple-darwin"))
                 "arm64-apple-darwin"
@@ -1012,7 +1011,6 @@ pub const CodeGen = struct {
 
             break :blk normalized_triple;
         };
-        defer self.allocator.free(final_triple);
 
         if (self.verbose) {
             std.debug.print("Target triple: {s}\n", .{final_triple});

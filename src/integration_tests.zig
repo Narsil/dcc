@@ -201,9 +201,9 @@ test "compile example.toy and verify exit code" {
     // Get the path to the dcc binary
     const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
 
-    // Test that dcc can compile example.toy
+    // Test that dcc can compile examples/example.toy
     {
-        const run = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, "example.toy" } });
+        const run = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, "examples/example.toy" } });
         defer allocator.free(run.stdout);
         defer allocator.free(run.stderr);
         std.debug.print("dcc compilation successful\n", .{});
@@ -219,25 +219,25 @@ test "compile library.toy and verify it works" {
     // Get the path to the dcc binary
     const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
 
-    // Test that dcc can compile library.toy
-    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, "library.toy" } });
+    // Test that dcc can compile examples/library.toy
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, "examples/library.toy" } });
     defer allocator.free(out.stdout);
     defer allocator.free(out.stderr);
     switch (out.term) {
         .Exited => |code| {
             if (code != 0) {
-                std.debug.print("dcc compilation of library.toy failed with exit code {}\n", .{code});
+                std.debug.print("dcc compilation of examples/library.toy failed with exit code {}\n", .{code});
                 std.debug.print("stdout: {s}\n", .{out.stdout});
                 std.debug.print("stderr: {s}\n", .{out.stderr});
                 return error.CompilationFailed;
             }
         },
         else => {
-            std.debug.print("dcc compilation of library.toy terminated abnormally\n", .{});
+            std.debug.print("dcc compilation of examples/library.toy terminated abnormally\n", .{});
             return error.CompilationFailed;
         },
     }
-    std.debug.print("dcc compilation of library.toy successful\n", .{});
+    std.debug.print("dcc compilation of examples/library.toy successful\n", .{});
 }
 
 test "type system - different integer types" {

@@ -234,7 +234,7 @@ The compiler supports various target triples:
 ./zig-out/bin/dcc hello.toy --target arm64-apple-darwin -o hello_arm64
 
 # Generate shared library for different platform
-./zig-out/bin/dcc library.toy --shared --target x86_64-pc-linux-gnu -o libexample.so
+./zig-out/bin/dcc examples/library.toy --shared --target x86_64-pc-linux-gnu -o libexample.so
 ```
 
 #### Cross-Compilation Use Cases
