@@ -2,244 +2,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const process = std.process;
 
-fn assertCompiles(allocator: std.mem.Allocator, source: []const u8, filename: []const u8) !void {
-    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
-    {
-        const file = try std.fs.cwd().createFile(filename, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(source);
-    }
-    defer std.fs.cwd().deleteFile(filename) catch {};
-
-    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, filename } });
-    defer allocator.free(out.stdout);
-    defer allocator.free(out.stderr);
-
-    switch (out.term) {
-        .Exited => |code| {
-            if (code != 0) {
-                std.debug.print("{s} failed with exit code {}\n", .{ filename, code });
-                std.debug.print("stdout: {s}\n", .{out.stdout});
-                std.debug.print("stderr: {s}\n", .{out.stderr});
-                return error.CompilationFailed;
-            }
-        },
-        else => {
-            std.debug.print("Integer types test terminated abnormally\n", .{});
-            return error.CompilationFailed;
-        },
-    }
-}
-
-fn assertReturns(allocator: std.mem.Allocator, expected: usize) !void {
-    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{"./output"} });
-    switch (out.term) {
-        .Exited => |term| {
-            if (term != expected) {
-                std.debug.print("Expected exit code {}, got {}\n", .{ expected, term });
-                std.debug.print("stdout: {s}\n", .{out.stdout});
-                std.debug.print("stderr: {s}\n", .{out.stderr});
-                return error.UnexpectedExitCode;
-            } else {
-                std.debug.print("Compiled test_tensor.toy produced correct exit code: {}\n", .{out.term.Exited});
-            }
-        },
-        else => {
-            return error.UnexpectedExitCode;
-        },
-    }
-}
-
-// Assert that GPU compilation fails without --gpu flag
-fn assertGpuCompileFailure(
-    allocator: std.mem.Allocator,
-    source: []const u8,
-    filename: []const u8,
-) !void {
-    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
-
-    // Write the temporary source file
-    {
-        const file = try std.fs.cwd().createFile(filename, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(source);
-    }
-    defer std.fs.cwd().deleteFile(filename) catch {};
-
-    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, filename } });
-    defer allocator.free(out.stdout);
-    defer allocator.free(out.stderr);
-
-    // Expect non-zero exit status
-    switch (out.term) {
-        .Exited => |code| {
-            if (code == 0) {
-                std.debug.print("Expected GPU compilation to fail without --gpu flag\n", .{});
-                std.debug.print("stdout: {s}\n", .{out.stdout});
-                std.debug.print("stderr: {s}\n", .{out.stderr});
-                return error.UnexpectedSuccess;
-            }
-        },
-        else => return error.UnexpectedTermination,
-    }
-
-    // Check that the error message contains the expected GPU error text
-    if (!std.mem.containsAtLeast(u8, out.stderr, 1, "Cannot compile GPU function") or
-        !std.mem.containsAtLeast(u8, out.stderr, 1, "without --gpu flag"))
-    {
-        std.debug.print("Expected GPU error message not found in stderr:\n{s}\n", .{out.stderr});
-        return error.MissingGpuError;
-    }
-}
-
-// Assert that compilation fails and stderr contains the expected substring (if provided)
-fn assertCompileFailure(
-    allocator: std.mem.Allocator,
-    source: []const u8,
-    filename: []const u8,
-    expected_substr: []const u8,
-    expected_line: []const u8,
-) !void {
-    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
-
-    // Write the temporary source file
-    {
-        const file = try std.fs.cwd().createFile(filename, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(source);
-    }
-    defer std.fs.cwd().deleteFile(filename) catch {};
-
-    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, filename } });
-    defer allocator.free(out.stdout);
-    defer allocator.free(out.stderr);
-
-    // Expect non-zero exit status
-    switch (out.term) {
-        .Exited => |code| {
-            if (code == 0) return error.UnexpectedSuccess;
-        },
-        else => {},
-    }
-
-    // Extract and validate "Error at line X, column Y" header
-    const header_start = std.mem.indexOf(u8, out.stderr, "Error at line") orelse {
-        std.debug.print("Line/column header missing in stderr: {s}\n", .{out.stderr});
-        return error.MissingError;
-    };
-
-    // Slice header until newline
-    const newline_pos_opt = std.mem.indexOfPos(u8, out.stderr, header_start, "\n") orelse out.stderr.len;
-    const header_line = out.stderr[header_start..newline_pos_opt];
-
-    // Parse numbers from header
-    var it = std.mem.splitSequence(u8, header_line, " ");
-    _ = it.next(); // "Error"
-    _ = it.next(); // "at"
-    _ = it.next(); // "line"
-    const line_str = it.next() orelse ""; // "X,"
-    const line_num = std.fmt.parseInt(u32, line_str[0 .. line_str.len - 1], 10) catch 0; // remove trailing comma
-    _ = it.next(); // "column"
-    const col_str = it.next() orelse ""; // "Y:"
-    const col_num = std.fmt.parseInt(u32, col_str[0 .. col_str.len - 1], 10) catch 0;
-
-    // Compute expected line number from the provided source
-    var expected_line_number: u32 = 0;
-    var current: u32 = 1;
-    var idx: usize = 0;
-    while (idx < source.len) : (idx += 1) {
-        // Find start of each line
-        const line_start = idx;
-        // Move to end of line
-        while (idx < source.len and source[idx] != '\n') : (idx += 1) {}
-        const line_slice = source[line_start..idx];
-        if (std.mem.eql(u8, line_slice, expected_line)) {
-            expected_line_number = current;
-            break;
-        }
-        current += 1;
-    }
-
-    if (expected_line_number == 0 or expected_line_number != line_num) {
-        std.debug.print("Expected error on line {}, got {}. Stderr: {s}\n", .{ expected_line_number, line_num, out.stderr });
-        return error.MissingError;
-    }
-
-    // Ensure the full source line appears in stderr with leading two spaces
-    const formatted_line = try std.fmt.allocPrint(allocator, "  {s}", .{expected_line});
-    defer allocator.free(formatted_line);
-
-    if (std.mem.indexOf(u8, out.stderr, formatted_line) == null) {
-        std.debug.print("Expected source line not found in stderr. Looking for '{s}'. Stderr: {s}\n", .{ formatted_line, out.stderr });
-        return error.MissingError;
-    }
-
-    // Verify caret alignment matches column number
-    const caret_line_start = std.mem.indexOf(u8, out.stderr, "^") orelse {
-        std.debug.print("Caret '^' not found in stderr: {s}\n", .{out.stderr});
-        return error.MissingError;
-    };
-    // Count spaces before caret by scanning backwards to preceding newline
-    var tmp_idx: usize = caret_line_start;
-    while (tmp_idx > 0 and out.stderr[tmp_idx - 1] != '\n') : (tmp_idx -= 1) {}
-    const spaces = caret_line_start - tmp_idx - 2; // exclude the two leading indent spaces
-    if (spaces + 1 != col_num) {
-        std.debug.print("Caret column {} does not match parsed column {}\n", .{ spaces + 1, col_num });
-        return error.MissingError;
-    }
-
-    // If caller supplied a substring, ensure it's present in stderr
-    if (expected_substr.len > 0 and std.mem.indexOf(u8, out.stderr, expected_substr) == null) {
-        std.debug.print("Expected substring '{s}' not found in stderr: {s}\n", .{ expected_substr, out.stderr });
-        return error.MissingError;
-    }
-}
-
-test "compile example.toy and verify exit code" {
-    const allocator = std.testing.allocator;
-
-    // Get the path to the dcc binary
-    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
-
-    // Test that dcc can compile examples/example.toy
-    {
-        const run = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, "examples/example.toy" } });
-        defer allocator.free(run.stdout);
-        defer allocator.free(run.stderr);
-        std.debug.print("dcc compilation successful\n", .{});
-    }
-
-    // Test that the compiled binary produces exit code 16
-    try assertReturns(allocator, 16);
-}
-
-test "compile library.toy and verify it works" {
-    const allocator = std.testing.allocator;
-
-    // Get the path to the dcc binary
-    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
-
-    // Test that dcc can compile examples/library.toy
-    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, "examples/library.toy" } });
-    defer allocator.free(out.stdout);
-    defer allocator.free(out.stderr);
-    switch (out.term) {
-        .Exited => |code| {
-            if (code != 0) {
-                std.debug.print("dcc compilation of examples/library.toy failed with exit code {}\n", .{code});
-                std.debug.print("stdout: {s}\n", .{out.stdout});
-                std.debug.print("stderr: {s}\n", .{out.stderr});
-                return error.CompilationFailed;
-            }
-        },
-        else => {
-            std.debug.print("dcc compilation of examples/library.toy terminated abnormally\n", .{});
-            return error.CompilationFailed;
-        },
-    }
-    std.debug.print("dcc compilation of examples/library.toy successful\n", .{});
-}
-
 test "type system - different integer types" {
     const allocator = std.testing.allocator;
     // Create a test file with different integer types
@@ -963,4 +725,242 @@ test "integration test" {
     try std.testing.expect(ast.program.statements.len == 2);
     try std.testing.expect(ast.program.statements[0] == .function_declaration);
     try std.testing.expect(ast.program.statements[1] == .function_declaration);
+}
+
+test "compile example.toy and verify exit code" {
+    const allocator = std.testing.allocator;
+
+    // Get the path to the dcc binary
+    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
+
+    // Test that dcc can compile examples/example.toy
+    {
+        const run = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, "examples/example.toy" } });
+        defer allocator.free(run.stdout);
+        defer allocator.free(run.stderr);
+        std.debug.print("dcc compilation successful\n", .{});
+    }
+
+    // Test that the compiled binary produces exit code 16
+    try assertReturns(allocator, 16);
+}
+
+test "compile library.toy and verify it works" {
+    const allocator = std.testing.allocator;
+
+    // Get the path to the dcc binary
+    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
+
+    // Test that dcc can compile examples/library.toy
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, "examples/library.toy" } });
+    defer allocator.free(out.stdout);
+    defer allocator.free(out.stderr);
+    switch (out.term) {
+        .Exited => |code| {
+            if (code != 0) {
+                std.debug.print("dcc compilation of examples/library.toy failed with exit code {}\n", .{code});
+                std.debug.print("stdout: {s}\n", .{out.stdout});
+                std.debug.print("stderr: {s}\n", .{out.stderr});
+                return error.CompilationFailed;
+            }
+        },
+        else => {
+            std.debug.print("dcc compilation of examples/library.toy terminated abnormally\n", .{});
+            return error.CompilationFailed;
+        },
+    }
+    std.debug.print("dcc compilation of examples/library.toy successful\n", .{});
+}
+
+fn assertCompiles(allocator: std.mem.Allocator, source: []const u8, filename: []const u8) !void {
+    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
+    {
+        const file = try std.fs.cwd().createFile(filename, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(source);
+    }
+    defer std.fs.cwd().deleteFile(filename) catch {};
+
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, filename } });
+    defer allocator.free(out.stdout);
+    defer allocator.free(out.stderr);
+
+    switch (out.term) {
+        .Exited => |code| {
+            if (code != 0) {
+                std.debug.print("{s} failed with exit code {}\n", .{ filename, code });
+                std.debug.print("stdout: {s}\n", .{out.stdout});
+                std.debug.print("stderr: {s}\n", .{out.stderr});
+                return error.CompilationFailed;
+            }
+        },
+        else => {
+            std.debug.print("Integer types test terminated abnormally\n", .{});
+            return error.CompilationFailed;
+        },
+    }
+}
+
+fn assertReturns(allocator: std.mem.Allocator, expected: usize) !void {
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{"./output"} });
+    switch (out.term) {
+        .Exited => |term| {
+            if (term != expected) {
+                std.debug.print("Expected exit code {}, got {}\n", .{ expected, term });
+                std.debug.print("stdout: {s}\n", .{out.stdout});
+                std.debug.print("stderr: {s}\n", .{out.stderr});
+                return error.UnexpectedExitCode;
+            } else {
+                std.debug.print("Compiled test_tensor.toy produced correct exit code: {}\n", .{out.term.Exited});
+            }
+        },
+        else => {
+            return error.UnexpectedExitCode;
+        },
+    }
+}
+
+// Assert that GPU compilation fails without --gpu flag
+fn assertGpuCompileFailure(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    filename: []const u8,
+) !void {
+    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
+
+    // Write the temporary source file
+    {
+        const file = try std.fs.cwd().createFile(filename, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(source);
+    }
+    defer std.fs.cwd().deleteFile(filename) catch {};
+
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, filename } });
+    defer allocator.free(out.stdout);
+    defer allocator.free(out.stderr);
+
+    // Expect non-zero exit status
+    switch (out.term) {
+        .Exited => |code| {
+            if (code == 0) {
+                std.debug.print("Expected GPU compilation to fail without --gpu flag\n", .{});
+                std.debug.print("stdout: {s}\n", .{out.stdout});
+                std.debug.print("stderr: {s}\n", .{out.stderr});
+                return error.UnexpectedSuccess;
+            }
+        },
+        else => return error.UnexpectedTermination,
+    }
+
+    // Check that the error message contains the expected GPU error text
+    if (!std.mem.containsAtLeast(u8, out.stderr, 1, "Cannot compile GPU function") or
+        !std.mem.containsAtLeast(u8, out.stderr, 1, "without --gpu flag"))
+    {
+        std.debug.print("Expected GPU error message not found in stderr:\n{s}\n", .{out.stderr});
+        return error.MissingGpuError;
+    }
+}
+
+// Assert that compilation fails and stderr contains the expected substring (if provided)
+fn assertCompileFailure(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    filename: []const u8,
+    expected_substr: []const u8,
+    expected_line: []const u8,
+) !void {
+    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
+
+    // Write the temporary source file
+    {
+        const file = try std.fs.cwd().createFile(filename, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(source);
+    }
+    defer std.fs.cwd().deleteFile(filename) catch {};
+
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, filename } });
+    defer allocator.free(out.stdout);
+    defer allocator.free(out.stderr);
+
+    // Expect non-zero exit status
+    switch (out.term) {
+        .Exited => |code| {
+            if (code == 0) return error.UnexpectedSuccess;
+        },
+        else => {},
+    }
+
+    // Extract and validate "Error at line X, column Y" header
+    const header_start = std.mem.indexOf(u8, out.stderr, "Error at line") orelse {
+        std.debug.print("Line/column header missing in stderr: {s}\n", .{out.stderr});
+        return error.MissingError;
+    };
+
+    // Slice header until newline
+    const newline_pos_opt = std.mem.indexOfPos(u8, out.stderr, header_start, "\n") orelse out.stderr.len;
+    const header_line = out.stderr[header_start..newline_pos_opt];
+
+    // Parse numbers from header
+    var it = std.mem.splitSequence(u8, header_line, " ");
+    _ = it.next(); // "Error"
+    _ = it.next(); // "at"
+    _ = it.next(); // "line"
+    const line_str = it.next() orelse ""; // "X,"
+    const line_num = std.fmt.parseInt(u32, line_str[0 .. line_str.len - 1], 10) catch 0; // remove trailing comma
+    _ = it.next(); // "column"
+    const col_str = it.next() orelse ""; // "Y:"
+    const col_num = std.fmt.parseInt(u32, col_str[0 .. col_str.len - 1], 10) catch 0;
+
+    // Compute expected line number from the provided source
+    var expected_line_number: u32 = 0;
+    var current: u32 = 1;
+    var idx: usize = 0;
+    while (idx < source.len) : (idx += 1) {
+        // Find start of each line
+        const line_start = idx;
+        // Move to end of line
+        while (idx < source.len and source[idx] != '\n') : (idx += 1) {}
+        const line_slice = source[line_start..idx];
+        if (std.mem.eql(u8, line_slice, expected_line)) {
+            expected_line_number = current;
+            break;
+        }
+        current += 1;
+    }
+
+    if (expected_line_number == 0 or expected_line_number != line_num) {
+        std.debug.print("Expected error on line {}, got {}. Stderr: {s}\n", .{ expected_line_number, line_num, out.stderr });
+        return error.MissingError;
+    }
+
+    // Ensure the full source line appears in stderr with leading two spaces
+    const formatted_line = try std.fmt.allocPrint(allocator, "  {s}", .{expected_line});
+    defer allocator.free(formatted_line);
+
+    if (std.mem.indexOf(u8, out.stderr, formatted_line) == null) {
+        std.debug.print("Expected source line not found in stderr. Looking for '{s}'. Stderr: {s}\n", .{ formatted_line, out.stderr });
+        return error.MissingError;
+    }
+
+    // Verify caret alignment matches column number
+    const caret_line_start = std.mem.indexOf(u8, out.stderr, "^") orelse {
+        std.debug.print("Caret '^' not found in stderr: {s}\n", .{out.stderr});
+        return error.MissingError;
+    };
+    // Count spaces before caret by scanning backwards to preceding newline
+    var tmp_idx: usize = caret_line_start;
+    while (tmp_idx > 0 and out.stderr[tmp_idx - 1] != '\n') : (tmp_idx -= 1) {}
+    const spaces = caret_line_start - tmp_idx - 2; // exclude the two leading indent spaces
+    if (spaces + 1 != col_num) {
+        std.debug.print("Caret column {} does not match parsed column {}\n", .{ spaces + 1, col_num });
+        return error.MissingError;
+    }
+
+    // If caller supplied a substring, ensure it's present in stderr
+    if (expected_substr.len > 0 and std.mem.indexOf(u8, out.stderr, expected_substr) == null) {
+        std.debug.print("Expected substring '{s}' not found in stderr: {s}\n", .{ expected_substr, out.stderr });
+        return error.MissingError;
+    }
 }

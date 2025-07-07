@@ -442,8 +442,24 @@ pub fn build(b: *std.Build) !void {
     const integration_test_step = b.step("test-integration", "Run integration tests");
     integration_test_step.dependOn(&run_integration_tests.step);
 
+    // Cross-compilation tests that require the dcc binary
+    const cross_compilation_tests = b.addTest(.{
+        .name = "cross-compilation-tests",
+        .root_source_file = b.path("src/cross_compilation_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Add cross-compilation tests step
+    const run_cross_compilation_tests = b.addRunArtifact(cross_compilation_tests);
+    run_cross_compilation_tests.step.dependOn(b.getInstallStep()); // Ensure dcc binary is built first
+
+    const cross_compilation_test_step = b.step("test-cross", "Run cross-compilation tests");
+    cross_compilation_test_step.dependOn(&run_cross_compilation_tests.step);
+
     // Make the main test step depend on both unit and integration tests
     test_step.dependOn(&run_integration_tests.step);
+    test_step.dependOn(&run_cross_compilation_tests.step);
 
     // Add specific MLIR codegen test step
     const mlir_codegen_tests = b.addTest(.{
