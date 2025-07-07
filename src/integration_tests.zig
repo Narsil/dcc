@@ -932,3 +932,35 @@ test "vector operations - add then multiply" {
 
     std.debug.print("vector operations test passed - program correctly returns 15\n", .{});
 }
+
+test "integration test" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    const allocator = std.testing.allocator;
+    const source =
+        \\fn add(a: i64, b: i64) i64 {
+        \\    return a + b;
+        \\}
+        \\
+        \\fn main() i64 {
+        \\    let result: i64 = add(5i64, 3i64);
+        \\    return result;
+        \\}
+    ;
+
+    // Tokenize
+    var lex = lexer.Lexer.init(allocator, source);
+    const tokens = try lex.tokenize();
+    defer allocator.free(tokens);
+
+    // Parse
+    var parse = parser.Parser.init(allocator, tokens, source, false);
+    const ast = try parse.parse();
+    defer parser.freeAST(allocator, ast);
+
+    // Should have two function declarations
+    try std.testing.expect(ast == .program);
+    try std.testing.expect(ast.program.statements.len == 2);
+    try std.testing.expect(ast.program.statements[0] == .function_declaration);
+    try std.testing.expect(ast.program.statements[1] == .function_declaration);
+}

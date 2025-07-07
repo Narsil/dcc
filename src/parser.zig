@@ -1191,6 +1191,111 @@ pub const Parser = struct {
     }
 };
 
+pub fn freeType(allocator: std.mem.Allocator, type_info: Type) void {
+    switch (type_info) {
+        .tensor => |tensor_type| {
+            // Free the shape array
+            allocator.free(tensor_type.shape);
+            // Recursively free the element type
+            freeType(allocator, tensor_type.element_type.*);
+            // Free the element type pointer
+            allocator.destroy(tensor_type.element_type);
+        },
+        else => {
+            // Basic types don't need cleanup
+        },
+    }
+}
+
+pub fn freeAST(allocator: std.mem.Allocator, node: ASTNode) void {
+    switch (node) {
+        .program => |prog| {
+            for (prog.statements) |stmt| {
+                freeAST(allocator, stmt);
+            }
+            allocator.free(prog.statements);
+        },
+        .function_declaration => |func| {
+            // Free parameter types
+            for (func.parameters) |param| {
+                freeType(allocator, param.type);
+            }
+            allocator.free(func.parameters);
+
+            // Free return type
+            freeType(allocator, func.return_type);
+
+            for (func.body) |stmt| {
+                freeAST(allocator, stmt);
+            }
+            allocator.free(func.body);
+        },
+        .variable_declaration => |var_decl| {
+            // Free the variable type
+            freeType(allocator, var_decl.type);
+            freeAST(allocator, var_decl.value.*);
+            allocator.destroy(var_decl.value);
+        },
+        .return_statement => |ret| {
+            if (ret.value) |val| {
+                freeAST(allocator, val.*);
+                allocator.destroy(val);
+            }
+        },
+        .expression_statement => |expr_stmt| {
+            freeAST(allocator, expr_stmt.expression.*);
+            allocator.destroy(expr_stmt.expression);
+        },
+        .binary_expression => |bin_expr| {
+            freeAST(allocator, bin_expr.left.*);
+            freeAST(allocator, bin_expr.right.*);
+            allocator.destroy(bin_expr.left);
+            allocator.destroy(bin_expr.right);
+        },
+        .unary_expression => |unary_expr| {
+            freeAST(allocator, unary_expr.operand.*);
+            allocator.destroy(unary_expr.operand);
+        },
+        .call_expression => |call| {
+            freeAST(allocator, call.callee.*);
+            allocator.destroy(call.callee);
+            for (call.arguments) |arg| {
+                freeAST(allocator, arg);
+            }
+            allocator.free(call.arguments);
+        },
+        .tensor_literal => |tensor_lit| {
+            // Free the shape array
+            allocator.free(tensor_lit.shape);
+            // Free the tensor literal type
+            freeType(allocator, tensor_lit.element_type);
+            freeAST(allocator, tensor_lit.value.*);
+            allocator.destroy(tensor_lit.value);
+        },
+        .tensor_slice => |tensor_slice| {
+            freeAST(allocator, tensor_slice.tensor.*);
+            allocator.destroy(tensor_slice.tensor);
+            for (tensor_slice.indices) |index| {
+                freeAST(allocator, index);
+            }
+            allocator.free(tensor_slice.indices);
+        },
+        .implicit_tensor_index => |tensor_index| {
+            // Free the implicit index name string
+            allocator.free(tensor_index.implicit_index);
+            freeAST(allocator, tensor_index.tensor.*);
+            allocator.destroy(tensor_index.tensor);
+        },
+        .parallel_assignment => |pa| {
+            freeAST(allocator, pa.target.*);
+            freeAST(allocator, pa.value.*);
+            allocator.destroy(pa.target);
+            allocator.destroy(pa.value);
+        },
+        .identifier, .number_literal, .parameter => {},
+    }
+}
+
 test "parser simple variable" {
     const allocator = std.testing.allocator;
     const source = "let x: i64 = 42i64;";
@@ -1323,109 +1428,4 @@ test "parser error - calling expression" {
     var parser = Parser.init(allocator, tokens, source, false);
     const result = parser.parse();
     try std.testing.expectError(error.ParseError, result);
-}
-
-pub fn freeType(allocator: std.mem.Allocator, type_info: Type) void {
-    switch (type_info) {
-        .tensor => |tensor_type| {
-            // Free the shape array
-            allocator.free(tensor_type.shape);
-            // Recursively free the element type
-            freeType(allocator, tensor_type.element_type.*);
-            // Free the element type pointer
-            allocator.destroy(tensor_type.element_type);
-        },
-        else => {
-            // Basic types don't need cleanup
-        },
-    }
-}
-
-pub fn freeAST(allocator: std.mem.Allocator, node: ASTNode) void {
-    switch (node) {
-        .program => |prog| {
-            for (prog.statements) |stmt| {
-                freeAST(allocator, stmt);
-            }
-            allocator.free(prog.statements);
-        },
-        .function_declaration => |func| {
-            // Free parameter types
-            for (func.parameters) |param| {
-                freeType(allocator, param.type);
-            }
-            allocator.free(func.parameters);
-
-            // Free return type
-            freeType(allocator, func.return_type);
-
-            for (func.body) |stmt| {
-                freeAST(allocator, stmt);
-            }
-            allocator.free(func.body);
-        },
-        .variable_declaration => |var_decl| {
-            // Free the variable type
-            freeType(allocator, var_decl.type);
-            freeAST(allocator, var_decl.value.*);
-            allocator.destroy(var_decl.value);
-        },
-        .return_statement => |ret| {
-            if (ret.value) |val| {
-                freeAST(allocator, val.*);
-                allocator.destroy(val);
-            }
-        },
-        .expression_statement => |expr_stmt| {
-            freeAST(allocator, expr_stmt.expression.*);
-            allocator.destroy(expr_stmt.expression);
-        },
-        .binary_expression => |bin_expr| {
-            freeAST(allocator, bin_expr.left.*);
-            freeAST(allocator, bin_expr.right.*);
-            allocator.destroy(bin_expr.left);
-            allocator.destroy(bin_expr.right);
-        },
-        .unary_expression => |unary_expr| {
-            freeAST(allocator, unary_expr.operand.*);
-            allocator.destroy(unary_expr.operand);
-        },
-        .call_expression => |call| {
-            freeAST(allocator, call.callee.*);
-            allocator.destroy(call.callee);
-            for (call.arguments) |arg| {
-                freeAST(allocator, arg);
-            }
-            allocator.free(call.arguments);
-        },
-        .tensor_literal => |tensor_lit| {
-            // Free the shape array
-            allocator.free(tensor_lit.shape);
-            // Free the tensor literal type
-            freeType(allocator, tensor_lit.element_type);
-            freeAST(allocator, tensor_lit.value.*);
-            allocator.destroy(tensor_lit.value);
-        },
-        .tensor_slice => |tensor_slice| {
-            freeAST(allocator, tensor_slice.tensor.*);
-            allocator.destroy(tensor_slice.tensor);
-            for (tensor_slice.indices) |index| {
-                freeAST(allocator, index);
-            }
-            allocator.free(tensor_slice.indices);
-        },
-        .implicit_tensor_index => |tensor_index| {
-            // Free the implicit index name string
-            allocator.free(tensor_index.implicit_index);
-            freeAST(allocator, tensor_index.tensor.*);
-            allocator.destroy(tensor_index.tensor);
-        },
-        .parallel_assignment => |pa| {
-            freeAST(allocator, pa.target.*);
-            freeAST(allocator, pa.value.*);
-            allocator.destroy(pa.target);
-            allocator.destroy(pa.value);
-        },
-        .identifier, .number_literal, .parameter => {},
-    }
 }
