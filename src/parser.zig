@@ -1,13 +1,5 @@
 const std = @import("std");
 const lexer = @import("lexer.zig");
-const LLVM = @cImport({
-    @cInclude("llvm-c/Core.h");
-    @cInclude("llvm-c/TargetMachine.h");
-    @cInclude("llvm-c/Target.h");
-    @cInclude("llvm-c/Support.h");
-    @cInclude("llvm-c/BitReader.h");
-    @cInclude("llvm-c/Object.h");
-});
 
 pub const ParseError = error{ ParseError, OutOfMemory, InvalidCharacter, Overflow, InvalidUtf8 } || std.mem.Allocator.Error;
 
@@ -121,25 +113,6 @@ pub const Type = union(enum) {
                 result.appendSlice(tensor_type.element_type.toString()) catch {};
 
                 return result.toOwnedSlice();
-            },
-        };
-    }
-
-    /// Get the LLVM type for this type
-    pub fn toLLVMType(self: Type, context: anytype) LLVM.LLVMTypeRef {
-        return switch (self) {
-            .u8, .i8 => LLVM.LLVMInt8TypeInContext(context),
-            .u16, .i16 => LLVM.LLVMInt16TypeInContext(context),
-            .u32, .i32 => LLVM.LLVMInt32TypeInContext(context),
-            .u64, .i64 => LLVM.LLVMInt64TypeInContext(context),
-            .f32 => LLVM.LLVMFloatTypeInContext(context),
-            .f64 => LLVM.LLVMDoubleTypeInContext(context),
-            .void => LLVM.LLVMVoidTypeInContext(context),
-            .tensor => |tensor_type| {
-                // For now, create a simple array type
-                // In a full implementation, we'd want to handle multi-dimensional arrays properly
-                const element_type = tensor_type.element_type.toLLVMType(context);
-                return LLVM.LLVMArrayType(element_type, @intCast(tensor_type.total_elements()));
             },
         };
     }

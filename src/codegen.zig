@@ -3,7 +3,6 @@ const parser = @import("parser.zig");
 const mlir_codegen = @import("mlir_codegen.zig");
 const cuda_llvm_ir_gen = @import("cuda_llvm_ir_gen.zig");
 const cuda_stub_manager = @import("cuda_stub_manager.zig");
-const macho = std.macho;
 const LLVM = @cImport({
     @cInclude("llvm-c/Core.h");
     @cInclude("llvm-c/TargetMachine.h");
@@ -58,39 +57,39 @@ pub const CodeGen = struct {
     fn parseGpuTriplet(triplet: []const u8) !u32 {
         // Split by '-' to get parts
         var parts = std.mem.splitSequence(u8, triplet, "-");
-        
+
         // Part 1: vendor (must be "nvidia")
         const vendor = parts.next() orelse return error.InvalidGpuTriplet;
         if (!std.mem.eql(u8, vendor, "nvidia")) {
             return error.InvalidGpuTriplet;
         }
-        
+
         // Part 2: target (must be "ptx")
         const target = parts.next() orelse return error.InvalidGpuTriplet;
         if (!std.mem.eql(u8, target, "ptx")) {
             return error.InvalidGpuTriplet;
         }
-        
+
         // Part 3: SM version (must be "smXX")
         const sm_part = parts.next() orelse return error.InvalidGpuTriplet;
         if (!std.mem.startsWith(u8, sm_part, "sm")) {
             return error.InvalidGpuTriplet;
         }
-        
+
         // Make sure there are no more parts
         if (parts.next() != null) {
             return error.InvalidGpuTriplet;
         }
-        
+
         // Extract the numeric part after "sm"
         const sm_version_str = sm_part[2..]; // Skip "sm"
         const sm_version = std.fmt.parseInt(u32, sm_version_str, 10) catch return error.InvalidGpuTriplet;
-        
+
         // Validate SM version is reasonable (20-90)
         if (sm_version < 20 or sm_version > 90) {
             return error.InvalidGpuTriplet;
         }
-        
+
         return sm_version;
     }
 
@@ -178,6 +177,25 @@ pub const CodeGen = struct {
         LLVM.LLVMContextDispose(self.context);
     }
 
+    /// Convert a Type to an LLVM type
+    pub fn toLLVMType(self: *CodeGen, type_to_convert: parser.Type) LLVM.LLVMTypeRef {
+        return switch (type_to_convert) {
+            .u8, .i8 => LLVM.LLVMInt8TypeInContext(self.context),
+            .u16, .i16 => LLVM.LLVMInt16TypeInContext(self.context),
+            .u32, .i32 => LLVM.LLVMInt32TypeInContext(self.context),
+            .u64, .i64 => LLVM.LLVMInt64TypeInContext(self.context),
+            .f32 => LLVM.LLVMFloatTypeInContext(self.context),
+            .f64 => LLVM.LLVMDoubleTypeInContext(self.context),
+            .void => LLVM.LLVMVoidTypeInContext(self.context),
+            .tensor => |tensor_type| {
+                // For now, create a simple array type
+                // In a full implementation, we'd want to handle multi-dimensional arrays properly
+                const element_type = self.toLLVMType(tensor_type.element_type.*);
+                return LLVM.LLVMArrayType(element_type, @intCast(tensor_type.total_elements()));
+            },
+        };
+    }
+
     fn hasGpuFunctions(self: *CodeGen) bool {
         // Check if any function names start with "gpu_"
         // Since functions may not be registered yet when this is called,
@@ -201,11 +219,11 @@ pub const CodeGen = struct {
                         try self.declareFunctionSignature(stmt.function_declaration);
                     }
                 }
-                
+
                 // Pass 2: Process all function bodies (GPU functions first, then main)
                 var main_processed = false;
                 var main_func_decl: ?@TypeOf(@as(parser.ASTNode, undefined).function_declaration) = null;
-                
+
                 // First, process GPU functions
                 for (prog.statements) |stmt| {
                     if (stmt == .function_declaration) {
@@ -217,13 +235,13 @@ pub const CodeGen = struct {
                         }
                     }
                 }
-                
+
                 // Then, process main function after GPU functions are done
                 if (main_func_decl) |main_func| {
                     try self.generateFunctionBody(main_func);
                     main_processed = true;
                 }
-                
+
                 // Process other statements
                 for (prog.statements) |stmt| {
                     switch (stmt) {
@@ -233,7 +251,7 @@ pub const CodeGen = struct {
                         else => try self.generateNode(stmt),
                     }
                 }
-                
+
                 // Only require main function for executable mode
                 if (mode == .executable and !main_processed) {
                     return error.MissingMainFunction;
@@ -264,15 +282,15 @@ pub const CodeGen = struct {
         for (func.parameters, 0..) |param, i| {
             if (param.type == .tensor) {
                 // Use pointer type for tensor parameters to allow in-place modification
-                const array_type = param.type.toLLVMType(self.context);
+                const array_type = self.toLLVMType(param.type);
                 param_types[i] = LLVM.LLVMPointerType(array_type, 0);
             } else {
-                param_types[i] = param.type.toLLVMType(self.context);
+                param_types[i] = self.toLLVMType(param.type);
             }
         }
 
         // Create function type
-        const actual_return_type = func.return_type.toLLVMType(self.context);
+        const actual_return_type = self.toLLVMType(func.return_type);
         const function_type = LLVM.LLVMFunctionType(actual_return_type, param_types.ptr, @intCast(param_types.len), 0);
 
         // Create function
@@ -285,7 +303,7 @@ pub const CodeGen = struct {
         self.setStackAlignmentAttributes(llvm_function);
 
         try self.functions.put(try self.allocator.dupe(u8, func.name), llvm_function);
-        
+
         if (self.verbose) {
             std.debug.print("🔧 Declared function signature: {s}\n", .{func.name});
         }
@@ -296,10 +314,10 @@ pub const CodeGen = struct {
         if (std.mem.startsWith(u8, func.name, "gpu_")) {
             return self.generateGpuFunction(func);
         }
-        
+
         // Get the already declared function
         const llvm_function = self.functions.get(func.name) orelse return error.UndefinedFunction;
-        
+
         // Use i32 return type for main function to match C runtime expectations
         const is_main = std.mem.eql(u8, func.name, "main");
 
@@ -314,11 +332,11 @@ pub const CodeGen = struct {
             defer self.allocator.free(param_name_z);
 
             if (param.type == .tensor) {
-                // For tensor parameters, use the passed pointer directly 
+                // For tensor parameters, use the passed pointer directly
                 // (no need to create a local copy)
                 try self.variables.put(try self.allocator.dupe(u8, param.name), VarInfo{ .alloca = param_value, .ty = param.type });
             } else {
-                const param_type = param.type.toLLVMType(self.context);
+                const param_type = self.toLLVMType(param.type);
                 const alloca = LLVM.LLVMBuildAlloca(self.builder, param_type, param_name_z.ptr);
                 LLVM.LLVMSetAlignment(alloca, 16); // 16-byte alignment for x86-64 System V ABI
                 const store_inst = LLVM.LLVMBuildStore(self.builder, param_value, alloca);
@@ -366,7 +384,7 @@ pub const CodeGen = struct {
         // Check if the current basic block has a terminator
         const current_block = LLVM.LLVMGetInsertBlock(self.builder);
         const terminator = LLVM.LLVMGetBasicBlockTerminator(current_block);
-        
+
         if (terminator == null) {
             // No terminator found, add appropriate return based on function type
             if (func.return_type == .void) {
@@ -392,7 +410,7 @@ pub const CodeGen = struct {
     }
 
     fn generateVariableDeclaration(self: *CodeGen, var_decl: @TypeOf(@as(parser.ASTNode, undefined).variable_declaration)) CodeGenError!void {
-        const var_type = var_decl.type.toLLVMType(self.context);
+        const var_type = self.toLLVMType(var_decl.type);
         const name_z = try self.allocator.dupeZ(u8, var_decl.name);
         defer self.allocator.free(name_z);
 
@@ -410,14 +428,14 @@ pub const CodeGen = struct {
         const current_function = LLVM.LLVMGetBasicBlockParent(LLVM.LLVMGetInsertBlock(self.builder));
         const function_name = LLVM.LLVMGetValueName(current_function);
         const is_main = std.mem.eql(u8, std.mem.span(function_name), "main");
-        
+
         if (is_main and self.hasGpuFunctions()) {
             if (self.verbose) {
                 std.debug.print("🧹 Injecting CUDA cleanup before return in main function\n", .{});
             }
             try self.injectCudaCleanupBeforeReturn();
         }
-        
+
         if (ret.value) |value| {
             const llvm_value = try self.generateExpression(value.*);
             _ = LLVM.LLVMBuildRet(self.builder, llvm_value);
@@ -446,7 +464,7 @@ pub const CodeGen = struct {
             .tensor => |t| t.shape[0],
             else => 0,
         };
-        const elem_type = tensor_info.ty.toLLVMType(self.context);
+        const elem_type = self.toLLVMType(tensor_info.ty);
 
         const i64_type = LLVM.LLVMInt64TypeInContext(self.context);
         const zero_const = LLVM.LLVMConstInt(i64_type, 0, 0);
@@ -499,7 +517,7 @@ pub const CodeGen = struct {
     fn generateExpression(self: *CodeGen, node: parser.ASTNode) CodeGenError!LLVM.LLVMValueRef {
         switch (node) {
             .number_literal => |num| {
-                const llvm_type = num.type.toLLVMType(self.context);
+                const llvm_type = self.toLLVMType(num.type);
 
                 if (num.type.isFloat()) {
                     // Strip type suffix for float parsing
@@ -529,7 +547,7 @@ pub const CodeGen = struct {
                         return info.alloca; // use pointer for tensors
                     }
 
-                    const elem_type = info.ty.toLLVMType(self.context);
+                    const elem_type = self.toLLVMType(info.ty);
                     const name_z = try self.allocator.dupeZ(u8, ident.name);
                     defer self.allocator.free(name_z);
 
@@ -601,7 +619,7 @@ pub const CodeGen = struct {
 
                     for (call.arguments, 0..) |arg, i| {
                         const arg_value = try self.generateExpression(arg);
-                        
+
                         // For tensor arguments, pass the pointer directly
                         // (no need to load the array value since functions expect pointers now)
                         args[i] = arg_value;
@@ -617,7 +635,7 @@ pub const CodeGen = struct {
             },
             .tensor_literal => |tensor_lit| {
                 // For now, create a simple array with the specified value
-                const element_type = tensor_lit.element_type.toLLVMType(self.context);
+                const element_type = self.toLLVMType(tensor_lit.element_type);
                 _ = LLVM.LLVMArrayType(element_type, @intCast(tensor_lit.shape[0])); // Suppress unused warning
                 const value = try self.generateExpression(tensor_lit.value.*);
 
@@ -649,8 +667,8 @@ pub const CodeGen = struct {
                 const vi_slice = self.variables.get(name_slice) orelse return error.CodeGenError;
                 if (vi_slice.ty != .tensor) return error.CodeGenError;
 
-                const array_ty = vi_slice.ty.toLLVMType(self.context);
-                const elem_ty = vi_slice.ty.tensor.element_type.toLLVMType(self.context);
+                const array_ty = self.toLLVMType(vi_slice.ty);
+                const elem_ty = self.toLLVMType(vi_slice.ty.tensor.element_type.*);
 
                 // Currently only support 1-dimensional explicit indices.
                 if (tensor_slice.indices.len != 1) {
@@ -691,8 +709,8 @@ pub const CodeGen = struct {
                 const vi = self.variables.get(name) orelse return error.CodeGenError;
                 if (vi.ty != .tensor) return error.CodeGenError;
 
-                const array_ty = vi.ty.toLLVMType(self.context);
-                const elem_ty = vi.ty.tensor.element_type.toLLVMType(self.context);
+                const array_ty = self.toLLVMType(vi.ty);
+                const elem_ty = self.toLLVMType(vi.ty.tensor.element_type.*);
 
                 // Build GEP indices [0, idx_val]
                 const i64_type = LLVM.LLVMInt64TypeInContext(self.context);
@@ -877,12 +895,12 @@ pub const CodeGen = struct {
         try args.append(try self.allocator.dupeZ(u8, obj_path));
 
         // No libc needed - using Linux syscall for exit() in cross-compilation
-        
+
         // Add CUDA library linking for Linux targets if GPU code is present
         if (!is_darwin and !is_windows and self.mlir_codegen != null) {
             // Check if we have CUDA stub libraries available
-                         if (self.cuda_stub_mgr) |*stub_mgr| {
-                 if (cuda_stub_manager.CudaStubManager.shouldUseStubs(target_triple)) {
+            if (self.cuda_stub_mgr) |*stub_mgr| {
+                if (cuda_stub_manager.CudaStubManager.shouldUseStubs(target_triple)) {
                     // Use CUDA stub library for linking, but set RPATH to system library
                     const stub_lib_path = stub_mgr.getLibCudaPath() catch |err| {
                         if (self.verbose) {
@@ -890,47 +908,47 @@ pub const CodeGen = struct {
                         }
                         // Fall back to system libraries
                         try args.append(try self.allocator.dupeZ(u8, "-lcuda"));
-                        
+
                         if (self.verbose) {
                             std.debug.print("🔗 Added system CUDA library linking (fallback)\n", .{});
                         }
                         return;
                     };
                     defer self.allocator.free(stub_lib_path);
-                    
+
                     // Add the stub library directory for linking
                     const stub_lib_dir = std.fs.path.dirname(stub_lib_path) orelse ".";
                     const lib_dir_flag = try std.fmt.allocPrintZ(self.allocator, "-L{s}", .{stub_lib_dir});
                     try args.append(lib_dir_flag);
-                    
+
                     // Set RPATH to standard Linux CUDA library paths for cross-compilation
                     // For cross-compilation, use the most common Linux CUDA library paths
                     const linux_cuda_paths = [_][]const u8{
-                        "/run/opengl-driver/lib",      // NixOS
-                        "/usr/local/cuda/lib64",       // Standard CUDA installation
-                        "/usr/lib/x86_64-linux-gnu",   // Ubuntu/Debian
-                        "/usr/lib64",                  // RHEL/CentOS
+                        "/run/opengl-driver/lib", // NixOS
+                        "/usr/local/cuda/lib64", // Standard CUDA installation
+                        "/usr/lib/x86_64-linux-gnu", // Ubuntu/Debian
+                        "/usr/lib64", // RHEL/CentOS
                     };
-                    
+
                     // Add multiple RPATH entries for better compatibility
                     for (linux_cuda_paths) |cuda_path| {
                         const rpath_flag = try std.fmt.allocPrintZ(self.allocator, "--rpath={s}", .{cuda_path});
                         try args.append(rpath_flag);
                     }
-                    
+
                     if (self.verbose) {
                         std.debug.print("🔗 Using standard Linux CUDA library paths in RPATH for cross-compilation\n", .{});
                     }
-                    
+
                     try args.append(try self.allocator.dupeZ(u8, "-lcuda"));
-                    
+
                     if (self.verbose) {
                         std.debug.print("🔗 Added CUDA stub library for linking: {s}\n", .{stub_lib_path});
                     }
                 } else {
                     // Use system CUDA libraries
                     try args.append(try self.allocator.dupeZ(u8, "-lcuda"));
-                    
+
                     if (self.verbose) {
                         std.debug.print("🔗 Added system CUDA library linking\n", .{});
                     }
@@ -938,7 +956,7 @@ pub const CodeGen = struct {
             } else {
                 // No stub manager, use system libraries
                 try args.append(try self.allocator.dupeZ(u8, "-lcuda"));
-                
+
                 if (self.verbose) {
                     std.debug.print("🔗 Added system CUDA library linking (no stub manager)\n", .{});
                 }
@@ -1456,7 +1474,7 @@ pub const CodeGen = struct {
         const int64_type = LLVM.LLVMInt64TypeInContext(self.context);
         const main_function_type = LLVM.LLVMFunctionType(int64_type, null, 0, 0);
         const main_result = LLVM.LLVMBuildCall2(self.builder, main_function_type, main_function, null, 0, "main_result");
-        
+
         // Convert i64 to i32 for exit code
         const exit_code = LLVM.LLVMBuildTrunc(self.builder, main_result, i32_type, "exit_code");
 
@@ -1538,7 +1556,7 @@ pub const CodeGen = struct {
             if (self.verbose) {
                 std.debug.print("🚀 Compiling GPU function: {s}\n", .{func.name});
             }
-            
+
             // Step 1: Generate MLIR for the GPU function
             mlir.generateGpuFunction(func) catch |err| {
                 if (self.verbose) {
@@ -1546,11 +1564,11 @@ pub const CodeGen = struct {
                 }
                 // Fall through to generate host wrapper anyway
             };
-            
+
             if (self.verbose) {
                 mlir.printMLIR();
             }
-            
+
             // Step 2: Generate PTX from MLIR
             const ptx_code = mlir.lowerMLIRToPTX(func.name) catch |err| {
                 if (self.verbose) {
@@ -1560,17 +1578,16 @@ pub const CodeGen = struct {
                 return self.generateGpuHostWrapper(func);
             };
             defer self.allocator.free(ptx_code);
-            
+
             if (self.verbose) {
                 std.debug.print("✅ Generated PTX code ({d} bytes)\n", .{ptx_code.len});
             }
-            
+
             // Step 3: Generate CUDA LLVM IR wrapper using the new generator
             try self.generateCudaLLVMIRWrapper(func, ptx_code);
-            
+
             // Step 4: Generate host wrapper function that can be called from main
             try self.generateGpuHostWrapper(func);
-            
         } else {
             std.debug.print("Error: Cannot compile GPU function '{s}' without --gpu flag\n", .{func.name});
             std.debug.print("GPU functions require GPU compilation support. Use --gpu flag to enable.\n", .{});
@@ -1582,7 +1599,7 @@ pub const CodeGen = struct {
         if (self.verbose) {
             std.debug.print("🔧 Generating GPU host wrapper function: {s}\n", .{func.name});
         }
-        
+
         // Create a host function that launches the CUDA kernel
         const param_types = try self.allocator.alloc(LLVM.LLVMTypeRef, func.parameters.len);
         defer self.allocator.free(param_types);
@@ -1590,10 +1607,10 @@ pub const CodeGen = struct {
         for (func.parameters, 0..) |param, i| {
             if (param.type == .tensor) {
                 // Use pointer type for tensor parameters to allow in-place modification
-                const array_type = param.type.toLLVMType(self.context);
+                const array_type = self.toLLVMType(param.type);
                 param_types[i] = LLVM.LLVMPointerType(array_type, 0);
             } else {
-                param_types[i] = param.type.toLLVMType(self.context);
+                param_types[i] = self.toLLVMType(param.type);
             }
         }
 
@@ -1616,10 +1633,10 @@ pub const CodeGen = struct {
         if (self.verbose) {
             std.debug.print("🔧 Generating CUDA LLVM IR wrapper for function: {s}\n", .{func.name});
         }
-        
+
         // Extract target triple for CUDA compilation
         const target_triple = "x86_64-unknown-linux-gnu"; // Default for cross-compilation
-        
+
         // Check if we should use CUDA stubs and extract them if needed
         if (self.cuda_stub_mgr) |*stub_mgr| {
             if (cuda_stub_manager.CudaStubManager.shouldUseStubs(target_triple)) {
@@ -1630,7 +1647,7 @@ pub const CodeGen = struct {
                     }
                     // Continue without stub files - just generate the IR
                 };
-                
+
                 if (self.verbose) {
                     std.debug.print("✅ CUDA stub files extracted and ready\n", .{});
                     if (stub_mgr.getIncludePath()) |include_path| {
@@ -1642,298 +1659,298 @@ pub const CodeGen = struct {
                 }
             }
         }
-        
+
         // Instead of creating a separate CUDA module, integrate CUDA functions directly into the main module
         try self.addCudaFunctionsToMainModule(ptx_code);
-        
+
         if (self.verbose) {
             std.debug.print("✅ CUDA functions integrated into main module\n", .{});
         }
     }
-    
+
     fn addCudaFunctionsToMainModule(self: *CodeGen, ptx_code: []const u8) CodeGenError!void {
         if (self.verbose) {
             std.debug.print("🔧 Adding CUDA functions to main module\n", .{});
         }
-        
+
         // Declare CUDA runtime functions in the main module
         const int32_type = LLVM.LLVMInt32TypeInContext(self.context);
         const int8_type = LLVM.LLVMInt8TypeInContext(self.context);
         const ptr_type = LLVM.LLVMPointerType(int8_type, 0);
         const void_type = LLVM.LLVMVoidTypeInContext(self.context);
-        
+
         // Declare CUDA runtime functions
         var cuInit_params = [_]LLVM.LLVMTypeRef{int32_type};
         const cuInit_type = LLVM.LLVMFunctionType(int32_type, &cuInit_params, 1, 0);
         const cuInit_func = LLVM.LLVMAddFunction(self.module, "cuInit", cuInit_type);
-        
+
         var cuDeviceGet_params = [_]LLVM.LLVMTypeRef{ ptr_type, int32_type };
         const cuDeviceGet_type = LLVM.LLVMFunctionType(int32_type, &cuDeviceGet_params, 2, 0);
         const cuDeviceGet_func = LLVM.LLVMAddFunction(self.module, "cuDeviceGet", cuDeviceGet_type);
-        
+
         var cuCtxCreate_params = [_]LLVM.LLVMTypeRef{ ptr_type, int32_type, int32_type };
         const cuCtxCreate_type = LLVM.LLVMFunctionType(int32_type, &cuCtxCreate_params, 3, 0);
         const cuCtxCreate_func = LLVM.LLVMAddFunction(self.module, "cuCtxCreate_v2", cuCtxCreate_type);
-        
+
         // Add cuCtxDestroy for proper cleanup
         var cuCtxDestroy_params = [_]LLVM.LLVMTypeRef{ptr_type};
         const cuCtxDestroy_type = LLVM.LLVMFunctionType(int32_type, &cuCtxDestroy_params, 1, 0);
         const cuCtxDestroy_func = LLVM.LLVMAddFunction(self.module, "cuCtxDestroy_v2", cuCtxDestroy_type);
-        
+
         // Add cuDevicePrimaryCtxReset for thorough cleanup
         var cuDevicePrimaryCtxReset_params = [_]LLVM.LLVMTypeRef{int32_type};
         const cuDevicePrimaryCtxReset_type = LLVM.LLVMFunctionType(int32_type, &cuDevicePrimaryCtxReset_params, 1, 0);
         const cuDevicePrimaryCtxReset_func = LLVM.LLVMAddFunction(self.module, "cuDevicePrimaryCtxReset_v2", cuDevicePrimaryCtxReset_type);
-        
+
         // Add pthread functions for thread cleanup
         var pthread_kill_params = [_]LLVM.LLVMTypeRef{ LLVM.LLVMInt64TypeInContext(self.context), int32_type };
         const pthread_kill_type = LLVM.LLVMFunctionType(int32_type, &pthread_kill_params, 2, 0);
         _ = LLVM.LLVMAddFunction(self.module, "pthread_kill", pthread_kill_type);
-        
+
         // No exit function needed - using Linux syscall for cross-compilation
-        
+
         var cuModuleLoadData_params = [_]LLVM.LLVMTypeRef{ ptr_type, ptr_type };
         const cuModuleLoadData_type = LLVM.LLVMFunctionType(int32_type, &cuModuleLoadData_params, 2, 0);
         const cuModuleLoadData_func = LLVM.LLVMAddFunction(self.module, "cuModuleLoadData", cuModuleLoadData_type);
-        
+
         var cuModuleUnload_params = [_]LLVM.LLVMTypeRef{ptr_type};
         const cuModuleUnload_type = LLVM.LLVMFunctionType(int32_type, &cuModuleUnload_params, 1, 0);
         const cuModuleUnload_func = LLVM.LLVMAddFunction(self.module, "cuModuleUnload", cuModuleUnload_type);
-        
+
         // Additional CUDA functions needed for initialization
         var cuDeviceGetCount_params = [_]LLVM.LLVMTypeRef{ptr_type};
         const cuDeviceGetCount_type = LLVM.LLVMFunctionType(int32_type, &cuDeviceGetCount_params, 1, 0);
         _ = LLVM.LLVMAddFunction(self.module, "cuDeviceGetCount", cuDeviceGetCount_type);
-        
+
         var cuDeviceGetName_params = [_]LLVM.LLVMTypeRef{ ptr_type, int32_type, int32_type };
         const cuDeviceGetName_type = LLVM.LLVMFunctionType(int32_type, &cuDeviceGetName_params, 3, 0);
         _ = LLVM.LLVMAddFunction(self.module, "cuDeviceGetName", cuDeviceGetName_type);
-        
+
         // Additional CUDA functions needed for kernel launch
         const size_t_type = LLVM.LLVMInt64TypeInContext(self.context);
-        
+
         var cuModuleGetFunction_params = [_]LLVM.LLVMTypeRef{ ptr_type, ptr_type, ptr_type };
         const cuModuleGetFunction_type = LLVM.LLVMFunctionType(int32_type, &cuModuleGetFunction_params, 3, 0);
         _ = LLVM.LLVMAddFunction(self.module, "cuModuleGetFunction", cuModuleGetFunction_type);
-        
+
         var cuMemAlloc_params = [_]LLVM.LLVMTypeRef{ ptr_type, size_t_type };
         const cuMemAlloc_type = LLVM.LLVMFunctionType(int32_type, &cuMemAlloc_params, 2, 0);
         _ = LLVM.LLVMAddFunction(self.module, "cuMemAlloc_v2", cuMemAlloc_type);
-        
+
         var cuMemcpyHtoD_params = [_]LLVM.LLVMTypeRef{ ptr_type, ptr_type, size_t_type };
         const cuMemcpyHtoD_type = LLVM.LLVMFunctionType(int32_type, &cuMemcpyHtoD_params, 3, 0);
         _ = LLVM.LLVMAddFunction(self.module, "cuMemcpyHtoD_v2", cuMemcpyHtoD_type);
-        
+
         var cuLaunchKernel_params = [_]LLVM.LLVMTypeRef{ ptr_type, int32_type, int32_type, int32_type, int32_type, int32_type, int32_type, int32_type, ptr_type, ptr_type, ptr_type };
         const cuLaunchKernel_type = LLVM.LLVMFunctionType(int32_type, &cuLaunchKernel_params, 11, 0);
         _ = LLVM.LLVMAddFunction(self.module, "cuLaunchKernel", cuLaunchKernel_type);
-        
+
         const cuCtxSynchronize_type = LLVM.LLVMFunctionType(int32_type, null, 0, 0);
         _ = LLVM.LLVMAddFunction(self.module, "cuCtxSynchronize", cuCtxSynchronize_type);
-        
+
         var cuMemcpyDtoH_params = [_]LLVM.LLVMTypeRef{ ptr_type, ptr_type, size_t_type };
         const cuMemcpyDtoH_type = LLVM.LLVMFunctionType(int32_type, &cuMemcpyDtoH_params, 3, 0);
         _ = LLVM.LLVMAddFunction(self.module, "cuMemcpyDtoH_v2", cuMemcpyDtoH_type);
-        
+
         var cuMemFree_params = [_]LLVM.LLVMTypeRef{ptr_type};
         const cuMemFree_type = LLVM.LLVMFunctionType(int32_type, &cuMemFree_params, 1, 0);
         _ = LLVM.LLVMAddFunction(self.module, "cuMemFree_v2", cuMemFree_type);
-        
+
         // Embed PTX data as global constant
         try self.embedPTXDataInMainModule(ptx_code);
-        
+
         // Create global variables to store CUDA context and module
         const cuda_context_global = LLVM.LLVMAddGlobal(self.module, ptr_type, "cuda_context");
         LLVM.LLVMSetInitializer(cuda_context_global, LLVM.LLVMConstNull(ptr_type));
         LLVM.LLVMSetLinkage(cuda_context_global, LLVM.LLVMInternalLinkage);
-        
+
         const cuda_module_global = LLVM.LLVMAddGlobal(self.module, ptr_type, "cuda_module");
         LLVM.LLVMSetInitializer(cuda_module_global, LLVM.LLVMConstNull(ptr_type));
         LLVM.LLVMSetLinkage(cuda_module_global, LLVM.LLVMInternalLinkage);
-        
+
         // Generate CUDA wrapper functions in the main module
         try self.generateCudaInitInMainModule(cuInit_func, cuInit_type);
         try self.generateCudaCreateContextInMainModule(cuDeviceGet_func, cuDeviceGet_type, cuCtxCreate_func, cuCtxCreate_type);
         try self.generateCudaLoadModuleInMainModule(cuModuleLoadData_func, cuModuleLoadData_type);
         try self.generateCudaCleanupInMainModule(cuCtxDestroy_func, cuCtxDestroy_type, cuModuleUnload_func, cuModuleUnload_type, cuDevicePrimaryCtxReset_func, cuDevicePrimaryCtxReset_type, void_type);
-        
+
         if (self.verbose) {
             std.debug.print("✅ All CUDA functions added to main module\n", .{});
         }
     }
-    
+
     fn embedPTXDataInMainModule(self: *CodeGen, ptx_code: []const u8) CodeGenError!void {
         const int8_type = LLVM.LLVMInt8TypeInContext(self.context);
-        
+
         // Create array type for PTX data + null terminator
         // PTX data MUST be null-terminated for cuModuleLoadData
         const array_type = LLVM.LLVMArrayType(int8_type, @intCast(ptx_code.len + 1));
-        
+
         // Create global variable for PTX data
         const ptx_global = LLVM.LLVMAddGlobal(self.module, array_type, "embedded_ptx_data");
         LLVM.LLVMSetLinkage(ptx_global, LLVM.LLVMPrivateLinkage);
         LLVM.LLVMSetGlobalConstant(ptx_global, 1);
-        
+
         // Create initializer from PTX code + null terminator
         const ptx_values = try self.allocator.alloc(LLVM.LLVMValueRef, ptx_code.len + 1);
         defer self.allocator.free(ptx_values);
-        
+
         for (ptx_code, 0..) |byte, i| {
             ptx_values[i] = LLVM.LLVMConstInt(int8_type, byte, 0);
         }
         // Add null terminator - this is CRITICAL for cuModuleLoadData
         ptx_values[ptx_code.len] = LLVM.LLVMConstInt(int8_type, 0, 0);
-        
+
         const ptx_array = LLVM.LLVMConstArray(int8_type, ptx_values.ptr, @intCast(ptx_code.len + 1));
         LLVM.LLVMSetInitializer(ptx_global, ptx_array);
-        
+
         if (self.verbose) {
             std.debug.print("✅ PTX data embedded in main module ({d} bytes + null terminator)\n", .{ptx_code.len});
         }
     }
-    
+
     fn generateCudaInitInMainModule(self: *CodeGen, cuInit_func: LLVM.LLVMValueRef, cuInit_type: LLVM.LLVMTypeRef) CodeGenError!void {
         const int32_type = LLVM.LLVMInt32TypeInContext(self.context);
-        
+
         // Create cuda_init function
         const function_type = LLVM.LLVMFunctionType(int32_type, null, 0, 0);
         const function = LLVM.LLVMAddFunction(self.module, "cuda_init", function_type);
-        
+
         // Create entry block
         const entry_block = LLVM.LLVMAppendBasicBlockInContext(self.context, function, "entry");
         const old_position = LLVM.LLVMGetInsertBlock(self.builder);
         LLVM.LLVMPositionBuilderAtEnd(self.builder, entry_block);
-        
+
         // Call cuInit(0)
         const zero = LLVM.LLVMConstInt(int32_type, 0, 0);
         var args = [_]LLVM.LLVMValueRef{zero};
         const cuInit_result = LLVM.LLVMBuildCall2(self.builder, cuInit_type, cuInit_func, &args, 1, "cuInit_result");
-        
+
         // Return the result
         _ = LLVM.LLVMBuildRet(self.builder, cuInit_result);
-        
+
         // Restore builder position
         if (old_position != null) {
             LLVM.LLVMPositionBuilderAtEnd(self.builder, old_position);
         }
     }
-    
+
     fn generateCudaCreateContextInMainModule(self: *CodeGen, cuDeviceGet_func: LLVM.LLVMValueRef, cuDeviceGet_type: LLVM.LLVMTypeRef, cuCtxCreate_func: LLVM.LLVMValueRef, cuCtxCreate_type: LLVM.LLVMTypeRef) CodeGenError!void {
         const int32_type = LLVM.LLVMInt32TypeInContext(self.context);
         const int8_type = LLVM.LLVMInt8TypeInContext(self.context);
         const ptr_type = LLVM.LLVMPointerType(int8_type, 0);
-        
+
         // Create cuda_create_context function
         var param_types = [_]LLVM.LLVMTypeRef{ ptr_type, int32_type };
         const function_type = LLVM.LLVMFunctionType(int32_type, &param_types, 2, 0);
         const function = LLVM.LLVMAddFunction(self.module, "cuda_create_context", function_type);
-        
+
         // Get parameters
         const context_param = LLVM.LLVMGetParam(function, 0);
         const device_id_param = LLVM.LLVMGetParam(function, 1);
-        
+
         // Create blocks
         const entry_block = LLVM.LLVMAppendBasicBlockInContext(self.context, function, "entry");
         const success_block = LLVM.LLVMAppendBasicBlockInContext(self.context, function, "success");
         const error_block = LLVM.LLVMAppendBasicBlockInContext(self.context, function, "error");
-        
+
         const old_position = LLVM.LLVMGetInsertBlock(self.builder);
         LLVM.LLVMPositionBuilderAtEnd(self.builder, entry_block);
-        
+
         // Get device
         const device_var = LLVM.LLVMBuildAlloca(self.builder, int32_type, "device");
         var cuDeviceGet_args = [_]LLVM.LLVMValueRef{ device_var, device_id_param };
         const cuDeviceGet_result = LLVM.LLVMBuildCall2(self.builder, cuDeviceGet_type, cuDeviceGet_func, &cuDeviceGet_args, 2, "cuDeviceGet_result");
-        
+
         // Check if device get was successful
         const zero = LLVM.LLVMConstInt(int32_type, 0, 0);
         const device_get_success = LLVM.LLVMBuildICmp(self.builder, LLVM.LLVMIntEQ, cuDeviceGet_result, zero, "device_get_success");
         _ = LLVM.LLVMBuildCondBr(self.builder, device_get_success, success_block, error_block);
-        
+
         // Success block: create context
         LLVM.LLVMPositionBuilderAtEnd(self.builder, success_block);
         const device_value = LLVM.LLVMBuildLoad2(self.builder, int32_type, device_var, "device_value");
         var cuCtxCreate_args = [_]LLVM.LLVMValueRef{ context_param, zero, device_value };
         const cuCtxCreate_result = LLVM.LLVMBuildCall2(self.builder, cuCtxCreate_type, cuCtxCreate_func, &cuCtxCreate_args, 3, "cuCtxCreate_result");
         _ = LLVM.LLVMBuildRet(self.builder, cuCtxCreate_result);
-        
+
         // Error block: return error
         LLVM.LLVMPositionBuilderAtEnd(self.builder, error_block);
         _ = LLVM.LLVMBuildRet(self.builder, cuDeviceGet_result);
-        
+
         // Restore builder position
         if (old_position != null) {
             LLVM.LLVMPositionBuilderAtEnd(self.builder, old_position);
         }
     }
-    
+
     fn generateCudaLoadModuleInMainModule(self: *CodeGen, cuModuleLoadData_func: LLVM.LLVMValueRef, cuModuleLoadData_type: LLVM.LLVMTypeRef) CodeGenError!void {
         const int32_type = LLVM.LLVMInt32TypeInContext(self.context);
         const int8_type = LLVM.LLVMInt8TypeInContext(self.context);
         const ptr_type = LLVM.LLVMPointerType(int8_type, 0);
-        
+
         // Create cuda_load_module function
         var param_types = [_]LLVM.LLVMTypeRef{ ptr_type, ptr_type };
         const function_type = LLVM.LLVMFunctionType(int32_type, &param_types, 2, 0);
         const function = LLVM.LLVMAddFunction(self.module, "cuda_load_module", function_type);
-        
+
         // Get parameters
         const module_param = LLVM.LLVMGetParam(function, 0);
         const ptx_data_param = LLVM.LLVMGetParam(function, 1);
-        
+
         // Create entry block
         const entry_block = LLVM.LLVMAppendBasicBlockInContext(self.context, function, "entry");
         const old_position = LLVM.LLVMGetInsertBlock(self.builder);
         LLVM.LLVMPositionBuilderAtEnd(self.builder, entry_block);
-        
+
         // Call cuModuleLoadData(module, ptx_data)
         var cuModuleLoadData_args = [_]LLVM.LLVMValueRef{ module_param, ptx_data_param };
         const cuModuleLoadData_result = LLVM.LLVMBuildCall2(self.builder, cuModuleLoadData_type, cuModuleLoadData_func, &cuModuleLoadData_args, 2, "cuModuleLoadData_result");
-        
+
         // Return the result
         _ = LLVM.LLVMBuildRet(self.builder, cuModuleLoadData_result);
-        
+
         // Restore builder position
         if (old_position != null) {
             LLVM.LLVMPositionBuilderAtEnd(self.builder, old_position);
         }
     }
-    
+
     fn generateCudaCleanupInMainModule(self: *CodeGen, cuCtxDestroy_func: LLVM.LLVMValueRef, cuCtxDestroy_type: LLVM.LLVMTypeRef, cuModuleUnload_func: LLVM.LLVMValueRef, cuModuleUnload_type: LLVM.LLVMTypeRef, cuDevicePrimaryCtxReset_func: LLVM.LLVMValueRef, cuDevicePrimaryCtxReset_type: LLVM.LLVMTypeRef, void_type: LLVM.LLVMTypeRef) CodeGenError!void {
         const int8_type = LLVM.LLVMInt8TypeInContext(self.context);
         const ptr_type = LLVM.LLVMPointerType(int8_type, 0);
-        
+
         // Create cuda_cleanup function
         var param_types = [_]LLVM.LLVMTypeRef{ ptr_type, ptr_type };
         const function_type = LLVM.LLVMFunctionType(void_type, &param_types, 2, 0);
         const function = LLVM.LLVMAddFunction(self.module, "cuda_cleanup", function_type);
-        
+
         // Get parameters
         const context_param = LLVM.LLVMGetParam(function, 0);
         const module_param = LLVM.LLVMGetParam(function, 1);
-        
+
         // Create entry block
         const entry_block = LLVM.LLVMAppendBasicBlockInContext(self.context, function, "entry");
         const old_position = LLVM.LLVMGetInsertBlock(self.builder);
         LLVM.LLVMPositionBuilderAtEnd(self.builder, entry_block);
-        
+
         // Call cuModuleUnload(module)
         var module_args = [_]LLVM.LLVMValueRef{module_param};
         _ = LLVM.LLVMBuildCall2(self.builder, cuModuleUnload_type, cuModuleUnload_func, &module_args, 1, "");
-        
+
         // Call cuCtxDestroy(context)
         var context_args = [_]LLVM.LLVMValueRef{context_param};
         _ = LLVM.LLVMBuildCall2(self.builder, cuCtxDestroy_type, cuCtxDestroy_func, &context_args, 1, "");
-        
+
         // Call cuDevicePrimaryCtxReset(0) to thoroughly clean up device state
         const int32_type = LLVM.LLVMInt32TypeInContext(self.context);
         const zero = LLVM.LLVMConstInt(int32_type, 0, 0);
         var device_reset_args = [_]LLVM.LLVMValueRef{zero};
         _ = LLVM.LLVMBuildCall2(self.builder, cuDevicePrimaryCtxReset_type, cuDevicePrimaryCtxReset_func, &device_reset_args, 1, "");
-        
+
         // Return void to let the main function return with its intended exit code
         _ = LLVM.LLVMBuildRetVoid(self.builder);
-        
+
         // Restore builder position
         if (old_position != null) {
             LLVM.LLVMPositionBuilderAtEnd(self.builder, old_position);
@@ -1944,93 +1961,93 @@ pub const CodeGen = struct {
         if (self.verbose) {
             std.debug.print("🔧 Injecting CUDA one-time initialization into main function\n", .{});
         }
-        
+
         // Basic types
         const int32_type = LLVM.LLVMInt32TypeInContext(self.context);
         const int8_type = LLVM.LLVMInt8TypeInContext(self.context);
         const ptr_type = LLVM.LLVMPointerType(int8_type, 0);
-        
+
         // Get CUDA functions that should already be declared
         const cuInit_func = LLVM.LLVMGetNamedFunction(self.module, "cuInit");
         const cuDeviceGet_func = LLVM.LLVMGetNamedFunction(self.module, "cuDeviceGet");
         const cuCtxCreate_func = LLVM.LLVMGetNamedFunction(self.module, "cuCtxCreate_v2");
         const cuModuleLoadData_func = LLVM.LLVMGetNamedFunction(self.module, "cuModuleLoadData");
-        
+
         if (cuInit_func == null or cuDeviceGet_func == null or cuCtxCreate_func == null or cuModuleLoadData_func == null) {
             if (self.verbose) {
                 std.debug.print("❌ CUDA functions not found - they should be declared first\n", .{});
             }
             return CodeGenError.CudaFunctionNotFound;
         }
-        
+
         const zero = LLVM.LLVMConstInt(int32_type, 0, 0);
-        
+
         // Get function types from existing functions
         const cuInit_type = LLVM.LLVMGlobalGetValueType(cuInit_func.?);
         const cuDeviceGet_type = LLVM.LLVMGlobalGetValueType(cuDeviceGet_func.?);
         const cuCtxCreate_type = LLVM.LLVMGlobalGetValueType(cuCtxCreate_func.?);
         const cuModuleLoadData_type = LLVM.LLVMGlobalGetValueType(cuModuleLoadData_func.?);
-        
+
         // Get global variables that should already exist
         const cuda_context_global = LLVM.LLVMGetNamedGlobal(self.module, "cuda_context");
         const cuda_module_global = LLVM.LLVMGetNamedGlobal(self.module, "cuda_module");
-        
+
         if (cuda_context_global == null or cuda_module_global == null) {
             if (self.verbose) {
                 std.debug.print("❌ Global CUDA variables not found during initialization\n", .{});
             }
             return CodeGenError.CudaFunctionNotFound;
         }
-        
+
         // 1. Initialize CUDA
         var cuda_init_args = [_]LLVM.LLVMValueRef{zero};
         _ = LLVM.LLVMBuildCall2(self.builder, cuInit_type, cuInit_func.?, &cuda_init_args, 1, "cuda_init_result");
-        
+
         // 2. Get device
         const device_var = LLVM.LLVMBuildAlloca(self.builder, int32_type, "device");
         var device_args = [_]LLVM.LLVMValueRef{ device_var, zero };
         _ = LLVM.LLVMBuildCall2(self.builder, cuDeviceGet_type, cuDeviceGet_func.?, &device_args, 2, "device_result");
-        
+
         // 3. Create context
         const device = LLVM.LLVMBuildLoad2(self.builder, int32_type, device_var, "device_val");
         const context_var = LLVM.LLVMBuildAlloca(self.builder, ptr_type, "context");
         var context_args = [_]LLVM.LLVMValueRef{ context_var, zero, device };
         _ = LLVM.LLVMBuildCall2(self.builder, cuCtxCreate_type, cuCtxCreate_func.?, &context_args, 3, "context_result");
-        
+
         // Store context in global variable
         const context_val = LLVM.LLVMBuildLoad2(self.builder, ptr_type, context_var, "context_val");
         _ = LLVM.LLVMBuildStore(self.builder, context_val, cuda_context_global.?);
-        
+
         // 4. Load PTX module
         const ptx_data_global = LLVM.LLVMGetNamedGlobal(self.module, "embedded_ptx_data");
         if (ptx_data_global != null) {
             // Cast PTX data array to char pointer
             var ptx_gep_indices = [_]LLVM.LLVMValueRef{ zero, zero };
             const ptx_data = LLVM.LLVMBuildGEP2(self.builder, LLVM.LLVMGlobalGetValueType(ptx_data_global.?), ptx_data_global.?, &ptx_gep_indices, 2, "ptx_data_ptr");
-            
+
             const module_var = LLVM.LLVMBuildAlloca(self.builder, ptr_type, "module");
             var module_args = [_]LLVM.LLVMValueRef{ module_var, ptx_data };
             _ = LLVM.LLVMBuildCall2(self.builder, cuModuleLoadData_type, cuModuleLoadData_func.?, &module_args, 2, "module_result");
-            
+
             // Store module in global variable
             const module_val = LLVM.LLVMBuildLoad2(self.builder, ptr_type, module_var, "module_val");
             _ = LLVM.LLVMBuildStore(self.builder, module_val, cuda_module_global.?);
         }
-        
+
         if (self.verbose) {
             std.debug.print("✅ CUDA one-time initialization injected into main function\n", .{});
         }
     }
-    
+
     fn injectCudaCleanupBeforeReturn(self: *CodeGen) CodeGenError!void {
         if (self.verbose) {
             std.debug.print("🧹 Injecting CUDA cleanup before main function return\n", .{});
         }
-        
+
         // Basic types
         const int8_type = LLVM.LLVMInt8TypeInContext(self.context);
         const ptr_type = LLVM.LLVMPointerType(int8_type, 0);
-        
+
         // Get the cuda_cleanup function that should already be declared
         const cuda_cleanup_func = LLVM.LLVMGetNamedFunction(self.module, "cuda_cleanup");
         if (cuda_cleanup_func == null) {
@@ -2039,42 +2056,42 @@ pub const CodeGen = struct {
             }
             return CodeGenError.CudaFunctionNotFound;
         }
-        
+
         // Get global variables
         const cuda_context_global = LLVM.LLVMGetNamedGlobal(self.module, "cuda_context");
         const cuda_module_global = LLVM.LLVMGetNamedGlobal(self.module, "cuda_module");
-        
+
         if (cuda_context_global == null or cuda_module_global == null) {
             if (self.verbose) {
                 std.debug.print("❌ Global CUDA variables not found during cleanup\n", .{});
             }
             return CodeGenError.CudaFunctionNotFound;
         }
-        
+
         // Load the global context and module
         const cuda_context = LLVM.LLVMBuildLoad2(self.builder, ptr_type, cuda_context_global.?, "cuda_context_val");
         const cuda_module = LLVM.LLVMBuildLoad2(self.builder, ptr_type, cuda_module_global.?, "cuda_module_val");
-        
+
         // Get function type
         const cuda_cleanup_type = LLVM.LLVMGlobalGetValueType(cuda_cleanup_func.?);
-        
+
         // Call cuda_cleanup(context, module)
         var cleanup_args = [_]LLVM.LLVMValueRef{ cuda_context, cuda_module };
         _ = LLVM.LLVMBuildCall2(self.builder, cuda_cleanup_type, cuda_cleanup_func.?, &cleanup_args, 2, "");
-        
+
         if (self.verbose) {
             std.debug.print("✅ CUDA cleanup injected before main function return\n", .{});
         }
     }
-    
+
     fn generateSimpleCudaHostFunction(self: *CodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration)) CodeGenError!void {
         if (self.verbose) {
             std.debug.print("🔧 Generating simple CUDA host function for: {s}\n", .{func.name});
         }
-        
+
         // Generate a CPU fallback implementation that simply calls the regular CPU version
         // This allows the program to compile and run without requiring actual CUDA hardware
-        
+
         // For now, we'll just generate a stub function that prints a message
         // and falls back to CPU simulation
         return self.generateGpuHostWrapper(func);
@@ -2086,27 +2103,27 @@ pub const CodeGen = struct {
         const int8_type = LLVM.LLVMInt8TypeInContext(self.context);
         const ptr_type = LLVM.LLVMPointerType(int8_type, 0);
         const size_t_type = LLVM.LLVMInt64TypeInContext(self.context);
-        
+
         if (self.verbose) {
             std.debug.print("🚀 Generating CUDA kernel launch for {s} (using global context/module)\n", .{func.name});
         }
-        
+
         // Get global CUDA context and module (initialized once in main)
         const cuda_context_global = LLVM.LLVMGetNamedGlobal(self.module, "cuda_context");
         const cuda_module_global = LLVM.LLVMGetNamedGlobal(self.module, "cuda_module");
-        
+
         if (cuda_context_global == null or cuda_module_global == null) {
             if (self.verbose) {
                 std.debug.print("❌ Global CUDA context/module not found\n", .{});
             }
             return CodeGenError.CodeGenError;
         }
-        
+
         // Load the global context and module
         // Note: cuda_context not used in current implementation but available if needed
         _ = LLVM.LLVMBuildLoad2(self.builder, ptr_type, cuda_context_global.?, "cuda_context");
         const cuda_module = LLVM.LLVMBuildLoad2(self.builder, ptr_type, cuda_module_global.?, "cuda_module");
-        
+
         // Get additional CUDA functions that should already be declared in addCudaFunctionsToMainModule
         const cuModuleGetFunction_func = LLVM.LLVMGetNamedFunction(self.module, "cuModuleGetFunction");
         const cuMemAlloc_func = LLVM.LLVMGetNamedFunction(self.module, "cuMemAlloc_v2");
@@ -2115,15 +2132,16 @@ pub const CodeGen = struct {
         const cuCtxSynchronize_func = LLVM.LLVMGetNamedFunction(self.module, "cuCtxSynchronize");
         const cuMemcpyDtoH_func = LLVM.LLVMGetNamedFunction(self.module, "cuMemcpyDtoH_v2");
         const cuMemFree_func = LLVM.LLVMGetNamedFunction(self.module, "cuMemFree_v2");
-        
-        if (cuModuleGetFunction_func == null or cuMemAlloc_func == null or cuMemcpyHtoD_func == null or 
-            cuLaunchKernel_func == null or cuCtxSynchronize_func == null or cuMemcpyDtoH_func == null or cuMemFree_func == null) {
+
+        if (cuModuleGetFunction_func == null or cuMemAlloc_func == null or cuMemcpyHtoD_func == null or
+            cuLaunchKernel_func == null or cuCtxSynchronize_func == null or cuMemcpyDtoH_func == null or cuMemFree_func == null)
+        {
             if (self.verbose) {
                 std.debug.print("❌ Additional CUDA functions not found - they should be declared first\n", .{});
             }
             return CodeGenError.CudaFunctionNotFound;
         }
-        
+
         // Get function types from existing functions
         const cuModuleGetFunction_type = LLVM.LLVMGlobalGetValueType(cuModuleGetFunction_func.?);
         const cuMemAlloc_type = LLVM.LLVMGlobalGetValueType(cuMemAlloc_func.?);
@@ -2132,27 +2150,27 @@ pub const CodeGen = struct {
         const cuCtxSynchronize_type = LLVM.LLVMGlobalGetValueType(cuCtxSynchronize_func.?);
         const cuMemcpyDtoH_type = LLVM.LLVMGlobalGetValueType(cuMemcpyDtoH_func.?);
         const cuMemFree_type = LLVM.LLVMGlobalGetValueType(cuMemFree_func.?);
-        
+
         const zero = LLVM.LLVMConstInt(int32_type, 0, 0);
-        
+
         // 1. Get kernel function from the pre-loaded module
         const kernel_func_ptr = LLVM.LLVMBuildAlloca(self.builder, ptr_type, "kernel_func");
         const kernel_name = try std.fmt.allocPrintZ(self.allocator, "{s}", .{func.name});
         defer self.allocator.free(kernel_name);
         const kernel_name_global = LLVM.LLVMBuildGlobalStringPtr(self.builder, kernel_name.ptr, "kernel_name");
-        
+
         var get_func_args = [_]LLVM.LLVMValueRef{ kernel_func_ptr, cuda_module, kernel_name_global };
         _ = LLVM.LLVMBuildCall2(self.builder, cuModuleGetFunction_type, cuModuleGetFunction_func.?, &get_func_args, 3, "get_func_result");
         const kernel_func = LLVM.LLVMBuildLoad2(self.builder, ptr_type, kernel_func_ptr, "kernel_func_val");
-        
+
         // 6. Allocate GPU memory and copy data for each parameter
         var gpu_ptrs = std.ArrayList(LLVM.LLVMValueRef).init(self.allocator);
         defer gpu_ptrs.deinit();
-        
+
         for (func.parameters, 0..) |param, i| {
             if (param.type == .tensor) {
-            const llvm_param = LLVM.LLVMGetParam(llvm_function, @intCast(i));
-                
+                const llvm_param = LLVM.LLVMGetParam(llvm_function, @intCast(i));
+
                 // Calculate size for tensor
                 const elem_size: u32 = switch (param.type.tensor.element_type.*) {
                     .f32 => 4,
@@ -2162,61 +2180,61 @@ pub const CodeGen = struct {
                     else => 4,
                 };
                 const tensor_size = LLVM.LLVMConstInt(size_t_type, param.type.tensor.shape[0] * elem_size, 0);
-                
+
                 // Allocate GPU memory
                 const gpu_ptr = LLVM.LLVMBuildAlloca(self.builder, ptr_type, "gpu_ptr");
                 try gpu_ptrs.append(gpu_ptr);
-                
+
                 var alloc_args = [_]LLVM.LLVMValueRef{ gpu_ptr, tensor_size };
                 _ = LLVM.LLVMBuildCall2(self.builder, cuMemAlloc_type, cuMemAlloc_func.?, &alloc_args, 2, "");
-                
+
                 // Copy data to GPU
                 const gpu_ptr_val = LLVM.LLVMBuildLoad2(self.builder, ptr_type, gpu_ptr, "gpu_ptr_val");
                 const host_ptr = LLVM.LLVMBuildBitCast(self.builder, llvm_param, ptr_type, "host_ptr");
-                
+
                 var copy_args = [_]LLVM.LLVMValueRef{ gpu_ptr_val, host_ptr, tensor_size };
                 _ = LLVM.LLVMBuildCall2(self.builder, cuMemcpyHtoD_type, cuMemcpyHtoD_func.?, &copy_args, 3, "");
             }
         }
-        
+
         // 7. Create kernel arguments array with simple GPU device pointers
         const ptr_ptr_type = LLVM.LLVMPointerType(ptr_type, 0);
-        
+
         // For simple CUDA kernels, just pass device pointers directly
         // The PTX kernel expects simple u64 parameters, not complex memref descriptors
         var kernel_param_ptrs = std.ArrayList(LLVM.LLVMValueRef).init(self.allocator);
         defer kernel_param_ptrs.deinit();
-        
+
         var tensor_param_idx: usize = 0;
         for (func.parameters) |param| {
             if (param.type == .tensor) {
                 const gpu_ptr_val = LLVM.LLVMBuildLoad2(self.builder, ptr_type, gpu_ptrs.items[tensor_param_idx], "gpu_ptr_val");
-                
+
                 // Allocate space for the device pointer value and store it
                 const param_ptr = LLVM.LLVMBuildAlloca(self.builder, ptr_type, "param_ptr");
                 _ = LLVM.LLVMBuildStore(self.builder, gpu_ptr_val, param_ptr);
-                
+
                 // Add pointer to this device pointer value to the parameter array
                 try kernel_param_ptrs.append(param_ptr);
-                
+
                 tensor_param_idx += 1;
             }
         }
-        
+
         // Create array of parameter pointers (should be 2 elements for 2 tensors)
         const param_array_type = LLVM.LLVMArrayType(ptr_type, @intCast(kernel_param_ptrs.items.len));
         const param_array = LLVM.LLVMBuildAlloca(self.builder, param_array_type, "param_array");
-        
+
         // Store each parameter pointer in the array
         for (kernel_param_ptrs.items, 0..) |param_ptr, i| {
             var indices = [_]LLVM.LLVMValueRef{ LLVM.LLVMConstInt(int32_type, 0, 0), LLVM.LLVMConstInt(int32_type, @intCast(i), 0) };
             const elem_ptr = LLVM.LLVMBuildGEP2(self.builder, param_array_type, param_array, &indices, 2, "param_elem_ptr");
             _ = LLVM.LLVMBuildStore(self.builder, param_ptr, elem_ptr);
         }
-        
+
         // Cast to void** for cuLaunchKernel
         const kernel_args = LLVM.LLVMBuildBitCast(self.builder, param_array, ptr_ptr_type, "kernel_args");
-        
+
         // 3. Launch kernel
         const grid_x = LLVM.LLVMConstInt(int32_type, 1, 0);
         const grid_y = LLVM.LLVMConstInt(int32_type, 1, 0);
@@ -2227,19 +2245,19 @@ pub const CodeGen = struct {
         const shared_mem = LLVM.LLVMConstInt(int32_type, 0, 0);
         const stream = LLVM.LLVMConstNull(ptr_type);
         const extra = LLVM.LLVMConstNull(ptr_type);
-        
+
         var launch_args = [_]LLVM.LLVMValueRef{ kernel_func, grid_x, grid_y, grid_z, block_x, block_y, block_z, shared_mem, stream, kernel_args, extra };
         _ = LLVM.LLVMBuildCall2(self.builder, cuLaunchKernel_type, cuLaunchKernel_func.?, &launch_args, 11, "launch_result");
-        
+
         // 4. Synchronize to wait for kernel completion
         _ = LLVM.LLVMBuildCall2(self.builder, cuCtxSynchronize_type, cuCtxSynchronize_func.?, null, 0, "sync_result");
-        
+
         // 9. Copy results back from GPU to host
         for (func.parameters, 0..) |param, i| {
             if (param.type == .tensor) {
                 const llvm_param = LLVM.LLVMGetParam(llvm_function, @intCast(i));
                 const gpu_ptr = gpu_ptrs.items[i];
-                
+
                 const elem_size: u32 = switch (param.type.tensor.element_type.*) {
                     .f32 => 4,
                     .i32 => 4,
@@ -2248,19 +2266,19 @@ pub const CodeGen = struct {
                     else => 4,
                 };
                 const tensor_size = LLVM.LLVMConstInt(size_t_type, param.type.tensor.shape[0] * elem_size, 0);
-                
+
                 const gpu_ptr_val = LLVM.LLVMBuildLoad2(self.builder, ptr_type, gpu_ptr, "gpu_ptr_val");
                 const host_ptr = LLVM.LLVMBuildBitCast(self.builder, llvm_param, ptr_type, "host_ptr");
-                
+
                 var copy_back_args = [_]LLVM.LLVMValueRef{ host_ptr, gpu_ptr_val, tensor_size };
                 _ = LLVM.LLVMBuildCall2(self.builder, cuMemcpyDtoH_type, cuMemcpyDtoH_func.?, &copy_back_args, 3, "");
-                
+
                 // 10. Free GPU memory
                 var free_args = [_]LLVM.LLVMValueRef{gpu_ptr_val};
                 _ = LLVM.LLVMBuildCall2(self.builder, cuMemFree_type, cuMemFree_func.?, &free_args, 1, "");
             }
         }
-        
+
         // 5. Handle return value
         if (func.return_type == .void) {
             _ = LLVM.LLVMBuildRetVoid(self.builder);
@@ -2269,37 +2287,26 @@ pub const CodeGen = struct {
             if (func.parameters.len > 0 and func.parameters[0].type == .tensor) {
                 const first_param = LLVM.LLVMGetParam(llvm_function, 0);
                 var indices = [_]LLVM.LLVMValueRef{zero};
-                const first_elem_ptr = LLVM.LLVMBuildGEP2(self.builder, 
-                    func.parameters[0].type.toLLVMType(self.context), 
-                    first_param, 
-                    &indices, 
-                    1, 
-                    "first_elem_ptr"
-                );
-                const first_elem = LLVM.LLVMBuildLoad2(self.builder, 
-                    func.return_type.toLLVMType(self.context), 
-                    first_elem_ptr, 
-                    "first_elem"
-                );
+                const first_elem_ptr = LLVM.LLVMBuildGEP2(self.builder, self.toLLVMType(func.parameters[0].type), first_param, &indices, 1, "first_elem_ptr");
+                const first_elem = LLVM.LLVMBuildLoad2(self.builder, self.toLLVMType(func.return_type), first_elem_ptr, "first_elem");
                 _ = LLVM.LLVMBuildRet(self.builder, first_elem);
             } else {
                 // Return dummy value if no tensor parameters
-            const return_value = switch (func.return_type) {
-                .i32 => LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 0, 0),
-                .i64 => LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), 0, 0),
-                .f32 => LLVM.LLVMConstReal(LLVM.LLVMFloatTypeInContext(self.context), 0.0),
-                .f64 => LLVM.LLVMConstReal(LLVM.LLVMDoubleTypeInContext(self.context), 0.0),
-                else => LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 0, 0),
-            };
-            _ = LLVM.LLVMBuildRet(self.builder, return_value);
+                const return_value = switch (func.return_type) {
+                    .i32 => LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 0, 0),
+                    .i64 => LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), 0, 0),
+                    .f32 => LLVM.LLVMConstReal(LLVM.LLVMFloatTypeInContext(self.context), 0.0),
+                    .f64 => LLVM.LLVMConstReal(LLVM.LLVMDoubleTypeInContext(self.context), 0.0),
+                    else => LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 0, 0),
+                };
+                _ = LLVM.LLVMBuildRet(self.builder, return_value);
+            }
         }
-        }
-        
+
         if (self.verbose) {
             std.debug.print("✅ CUDA kernel launch generated for {s} (using global context/module)\n", .{func.name});
         }
     }
-
 };
 
 fn generateSimpleEntryPoint(module: LLVM.LLVMModuleRef, context: LLVM.LLVMContextRef, builder: LLVM.LLVMBuilderRef, main_func: LLVM.LLVMValueRef) !LLVM.LLVMValueRef {

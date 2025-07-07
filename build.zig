@@ -8,35 +8,35 @@ fn copyCudaStubFiles(b: *std.Build) void {
         return;
     };
     defer b.allocator.free(cuda_include_dir);
-    
+
     const cuda_lib_dir = std.process.getEnvVarOwned(b.allocator, "CUDA_LIB_DIR") catch {
         std.debug.print("🔧 CUDA_LIB_DIR not found, skipping CUDA stub file copying\n", .{});
         return;
     };
     defer b.allocator.free(cuda_lib_dir);
-    
+
     // Create destination directories
     std.fs.cwd().makePath("src/cuda_stub/include") catch {};
     std.fs.cwd().makePath("src/cuda_stub/lib") catch {};
-    
+
     // Copy CUDA header
     const src_header = std.fmt.allocPrint(b.allocator, "{s}/cuda.h", .{cuda_include_dir}) catch return;
     defer b.allocator.free(src_header);
-    
+
     std.fs.cwd().copyFile(src_header, std.fs.cwd(), "src/cuda_stub/include/cuda.h", .{}) catch |err| {
         std.debug.print("⚠️  Failed to copy CUDA header: {}\n", .{err});
         return;
     };
-    
+
     // Copy CUDA stub library
     const src_lib = std.fmt.allocPrint(b.allocator, "{s}/stubs/libcuda.so", .{cuda_lib_dir}) catch return;
     defer b.allocator.free(src_lib);
-    
+
     std.fs.cwd().copyFile(src_lib, std.fs.cwd(), "src/cuda_stub/lib/libcuda.so", .{}) catch |err| {
         std.debug.print("⚠️  Failed to copy CUDA stub library: {}\n", .{err});
         return;
     };
-    
+
     std.debug.print("✅ CUDA stub files copied to src/cuda_stub/ during build\n", .{});
 }
 
@@ -208,7 +208,7 @@ fn createLinking(b: *std.Build, exe: *std.Build.Step.Compile, llvm_include_dir: 
 pub fn build(b: *std.Build) !void {
     // Copy CUDA stub files at build time
     copyCudaStubFiles(b);
-    
+
     // Standard target options allows the person running `zig build` to choose
     // what target to build for. Here we do not override the defaults, which
     // means any target is allowed, and the default is native. Other options
@@ -269,17 +269,17 @@ pub fn build(b: *std.Build) !void {
     // Add our custom GPU to NVVM wrapper to main dcc build
     const mlir_include_dir_main = std.process.getEnvVarOwned(b.allocator, "MLIR_INCLUDE_DIR") catch null;
     const mlir_lib_dir_main = std.process.getEnvVarOwned(b.allocator, "MLIR_LIB_DIR") catch null;
-    
+
     if (mlir_include_dir_main != null and mlir_lib_dir_main != null) {
         defer b.allocator.free(mlir_include_dir_main.?);
         defer b.allocator.free(mlir_lib_dir_main.?);
-        
+
         // Add our GPU to NVVM wrapper for main dcc
         exe.addCSourceFile(.{
             .file = b.path("src/gpu_to_nvvm_wrapper.cpp"),
             .flags = &.{"-std=c++17"},
         });
-        
+
         // Add include path for our wrapper header
         exe.addIncludePath(.{ .cwd_relative = "src" });
     }
@@ -313,17 +313,17 @@ pub fn build(b: *std.Build) !void {
     // Add our custom GPU to NVVM wrapper for emit_ptx
     const mlir_include_dir = std.process.getEnvVarOwned(b.allocator, "MLIR_INCLUDE_DIR") catch null;
     const mlir_lib_dir = std.process.getEnvVarOwned(b.allocator, "MLIR_LIB_DIR") catch null;
-    
+
     if (mlir_include_dir != null and mlir_lib_dir != null) {
         defer b.allocator.free(mlir_include_dir.?);
         defer b.allocator.free(mlir_lib_dir.?);
-        
+
         // Add our GPU to NVVM wrapper
         emit_ptx_exe.addCSourceFile(.{
             .file = b.path("src/gpu_to_nvvm_wrapper.cpp"),
             .flags = &.{"-std=c++17"},
         });
-        
+
         // Add include path for our wrapper header
         emit_ptx_exe.addIncludePath(.{ .cwd_relative = "src" });
     }
@@ -349,52 +349,6 @@ pub fn build(b: *std.Build) !void {
     // Install cuda_llvm_ir_test executable
     b.installArtifact(cuda_llvm_ir_test_exe);
 
-    // Create CUDA test executable (cross-compile to x86_64-linux)
-    const linux_target = b.resolveTargetQuery(.{
-        .cpu_arch = .x86_64,
-        .os_tag = .linux,
-        .abi = .gnu,
-    });
-
-    const cuda_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/dcc_cuda_test.zig"),
-        .target = linux_target,
-        .optimize = optimize,
-    });
-
-    const cuda_test_exe = b.addExecutable(.{
-        .name = "dcc_cuda_test",
-        .root_module = cuda_test_mod,
-    });
-
-    // CUDA test only needs basic C/C++ linking, not LLVM/MLIR
-    cuda_test_exe.linkLibC();
-
-    // Add CUDA-specific linking for the test
-    if (cuda_include_dir != null and cuda_lib_dir != null) {
-        cuda_test_exe.addIncludePath(.{ .cwd_relative = cuda_include_dir.? });
-        cuda_test_exe.addLibraryPath(.{ .cwd_relative = cuda_lib_dir.? });
-
-        // Add stub directory for libcuda.so (driver API)
-        if (cuda_stub_dir != null) {
-            cuda_test_exe.addLibraryPath(.{ .cwd_relative = cuda_stub_dir.? });
-        }
-
-        cuda_test_exe.linkSystemLibrary("cuda"); // libcuda.so (from stubs)
-        cuda_test_exe.linkSystemLibrary("cudart"); // libcudart.so
-        // std.debug.print("CUDA test executable will be linked with CUDA libraries\n", .{});
-        // std.debug.print("CUDA Headers: {s}\n", .{cuda_include_dir.?});
-        // std.debug.print("CUDA Libraries: {s}\n", .{cuda_lib_dir.?});
-        // if (cuda_stub_dir != null) {
-        //     std.debug.print("CUDA Stubs: {s}\n", .{cuda_stub_dir.?});
-        // }
-    } else {
-        // std.debug.print("CUDA cross-compilation not available for test executable\n", .{});
-    }
-
-    // Install CUDA test executable
-    b.installArtifact(cuda_test_exe);
-
     // Create run step for emit_ptx
     const run_emit_ptx_cmd = b.addRunArtifact(emit_ptx_exe);
     run_emit_ptx_cmd.step.dependOn(b.getInstallStep());
@@ -416,13 +370,6 @@ pub fn build(b: *std.Build) !void {
 
     const run_cuda_llvm_ir_test_step = b.step("cuda-llvm-ir-test", "Run the CUDA LLVM IR generator test");
     run_cuda_llvm_ir_test_step.dependOn(&run_cuda_llvm_ir_test_cmd.step);
-
-    // Create run step for CUDA test
-    const run_cuda_test_cmd = b.addRunArtifact(cuda_test_exe);
-    run_cuda_test_cmd.step.dependOn(b.getInstallStep());
-
-    const run_cuda_test_step = b.step("cuda-test", "Run the CUDA cross-compilation test");
-    run_cuda_test_step.dependOn(&run_cuda_test_cmd.step);
 
     // This *creates* a Run step in the build graph, to be executed when another
     // step is evaluated that depends on it. The next line below will establish
