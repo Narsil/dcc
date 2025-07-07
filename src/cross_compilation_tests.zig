@@ -12,10 +12,10 @@ const targets = [_]Target{
         .target = "x86_64-unknown-linux-gnu",
         .remote = "home",
     },
-    // Target{
-    //     .target = "arm64-apple-darwin",
-    //     .remote = "laptop",
-    // },
+    Target{
+        .target = "arm64-apple-darwin",
+        .remote = "laptop",
+    },
 };
 
 const GpuTarget = struct {
@@ -30,10 +30,6 @@ const gpu_targets = [_]GpuTarget{
         .remote = "home",
         .gpu = "nvidia-ptx-sm50",
     },
-    // Target{
-    //     .target = "arm64-apple-darwin",
-    //     .remote = "laptop",
-    // },
 };
 
 test "type system - different integer types" {
@@ -124,13 +120,19 @@ fn assertCrossCompiles(allocator: std.mem.Allocator, source: []const u8, filenam
         defer allocator.free(remote_binary_path);
 
         {
-            const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ "scp", local_binary_path, target.remote } });
+            const remote = try std.fmt.allocPrint(allocator, "{s}:", .{target.remote});
+            defer allocator.free(remote);
+            const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ "scp", local_binary_path, remote } });
             defer allocator.free(out.stdout);
             defer allocator.free(out.stderr);
             switch (out.term) {
                 .Exited => |term| {
+                    if (term == 255) {
+                        std.debug.print("Skipping host check, host {s} - {s} is unreachable\n", .{ target.remote, target.target });
+                        return;
+                    }
                     if (term != 0) {
-                        std.debug.print("Expected exit code {}, got {}\n", .{ expected, term });
+                        std.debug.print("Failed to SCP\n", .{});
                         std.debug.print("stdout: {s}\n", .{out.stdout});
                         std.debug.print("stderr: {s}\n", .{out.stderr});
                         return error.UnexpectedExitCode;
