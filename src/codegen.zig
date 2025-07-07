@@ -187,6 +187,10 @@ pub const CodeGen = struct {
     }
 
     pub fn generate(self: *CodeGen, ast: parser.ASTNode) CodeGenError!void {
+        return self.generateWithMode(ast, .executable);
+    }
+
+    pub fn generateWithMode(self: *CodeGen, ast: parser.ASTNode, mode: enum { executable, library }) CodeGenError!void {
         // Generate LLVM IR for the program AST node
         switch (ast) {
             .program => |prog| {
@@ -230,7 +234,8 @@ pub const CodeGen = struct {
                     }
                 }
                 
-                if (!main_processed) {
+                // Only require main function for executable mode
+                if (mode == .executable and !main_processed) {
                     return error.MissingMainFunction;
                 }
                 // No need for _start function - using main directly as entry point
@@ -357,11 +362,6 @@ pub const CodeGen = struct {
             try self.generateNode(stmt);
         }
 
-        // Add CUDA cleanup for main function before return
-        if (is_main and self.hasGpuFunctions()) {
-            try self.injectCudaCleanupBeforeReturn();
-        }
-
         // Ensure void functions have proper terminators
         // Check if the current basic block has a terminator
         const current_block = LLVM.LLVMGetInsertBlock(self.builder);
@@ -387,6 +387,7 @@ pub const CodeGen = struct {
         }
 
         // Clear variables after function generation to avoid conflicts
+        // Functions should persist across the entire compilation process
         self.clearVariables();
     }
 
@@ -405,6 +406,18 @@ pub const CodeGen = struct {
     }
 
     fn generateReturn(self: *CodeGen, ret: @TypeOf(@as(parser.ASTNode, undefined).return_statement)) CodeGenError!void {
+        // Check if we're in the main function with GPU functions - if so, inject cleanup before return
+        const current_function = LLVM.LLVMGetBasicBlockParent(LLVM.LLVMGetInsertBlock(self.builder));
+        const function_name = LLVM.LLVMGetValueName(current_function);
+        const is_main = std.mem.eql(u8, std.mem.span(function_name), "main");
+        
+        if (is_main and self.hasGpuFunctions()) {
+            if (self.verbose) {
+                std.debug.print("🧹 Injecting CUDA cleanup before return in main function\n", .{});
+            }
+            try self.injectCudaCleanupBeforeReturn();
+        }
+        
         if (ret.value) |value| {
             const llvm_value = try self.generateExpression(value.*);
             _ = LLVM.LLVMBuildRet(self.builder, llvm_value);
@@ -1485,6 +1498,15 @@ pub const CodeGen = struct {
         self.variables.clearAndFree();
     }
 
+    pub fn clearFunctions(self: *CodeGen) void {
+        // Free all duplicated strings used as keys in the functions HashMap
+        var func_iter = self.functions.iterator();
+        while (func_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.functions.clearAndFree();
+    }
+
     // Helper function to set stack alignment attributes on functions
     fn setStackAlignmentAttributes(self: *CodeGen, function: LLVM.LLVMValueRef) void {
         // Set stack realignment for x86-64 System V ABI compliance
@@ -1575,16 +1597,8 @@ pub const CodeGen = struct {
             }
         }
 
-        // Create function type
-        const actual_return_type = func.return_type.toLLVMType(self.context);
-        const function_type = LLVM.LLVMFunctionType(actual_return_type, param_types.ptr, @intCast(param_types.len), 0);
-
-        // Create function
-        const name_z = try self.allocator.dupeZ(u8, func.name);
-        defer self.allocator.free(name_z);
-
-        const llvm_function = LLVM.LLVMAddFunction(self.module, name_z.ptr, function_type);
-        try self.functions.put(try self.allocator.dupe(u8, func.name), llvm_function);
+        // Get the already declared function instead of creating a new one
+        const llvm_function = self.functions.get(func.name) orelse return error.UndefinedFunction;
 
         // Create entry basic block
         const entry_block = LLVM.LLVMAppendBasicBlockInContext(self.context, llvm_function, "entry");
@@ -1917,26 +1931,8 @@ pub const CodeGen = struct {
         var device_reset_args = [_]LLVM.LLVMValueRef{zero};
         _ = LLVM.LLVMBuildCall2(self.builder, cuDevicePrimaryCtxReset_type, cuDevicePrimaryCtxReset_func, &device_reset_args, 1, "");
         
-        // Force exit to terminate persistent CUDA background threads  
-        // This ensures all threads (including CUDA daemon threads) are terminated
-        // Use Linux syscall directly for cross-compilation compatibility
-        const int64_type = LLVM.LLVMInt64TypeInContext(self.context);
-        const syscall_param_types = [_]LLVM.LLVMTypeRef{int64_type};
-        const syscall_asm_ty = LLVM.LLVMFunctionType(void_type, @constCast(&syscall_param_types[0]), 1, 0);
-        const asm_str = "mov $0, %rdi\n mov $$231, %rax\nsyscall"; // rax=231 (SYS_exit_group), rdi=status
-        
-        const syscall_inline = LLVM.LLVMGetInlineAsm(syscall_asm_ty, asm_str, asm_str.len, "r", 1, // single general-purpose register input
-            1, // has side effects
-            0, // align stack  
-            0, // ATT dialect
-            0 // can throw
-        );
-        
-        const zero_64 = LLVM.LLVMConstInt(int64_type, 0, 0);
-        _ = LLVM.LLVMBuildCall2(self.builder, syscall_asm_ty, syscall_inline, @constCast(&[_]LLVM.LLVMValueRef{zero_64}), 1, "");
-        
-        // Add unreachable since exit() terminates the program
-        _ = LLVM.LLVMBuildUnreachable(self.builder);
+        // Return void to let the main function return with its intended exit code
+        _ = LLVM.LLVMBuildRetVoid(self.builder);
         
         // Restore builder position
         if (old_position != null) {

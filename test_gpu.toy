@@ -1,9 +1,9 @@
-fn gpu_vector_add(a: [1024]f32, b: [1024]f32) void {
+fn gpu_vector_add(a: [1024]f32, b: [1024]f32) void{
     a[i] = a[i] + b[i];
 }
-
-fn main() void {
+fn main() i32 {
     let a: [1024]f32 = [1024]f32{2f32};
     let b: [1024]f32 = [1024]f32{4f32};
     gpu_vector_add(a, b);
+    return 2i32;
 } 

@@ -215,10 +215,6 @@ pub fn main() !void {
                 std.debug.print("Error: Main function not found\n", .{});
                 std.process.exit(1);
             },
-            codegen.CodeGenError.MissingMainFunction => {
-                std.debug.print("Error: Missing main function\n", .{});
-                std.process.exit(1);
-            },
             codegen.CodeGenError.LinkingFailed => {
                 std.debug.print("Error: Linking failed\n", .{});
                 std.process.exit(1);
@@ -327,7 +323,13 @@ fn compile(allocator: std.mem.Allocator, source_file: []const u8, target_triple:
     var code_gen = try codegen.CodeGen.init(allocator, "toy_program", verbose, gpu_triplet);
     defer code_gen.deinit();
 
-    try code_gen.generate(ast);
+    // Choose compilation mode based on presence of main function
+    if (has_main) {
+        try code_gen.generateWithMode(ast, .executable);
+    } else {
+        try code_gen.generateWithMode(ast, .library);
+    }
+    
     if (verbose) {
         code_gen.printIR();
     }

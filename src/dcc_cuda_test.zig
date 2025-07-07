@@ -132,27 +132,27 @@ pub fn main() !void {
 
     // Set up test data
     const array_size: u32 = 1024;
-    const byte_size: usize = array_size * @sizeOf(f32);
+    const byte_size: usize = array_size * @sizeOf(i32);
 
-    std.debug.print("Setting up test data (arrays of {d} f32 elements)...\n", .{array_size});
+    std.debug.print("Setting up test data (arrays of {d} i32 elements)...\n", .{array_size});
 
     // Allocate host memory
     var allocator = std.heap.page_allocator;
-    const host_a = try allocator.alloc(f32, array_size);
-    const host_b = try allocator.alloc(f32, array_size);
-    const host_a_original = try allocator.alloc(f32, array_size); // Save original for verification
+    const host_a = try allocator.alloc(i32, array_size);
+    const host_b = try allocator.alloc(i32, array_size);
+    const host_a_original = try allocator.alloc(i32, array_size); // Save original for verification
     defer allocator.free(host_a);
     defer allocator.free(host_b);
     defer allocator.free(host_a_original);
 
     // Initialize test data
     for (0..array_size) |i| {
-        host_a[i] = @floatFromInt(i); // a = [0, 1, 2, 3, ...]
-        host_b[i] = @floatFromInt(i * 2); // b = [0, 2, 4, 6, ...]
+        host_a[i] = @intCast(i); // a = [0, 1, 2, 3, ...]
+        host_b[i] = @intCast(i * 2); // b = [0, 2, 4, 6, ...]
         host_a_original[i] = host_a[i]; // Save original a values
     }
 
-    std.debug.print("Test vectors initialized: a[0:3] = [{d:.1}, {d:.1}, {d:.1}, ...], b[0:3] = [{d:.1}, {d:.1}, {d:.1}, ...]\n", .{ host_a[0], host_a[1], host_a[2], host_b[0], host_b[1], host_b[2] });
+    std.debug.print("Test vectors initialized: a[0:3] = [{d}, {d}, {d}, ...], b[0:3] = [{d}, {d}, {d}, ...]\n", .{ host_a[0], host_a[1], host_a[2], host_b[0], host_b[1], host_b[2] });
     std.debug.print("In-place addition: a[i] will be updated to a[i] + b[i]\n", .{});
 
     // Allocate GPU memory
@@ -201,8 +201,8 @@ pub fn main() !void {
     for (0..@min(10, array_size)) |i| {
         const expected = host_a_original[i] + host_b[i]; // original_a[i] + b[i]
         const actual = host_a[i]; // modified a[i]
-        std.debug.print("  a[{d}] = {d:.1} (expected {d:.1} = {d:.1} + {d:.1}) {s}\n", .{ i, actual, expected, host_a_original[i], host_b[i], if (@abs(actual - expected) < 0.001) "✅" else "❌" });
-        if (@abs(actual - expected) >= 0.001) errors += 1;
+        std.debug.print("  a[{d}] = {d} (expected {d} = {d} + {d}) {s}\n", .{ i, actual, expected, host_a_original[i], host_b[i], if (actual == expected) "✅" else "❌" });
+        if (actual != expected) errors += 1;
     }
 
     if (errors == 0) {
