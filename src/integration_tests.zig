@@ -519,8 +519,7 @@ test "type system - tensor float" {
         \\ }
     ;
 
-    try assertCompiles(allocator, test_source, "test_tensor.toy");
-    try assertReturns(allocator, 3);
+    try assertCompileFailure(allocator, test_source, "test_tensor_float.toy", "main function cannot return f32", " fn main() f32 {");
 
     std.debug.print("Tensor float test passed\n", .{});
 }
@@ -803,6 +802,20 @@ test "void functions - basic void function" {
     try assertReturns(allocator, 0);
 
     std.debug.print("Basic void function test passed\n", .{});
+}
+
+test "void functions - float main" {
+    const allocator = std.testing.allocator;
+
+    const test_source =
+        \\fn main() f32 {
+        \\    return 2f32;
+        \\}
+    ;
+
+    try assertCompileFailure(allocator, test_source, "test_float_main.toy", "main function cannot return f32", "fn main() f32 {");
+
+    std.debug.print("Float main function error test passed\n", .{});
 }
 
 test "void functions - void function with variables" {

@@ -149,6 +149,21 @@ CUresult cuModuleUnload(CUmodule hmod) {
     return CUDA_SUCCESS;
 }
 
+CUresult cuDevicePrimaryCtxReset(CUdevice dev) {
+    STUB_LOG("cuDevicePrimaryCtxReset(dev=%d)\n", dev);
+    
+    if (!g_initialized) {
+        return CUDA_ERROR_NOT_INITIALIZED;
+    }
+    
+    if (dev < MOCK_DEVICE_BASE || dev >= MOCK_DEVICE_BASE + g_device_count) {
+        return CUDA_ERROR_INVALID_DEVICE;
+    }
+    
+    STUB_LOG("Mock device primary context reset: %d\n", dev);
+    return CUDA_SUCCESS;
+}
+
 CUresult cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const char *name) {
     STUB_LOG("cuModuleGetFunction(hfunc=%p, hmod=%p, name=%s)\n", hfunc, hmod, name ? name : "NULL");
     

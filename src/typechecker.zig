@@ -18,6 +18,7 @@ pub const TypeCheckError = error{
     InvalidBinaryOperation,
     InvalidUnaryOperation,
     InvalidVariableType,
+    InvalidMainFunctionReturnType,
 } || std.mem.Allocator.Error;
 
 pub const FunctionSignature = struct {
@@ -172,6 +173,16 @@ pub const TypeChecker = struct {
                 std.debug.print("Error at line {}, column {}: Must return value from non-void function '{s}'\n", .{ func_pos.line, func_pos.column, func.name });
                 self.printSourceContext(func.offset);
                 return error.InvalidReturnType;
+            }
+        }
+
+        // Check for invalid main function return type
+        if (std.mem.eql(u8, func.name, "main")) {
+            if (func.return_type == .f32) {
+                const pos = self.getPositionFromOffset(func.offset);
+                std.debug.print("Error at line {}, column {}: main function cannot return f32\n", .{ pos.line, pos.column });
+                self.printSourceContext(func.offset);
+                return error.InvalidMainFunctionReturnType;
             }
         }
 

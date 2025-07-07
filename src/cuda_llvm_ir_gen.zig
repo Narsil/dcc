@@ -649,7 +649,8 @@ pub const CudaLLVMIRGen = struct {
             std.debug.print("🔧 Generating PTX data constant: {s} ({d} bytes)\n", .{ name, ptx_content.len });
         }
 
-        // Create string constant
+        // Create string constant - the `0` parameter tells LLVM to add null terminator
+        // This is CRITICAL for cuModuleLoadData which expects null-terminated PTX
         const ptx_string = LLVM.LLVMConstStringInContext(self.context, ptx_content.ptr, @intCast(ptx_content.len), 0);
 
         // Create global variable
@@ -663,7 +664,7 @@ pub const CudaLLVMIRGen = struct {
         LLVM.LLVMSetLinkage(global_var, LLVM.LLVMPrivateLinkage);
 
         if (self.verbose) {
-            std.debug.print("✅ Generated PTX data constant: {s}\n", .{name});
+            std.debug.print("✅ Generated PTX data constant: {s} (null-terminated)\n", .{name});
         }
 
         return global_var;

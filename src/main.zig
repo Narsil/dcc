@@ -261,6 +261,10 @@ pub fn main() !void {
                 // Type checker already prints the error message, just exit
                 std.process.exit(1);
             },
+            typechecker.TypeCheckError.InvalidMainFunctionReturnType => {
+                // Type checker already prints the error message, just exit
+                std.process.exit(1);
+            },
             else => {
                 // For any other errors, re-raise to get stack trace (unhandled errors)
                 return err;

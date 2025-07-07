@@ -143,7 +143,7 @@ fn linkAllStaticLibraries(_: *std.Build, exe: *std.Build.Step.Compile, lib_dir: 
 
 fn createLinking(b: *std.Build, exe: *std.Build.Step.Compile, llvm_include_dir: []u8, llvm_lib_dir: []u8, lld_include_dir: []u8, lld_lib_dir: []u8, use_wrapper: bool) !void {
     // Copy build configuration to tests
-    exe.linkLibC();
+    // exe.linkLibC();  // Removed - using Linux syscalls directly, no libc needed
     exe.linkLibCpp();
 
     // Auto-link all LLVM static libraries
