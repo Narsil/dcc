@@ -75,6 +75,23 @@ test "type system - tensor gpu" {
     try assertGpuCrossCompiles(allocator, test_source, "test_cross_tensors.toy", 6);
 }
 
+test "type system - tensor gpu stacked" {
+    const allocator = std.testing.allocator;
+    // Create a test file with different integer types
+    const test_source =
+        \\fn gpu_vector_mul(a: [1024]i32, b: [1024]i32) void{
+        \\    a[i] = a[i] * b[i];
+        \\}
+        \\fn main() i32 {
+        \\    let a: [1024]i32 = [1024]i32{2i32};
+        \\    let b: [1024]i32 = [1024]i32{4i32};
+        \\    gpu_vector_mul(a, b);
+        \\    return a[0];
+        \\} 
+    ;
+    try assertGpuCrossCompiles(allocator, test_source, "test_cross_tensors_stacked.toy", 8);
+}
+
 fn assertCrossCompiles(allocator: std.mem.Allocator, source: []const u8, filename: []const u8, expected: u32) !void {
     for (targets) |target| {
         const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
@@ -209,7 +226,9 @@ fn assertGpuCrossCompiles(allocator: std.mem.Allocator, source: []const u8, file
         defer allocator.free(remote_binary_path);
 
         {
-            const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ "scp", local_binary_path, target.remote } });
+            const remote = try std.fmt.allocPrint(allocator, "{s}:", .{target.remote});
+            defer allocator.free(remote);
+            const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ "scp", local_binary_path, remote } });
             switch (out.term) {
                 .Exited => |term| {
                     if (term != 0) {
