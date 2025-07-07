@@ -104,7 +104,7 @@ fn buildLldWrapper(b: *std.Build, llvm_include_dir: []u8, lld_include_dir: []u8,
 }
 
 // Auto-link all static libraries in a directory matching a prefix
-fn linkAllStaticLibraries(_: *std.Build, exe: *std.Build.Step.Compile, lib_dir: []const u8, prefix: []const u8) !void {
+fn linkAllStaticLibraries(_: *std.Build, exe: *std.Build.Step.Compile, lib_dir: []const u8, prefix: []const u8, exclusion_list: ?[]const []const u8) !void {
     // std.debug.print("🔍 Auto-discovering {s} libraries in: {s}\n", .{ prefix, lib_dir });
 
     var dir = std.fs.cwd().openDir(lib_dir, .{ .iterate = true }) catch |err| {
@@ -115,6 +115,7 @@ fn linkAllStaticLibraries(_: *std.Build, exe: *std.Build.Step.Compile, lib_dir: 
 
     var iterator = dir.iterate();
     var count: u32 = 0;
+    var excluded_count: u32 = 0;
 
     while (try iterator.next()) |entry| {
         if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".a")) {
@@ -126,19 +127,34 @@ fn linkAllStaticLibraries(_: *std.Build, exe: *std.Build.Step.Compile, lib_dir: 
                 // Extract library name: "libMLIRParser.a" -> "MLIRParser"
                 const lib_name = entry.name[3 .. entry.name.len - 2]; // Remove "lib" and ".a"
 
-                exe.linkSystemLibrary2(lib_name, .{ .preferred_link_mode = .static });
-                count += 1;
+                // Check if this library is in the exclusion list
+                var should_exclude = false;
+                if (exclusion_list) |exclusions| {
+                    for (exclusions) |excluded_lib| {
+                        if (std.mem.eql(u8, lib_name, excluded_lib)) {
+                            should_exclude = true;
+                            excluded_count += 1;
+                            // std.debug.print("  🚫 Excluded: {s}\n", .{lib_name});
+                            break;
+                        }
+                    }
+                }
 
-                if (count <= 5) { // Show first 5 for debugging
-                    // std.debug.print("  ✅ Linked: {s}\n", .{lib_name});
-                } else if (count == 6) {
-                    // std.debug.print("  ... (showing first 5, found more)\n", .{});
+                if (!should_exclude) {
+                    exe.linkSystemLibrary2(lib_name, .{ .preferred_link_mode = .static });
+                    count += 1;
+
+                    if (count <= 5) { // Show first 5 for debugging
+                        // std.debug.print("  ✅ Linked: {s}\n", .{lib_name});
+                    } else if (count == 6) {
+                        // std.debug.print("  ... (showing first 5, found more)\n", .{});
+                    }
                 }
             }
         }
     }
 
-    // std.debug.print("📚 Auto-linked {d} {s} libraries\n", .{ count, prefix });
+    // std.debug.print("📚 Auto-linked {d} {s} libraries ({d} excluded)\n", .{ count, prefix, excluded_count });
 }
 
 fn createLinking(b: *std.Build, exe: *std.Build.Step.Compile, llvm_include_dir: []u8, llvm_lib_dir: []u8, lld_include_dir: []u8, lld_lib_dir: []u8, use_wrapper: bool) !void {
@@ -147,7 +163,7 @@ fn createLinking(b: *std.Build, exe: *std.Build.Step.Compile, llvm_include_dir: 
     exe.linkLibCpp();
 
     // Auto-link all LLVM static libraries
-    try linkAllStaticLibraries(b, exe, llvm_lib_dir, "LLVM");
+    try linkAllStaticLibraries(b, exe, llvm_lib_dir, "LLVM", null);
     exe.linkSystemLibrary("z"); // zlib for compression (required by LLD)
     exe.linkSystemLibrary("xml2"); // zlib for compression (required by LLD)
     exe.linkSystemLibrary("Polly"); // zlib for compression (required by LLD)
@@ -170,7 +186,10 @@ fn createLinking(b: *std.Build, exe: *std.Build.Step.Compile, llvm_include_dir: 
         exe.addLibraryPath(.{ .cwd_relative = mlir_lib_dir.? });
 
         // Link ALL MLIR static libraries automatically
-        try linkAllStaticLibraries(b, exe, mlir_lib_dir.?, "MLIR");
+        const mlir_exclusions = [_][]const u8{
+            "MlirOptMain", // Exclude specific Main library
+        };
+        try linkAllStaticLibraries(b, exe, mlir_lib_dir.?, "MLIR", &mlir_exclusions);
         // std.debug.print("MLIR support enabled (auto-linked all static libraries)\n", .{});
     } else {
         // std.debug.print("MLIR support not available (MLIR_INCLUDE_DIR and MLIR_LIB_DIR not set)\n", .{});
@@ -191,7 +210,7 @@ fn createLinking(b: *std.Build, exe: *std.Build.Step.Compile, llvm_include_dir: 
 
         // Auto-link all LLD libraries
         exe.addLibraryPath(.{ .cwd_relative = lld_lib_dir });
-        try linkAllStaticLibraries(b, exe, lld_lib_dir, "lld");
+        try linkAllStaticLibraries(b, exe, lld_lib_dir, "lld", null);
         exe.linkSystemLibrary2("z", .{ .preferred_link_mode = .static }); // zlib for compression
         if (use_wrapper) {
             exe.addCSourceFile(.{
