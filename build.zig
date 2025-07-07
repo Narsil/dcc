@@ -50,19 +50,17 @@ fn buildLldWrapper(b: *std.Build, llvm_include_dir: []u8, lld_include_dir: []u8,
     const result = b.run(&command_args);
     const libstdcxx_path = std.mem.trim(u8, result, "\n");
 
-    // Step 1: Compile lld_wrapper.cpp to object file using g++ directly
-    const wrapper_obj_cmd = b.addSystemCommand(&.{ "g++", "-c", "-std=c++17", "-fPIC", "-O2", "-o", "lld_wrapper.o", "src/lld_wrapper.cpp" });
+    // Step 2: Create directory for build process
+    const mkdir_cmd = b.addSystemCommand(&.{ "mkdir", "-p", "comprehensive_build" });
 
+    // Step 3: Compile lld_wrapper.cpp to object file using g++ directly
+    const wrapper_obj_cmd = b.addSystemCommand(&.{ "g++", "-c", "-std=c++17", "-fPIC", "-O2", "-o", "lld_wrapper.o", "src/lld_wrapper.cpp" });
     // Add include paths
     const llvm_include_arg = b.fmt("-I{s}", .{llvm_include_dir});
     const lld_include_arg = b.fmt("-I{s}", .{lld_include_dir});
     wrapper_obj_cmd.addArg(llvm_include_arg);
     wrapper_obj_cmd.addArg(lld_include_arg);
-
-    // Step 2: Create directory for build process
-    const mkdir_cmd = b.addSystemCommand(&.{ "mkdir", "-p", "comprehensive_build" });
-
-    // Step 3: Create directory for build process
+    wrapper_obj_cmd.step.dependOn(&mkdir_cmd.step); // Ensure directory exists before compiling
 
     // Step 4: Use ld -r to combine all libraries with relocatable linking
     const ld_cmd = b.addSystemCommand(&.{ "ld", "-r", "-o", "comprehensive_build/combined.o" });

@@ -22,6 +22,7 @@
           pkgs = import nixpkgs {
             inherit system;
             config.allowUnfree = true;
+            config.cudaSupport = true;
           };
 
           # Cross-compilation packages for x86_64-linux
@@ -35,12 +36,21 @@
           default =
             with pkgs;
             mkShell {
-              nativeBuildInputs = with pkgs; [
-                pkg-config
-                # Cross-compilation tools
-                gcc
-                binutils
-              ];
+              nativeBuildInputs =
+                with pkgs;
+                [
+                  pkg-config
+                  # Cross-compilation tools
+                  gcc
+                  binutils
+                ]
+                ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+                  llvm
+                  lld
+                  llvmPackages.mlir
+                  clang
+                  busybox
+                ];
               buildInputs = with pkgs; [
                 zig
                 llvm
@@ -70,6 +80,7 @@
               CUDA_INCLUDE_DIR = "${pkgsCross.cudaPackages.cuda_cudart.dev}/include";
               CUDA_LIB_DIR = "${pkgsCross.cudaPackages.cuda_cudart.lib}/lib";
               CUDA_STUB_DIR = "${pkgsCross.cudaPackages.cuda_cudart.lib}/lib/stubs";
+              LD_LIBRARY_PATH = "/run/opengl-driver/lib";
 
             };
         }

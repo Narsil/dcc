@@ -773,24 +773,29 @@ pub const CodeGen = struct {
             break :blk triple;
         } else blk: {
             const default_triple = LLVM.LLVMGetDefaultTargetTriple();
-            // defer LLVM.LLVMDisposeMessage(default_triple);
-
-            // Normalize the target triple for known platforms
             const triple_str = std.mem.span(default_triple);
-            const normalized_triple = if (std.mem.startsWith(u8, triple_str, "arm64-apple-darwin"))
+            const triple_copy = try self.allocator.dupe(u8, triple_str);
+            std.debug.print("Target triple: {s}\n", .{triple_str});
+            LLVM.LLVMDisposeMessage(default_triple);
+
+            const normalized_triple = if (std.mem.startsWith(u8, triple_copy, "arm64-apple-darwin"))
                 "arm64-apple-darwin"
-            else if (std.mem.startsWith(u8, triple_str, "x86_64-apple-darwin"))
+            else if (std.mem.startsWith(u8, triple_copy, "x86_64-apple-darwin"))
                 "x86_64-apple-darwin"
-            else if (std.mem.startsWith(u8, triple_str, "x86_64-pc-linux"))
+            else if (std.mem.startsWith(u8, triple_copy, "x86_64-pc-linux"))
                 "x86_64-pc-linux-gnu"
             else
-                triple_str;
+                triple_copy;
 
+            std.debug.print("Target triple norm: {s}\n", .{normalized_triple});
             break :blk normalized_triple;
         };
+        defer self.allocator.free(final_triple);
 
         if (self.verbose) {
+            // Debug print for target triple value, length, and bytes
             std.debug.print("Target triple: {s}\n", .{final_triple});
+            std.debug.print("Target triple length: {d}\n", .{final_triple.len});
         }
 
         const triple_z = try self.allocator.dupeZ(u8, final_triple);
@@ -992,21 +997,22 @@ pub const CodeGen = struct {
             break :blk triple;
         } else blk: {
             const default_triple = LLVM.LLVMGetDefaultTargetTriple();
+            const triple_str = std.mem.span(default_triple);
+            const triple_copy = try self.allocator.dupe(u8, triple_str);
             defer LLVM.LLVMDisposeMessage(default_triple);
 
-            // Normalize the target triple for known platforms
-            const triple_str = std.mem.span(default_triple);
-            const normalized_triple = if (std.mem.startsWith(u8, triple_str, "arm64-apple-darwin"))
+            const normalized_triple = if (std.mem.startsWith(u8, triple_copy, "arm64-apple-darwin"))
                 "arm64-apple-darwin"
-            else if (std.mem.startsWith(u8, triple_str, "x86_64-apple-darwin"))
+            else if (std.mem.startsWith(u8, triple_copy, "x86_64-apple-darwin"))
                 "x86_64-apple-darwin"
-            else if (std.mem.startsWith(u8, triple_str, "x86_64-pc-linux"))
+            else if (std.mem.startsWith(u8, triple_copy, "x86_64-pc-linux"))
                 "x86_64-pc-linux-gnu"
             else
-                triple_str;
+                triple_copy;
 
             break :blk normalized_triple;
         };
+        defer self.allocator.free(final_triple);
 
         if (self.verbose) {
             std.debug.print("Target triple: {s}\n", .{final_triple});
