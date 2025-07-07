@@ -132,7 +132,8 @@ pub fn main() !void {
     var target_info: ?TargetInfo = null;
     defer if (target_info) |*info| info.deinit(allocator);
 
-    if (target_triple) |triple| {
+    var allocated_triplet: bool = false;
+    const final_triple = if (target_triple) |triple| blk: {
         target_info = TargetInfo.parseFromTriple(allocator, triple) catch |err| {
             std.debug.print("Error: Invalid target triplet '{s}': {}\n", .{ triple, err });
             return;
@@ -140,10 +141,23 @@ pub fn main() !void {
         if (verbose) {
             std.debug.print("Cross-compiling for target: {s} ({s}-{s})\n", .{ triple, target_info.?.arch, target_info.?.os });
         }
-    }
+        break :blk triple;
+    } else blk: {
+        const triplet = try codegen.CodeGen.default_triplet(allocator);
+        target_info = TargetInfo.parseFromTriple(allocator, triplet) catch |err| {
+            std.debug.print("Error: Invalid default target triplet '{s}': {}\n", .{ triplet, err });
+            return;
+        };
+        if (verbose) {
+            std.debug.print("Defaulting to target: {s} ({s}-{s})\n", .{ triplet, target_info.?.arch, target_info.?.os });
+        }
+        allocated_triplet = true;
+        break :blk triplet;
+    };
 
     // Wrap compilation in catch block to handle normal errors gracefully
-    const result = compile(allocator, source_file, target_triple, verbose, gpu_triplet);
+    const result = compile(allocator, source_file, final_triple, verbose, gpu_triplet);
+    if (allocated_triplet) allocator.free(final_triple);
     if (result) |_| {
         // Compilation successful
     } else |err| {
@@ -269,7 +283,7 @@ pub fn main() !void {
     }
 }
 
-fn compile(allocator: std.mem.Allocator, source_file: []const u8, target_triple: ?[]const u8, verbose: bool, gpu_triplet: ?[]const u8) !void {
+fn compile(allocator: std.mem.Allocator, source_file: []const u8, target_triple: []const u8, verbose: bool, gpu_triplet: ?[]const u8) !void {
     if (verbose) {
         std.debug.print("Compiling: {s}\n", .{source_file});
     }
@@ -320,31 +334,25 @@ fn compile(allocator: std.mem.Allocator, source_file: []const u8, target_triple:
     if (verbose) {
         std.debug.print("CodeGen\n", .{});
     }
+
     var code_gen = try codegen.CodeGen.init(allocator, "toy_program", verbose, gpu_triplet);
     defer code_gen.deinit();
 
     // Choose compilation mode based on presence of main function
     if (has_main) {
         try code_gen.generateWithMode(ast, .executable);
+        // Generate executable binary
+        const bin_file = "output";
+        try code_gen.generateExecutable(bin_file, target_triple);
     } else {
         try code_gen.generateWithMode(ast, .library);
+        // Generate shared library
+        const lib_file = "output";
+        try code_gen.generateSharedLibrary(lib_file, target_triple);
     }
 
     if (verbose) {
         code_gen.printIR();
-    }
-
-    // Use LLVM directly for linking (no need for external linker detection)
-    const actual_target_triple = if (target_triple) |triple| triple else null;
-
-    if (has_main) {
-        // Generate executable binary
-        const bin_file = "output";
-        try code_gen.generateExecutable(bin_file, actual_target_triple);
-    } else {
-        // Generate shared library
-        const lib_file = "output";
-        try code_gen.generateSharedLibrary(lib_file, actual_target_triple);
     }
 
     if (verbose) {

@@ -767,56 +767,33 @@ pub const CodeGen = struct {
         }
     }
 
-    pub fn generateExecutable(self: *CodeGen, output_path: []const u8, target_triple: ?[]const u8) CodeGenError!void {
-        // Use provided target triple or default to host triple
-        const final_triple = if (target_triple) |triple| blk: {
-            break :blk triple;
-        } else blk: {
-            const default_triple = LLVM.LLVMGetDefaultTargetTriple();
-            const triple_str = std.mem.span(default_triple);
-            const triple_copy = try self.allocator.dupe(u8, triple_str);
-            defer LLVM.LLVMDisposeMessage(default_triple);
-            defer self.allocator.free(triple_copy);
+    pub fn default_triplet(allocator: std.mem.Allocator) ![]u8 {
+        const default_triple = LLVM.LLVMGetDefaultTargetTriple();
+        const triple_str = std.mem.span(default_triple);
+        const triple_copy = try allocator.dupe(u8, triple_str);
+        defer LLVM.LLVMDisposeMessage(default_triple);
+        return triple_copy;
+    }
 
-            const normalized_triple = if (std.mem.startsWith(u8, triple_copy, "arm64-apple-darwin"))
-                "arm64-apple-darwin"
-            else if (std.mem.startsWith(u8, triple_copy, "x86_64-apple-darwin"))
-                "x86_64-apple-darwin"
-            else if (std.mem.startsWith(u8, triple_copy, "x86_64-pc-linux"))
-                "x86_64-pc-linux-gnu"
-            else
-                triple_copy;
-
-            break :blk normalized_triple;
-        };
-
-        if (self.verbose) {
-            // Debug print for target triple value, length, and bytes
-            std.debug.print("Target triple: {s}\n", .{final_triple});
-            std.debug.print("Target triple length: {d}\n", .{final_triple.len});
-        }
-
-        const triple_z = try self.allocator.dupeZ(u8, final_triple);
-        defer self.allocator.free(triple_z);
-
+    pub fn generateExecutable(self: *CodeGen, output_path: []const u8, target_triplet: []const u8) CodeGenError!void {
         var target: LLVM.LLVMTargetRef = null;
         var error_message: [*c]u8 = undefined;
 
-        if (LLVM.LLVMGetTargetFromTriple(triple_z.ptr, &target, &error_message) != 0) {
+        if (LLVM.LLVMGetTargetFromTriple(target_triplet.ptr, &target, &error_message) != 0) {
             defer LLVM.LLVMDisposeMessage(error_message);
             std.debug.print("Error getting target: {s}\n", .{error_message});
-            std.debug.print("Tried target triple: {s}\n", .{final_triple});
+            std.debug.print("Tried target triple: {s}\n", .{target_triplet});
             return error.TargetError;
         }
 
         // Temporarily disable _start function to test main computation alignment
-        const is_linux = std.mem.indexOf(u8, final_triple, "linux") != null;
+        const is_linux = std.mem.indexOf(u8, target_triplet, "linux") != null;
         if (is_linux) {
             try self.generateStartFunction();
         }
 
         // Create target machine optimized for executables
-        const target_machine = LLVM.LLVMCreateTargetMachine(target.?, triple_z.ptr, "generic", "", LLVM.LLVMCodeGenLevelDefault, LLVM.LLVMRelocDefault, // Static relocation for executables
+        const target_machine = LLVM.LLVMCreateTargetMachine(target.?, target_triplet.ptr, "generic", "", LLVM.LLVMCodeGenLevelDefault, LLVM.LLVMRelocDefault, // Static relocation for executables
             LLVM.LLVMCodeModelDefault);
         defer LLVM.LLVMDisposeTargetMachine(target_machine);
 
@@ -838,7 +815,7 @@ pub const CodeGen = struct {
         }
 
         // Link object file into executable
-        try self.linkExecutable(obj_path, output_path, final_triple);
+        try self.linkExecutable(obj_path, output_path, target_triplet);
 
         // Clean up object file
         std.fs.cwd().deleteFile(obj_path) catch {};
@@ -882,8 +859,10 @@ pub const CodeGen = struct {
         } else {
             // ELF executable arguments
             try args.append(try self.allocator.dupeZ(u8, "--entry=_start"));
-            // Set dynamic linker interpreter for Linux
-            try args.append(try self.allocator.dupeZ(u8, "--dynamic-linker=/lib64/ld-linux-x86-64.so.2"));
+            // Only set dynamic linker if we're linking against dynamic libraries (i.e., when mlir_codegen is present)
+            if (self.mlir_codegen != null) {
+                try args.append(try self.allocator.dupeZ(u8, "--dynamic-linker=/lib64/ld-linux-x86-64.so.2"));
+            }
         }
 
         // Add output file
