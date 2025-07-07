@@ -187,7 +187,7 @@ fn createLinking(b: *std.Build, exe: *std.Build.Step.Compile, llvm_include_dir: 
 
         // Link ALL MLIR static libraries automatically
         const mlir_exclusions = [_][]const u8{
-            "MlirOptMain", // Exclude specific Main library
+            "MLIRMlirOptMain", // Exclude specific Main library
         };
         try linkAllStaticLibraries(b, exe, mlir_lib_dir.?, "MLIR", &mlir_exclusions);
         // std.debug.print("MLIR support enabled (auto-linked all static libraries)\n", .{});
