@@ -10,7 +10,7 @@ const Target = struct {
 const targets = [_]Target{
     Target{
         .target = "x86_64-unknown-linux-gnu",
-        .remote = "home:",
+        .remote = "home",
     },
     // Target{
     //     .target = "arm64-apple-darwin",
@@ -59,7 +59,7 @@ test "type system - different integer types" {
         \\    return y;
         \\}
     ;
-    try assertCrossCompiles(allocator, test_source, "test_integers.toy", 16);
+    try assertCrossCompiles(allocator, test_source, "test_cross_integers.toy", 30);
 }
 
 test "type system - tensor gpu" {
@@ -231,7 +231,7 @@ fn assertGpuCrossCompiles(allocator: std.mem.Allocator, source: []const u8, file
                     std.debug.print("stderr: {s}\n", .{out.stderr});
                     return error.UnexpectedExitCode;
                 } else {
-                    std.debug.print("Cross-compiled {s} for target {s} produced correct exit code: {}\n", .{ filename, target.target, out.term.Exited });
+                    std.debug.print("Cross-compiled {s} for target {s} and gpu {s} produced correct exit code: {}\n", .{ filename, target.target, target.gpu, out.term.Exited });
                 }
             },
             else => {
