@@ -598,50 +598,85 @@ pub const MLIRCodeGen = struct {
 
     /// Extract kernel function for standalone compilation
     fn extractKernelFunction(self: *MLIRCodeGen, input_content: []const u8, function_name: []const u8) ![]const u8 {
-        // Create the kernel function name to search for (without _kernel suffix)
-        const kernel_name = try std.fmt.allocPrint(self.allocator, "llvm.func @{s}", .{function_name});
-        defer self.allocator.free(kernel_name);
-
-        // Find the kernel function and extract it
-        const kernel_start = std.mem.indexOf(u8, input_content, kernel_name) orelse {
-            std.debug.print("Error: Could not find kernel function '{s}'\n", .{kernel_name});
-            return MLIRCodeGenError.PipelineError;
+        _ = function_name; // We'll extract ALL GPU functions, not just one
+        
+        // Find all GPU kernel functions (they start with "llvm.func @gpu_")
+        var functions = std.ArrayList([]const u8).init(self.allocator);
+        defer functions.deinit();
+        defer for (functions.items) |func| {
+            self.allocator.free(func);
         };
 
-        const kernel_end = std.mem.indexOf(u8, input_content[kernel_start..], "  }") orelse {
-            std.debug.print("Error: Could not find end of kernel function\n", .{});
+        var search_pos: usize = 0;
+        while (true) {
+            // Search for GPU functions
+            const func_start = std.mem.indexOf(u8, input_content[search_pos..], "llvm.func @gpu_") orelse break;
+            const actual_start = search_pos + func_start;
+            
+            // Find the end of this function
+            const func_end = std.mem.indexOf(u8, input_content[actual_start..], "  }") orelse {
+                std.debug.print("Error: Could not find end of GPU function\n", .{});
+                return MLIRCodeGenError.PipelineError;
+            };
+            
+            // Extract the function
+            const function = input_content[actual_start .. actual_start + func_end + 3];
+            
+            // Clean up the function (remove gpu.kernel attributes)
+            var cleaned_func = try self.allocator.dupe(u8, function);
+            
+            // Remove the gpu.kernel attribute as it's not needed in standalone module
+            const kernel_with_attrs = std.mem.replacementSize(u8, cleaned_func, "gpu.kernel, ", "");
+            if (kernel_with_attrs < cleaned_func.len) {
+                const temp = try self.allocator.alloc(u8, kernel_with_attrs);
+                _ = std.mem.replace(u8, cleaned_func, "gpu.kernel, ", "", temp);
+                self.allocator.free(cleaned_func);
+                cleaned_func = temp;
+            }
+            
+            // Also remove if it's at the end
+            const kernel_with_attrs2 = std.mem.replacementSize(u8, cleaned_func, ", gpu.kernel", "");
+            if (kernel_with_attrs2 < cleaned_func.len) {
+                const temp = try self.allocator.alloc(u8, kernel_with_attrs2);
+                _ = std.mem.replace(u8, cleaned_func, ", gpu.kernel", "", temp);
+                self.allocator.free(cleaned_func);
+                cleaned_func = temp;
+            }
+            
+            try functions.append(cleaned_func);
+            
+            // Move search position forward
+            search_pos = actual_start + func_end + 3;
+        }
+        
+        if (functions.items.len == 0) {
+            std.debug.print("Error: No GPU kernel functions found in MLIR\n", .{});
             return MLIRCodeGenError.PipelineError;
-        };
+        }
+        
+        if (self.verbose) {
+            std.debug.print("Found {} GPU kernel functions to extract\n", .{functions.items.len});
+        }
+        
+        // Combine all functions into a single module
+        var combined_functions = std.ArrayList(u8).init(self.allocator);
+        defer combined_functions.deinit();
+        
+        for (functions.items) |func| {
+            try combined_functions.appendSlice(func);
+            try combined_functions.appendSlice("\n");
+        }
 
-        // Extract the kernel function
-        const kernel_function = input_content[kernel_start .. kernel_start + kernel_end + 3];
-
-        // Remove the gpu.kernel attribute as it's not needed in standalone module
-        const kernel_with_attrs = std.mem.replacementSize(u8, kernel_function, "gpu.kernel, ", "");
-        const cleaned_kernel = try self.allocator.alloc(u8, kernel_with_attrs);
-        defer self.allocator.free(cleaned_kernel);
-        _ = std.mem.replace(u8, kernel_function, "gpu.kernel, ", "", cleaned_kernel);
-
-        // Also remove if it's at the end
-        const kernel_with_attrs2 = std.mem.replacementSize(u8, cleaned_kernel, ", gpu.kernel", "");
-        const cleaned_kernel2 = try self.allocator.alloc(u8, kernel_with_attrs2);
-        defer self.allocator.free(cleaned_kernel2);
-        _ = std.mem.replace(u8, cleaned_kernel, ", gpu.kernel", "", cleaned_kernel2);
-
-        // Final cleanup
-        const final_kernel = try self.allocator.dupe(u8, cleaned_kernel2);
-
-        // Create a standalone module with the kernel function
+        // Create a standalone module with all kernel functions
         const standalone_module = try std.fmt.allocPrint(self.allocator,
             \\module attributes {{nvvm.target = "cuda"}} {{
-            \\  {s}
+            \\{s}
             \\  llvm.func @llvm.nvvm.read.ptx.sreg.tid.x() -> i32 attributes {{passthrough = ["nounwind", "readnone"]}}
             \\  llvm.func @llvm.nvvm.read.ptx.sreg.ntid.x() -> i32 attributes {{passthrough = ["nounwind", "readnone"]}}
             \\  llvm.func @llvm.nvvm.read.ptx.sreg.ctaid.x() -> i32 attributes {{passthrough = ["nounwind", "readnone"]}}
             \\}}
             \\
-        , .{final_kernel});
-        defer self.allocator.free(final_kernel);
+        , .{combined_functions.items});
 
         return standalone_module;
     }
