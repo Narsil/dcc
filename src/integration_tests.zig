@@ -474,7 +474,7 @@ test "gpu function compilation with valid triplet" {
     }
     defer std.fs.cwd().deleteFile(filename) catch {};
 
-    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, filename, "--gpu", "nvptx-cuda:sm_50" } });
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, filename, "--gpu", "nvptx64-cuda:sm_50" } });
     defer allocator.free(out.stdout);
     defer allocator.free(out.stderr);
 
@@ -533,7 +533,7 @@ test "gpu function compilation with invalid triplet" {
             }
             // Check that the error message contains the expected text
             if (!std.mem.containsAtLeast(u8, out.stderr, 1, "Invalid GPU triplet") or
-                !std.mem.containsAtLeast(u8, out.stderr, 1, "Expected format: nvptx-cuda:sm_XX"))
+                !std.mem.containsAtLeast(u8, out.stderr, 1, "Expected format: nvptx64-cuda:sm_XX"))
             {
                 std.debug.print("Expected error message about invalid GPU triplet format\n", .{});
                 std.debug.print("stderr: {s}\n", .{out.stderr});
@@ -1012,7 +1012,7 @@ fn assertMacOsGpuCompileFailure(
     }
     defer std.fs.cwd().deleteFile(filename) catch {};
 
-    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, filename, "--target", "aarch64-macos-none", "--gpu", "nvptx-cuda:sm_50" } });
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, filename, "--target", "aarch64-macos-none", "--gpu", "nvptx64-cuda:sm_50" } });
     defer allocator.free(out.stdout);
     defer allocator.free(out.stderr);
 

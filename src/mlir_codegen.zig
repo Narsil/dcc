@@ -715,11 +715,13 @@ pub const MLIRCodeGen = struct {
         }
 
         // Get NVPTX target
-        const target_triple = "nvptx64-nvidia-cuda";
         var target: MLIR.LLVMTargetRef = undefined;
         var target_error_msg: [*c]u8 = undefined;
+        const query = std.Target.Query.fromTarget(self.target);
+        const target_triple = try query.zigTriple(self.allocator);
+        defer self.allocator.free(target_triple);
 
-        if (MLIR.LLVMGetTargetFromTriple(target_triple, &target, &target_error_msg) != 0) {
+        if (MLIR.LLVMGetTargetFromTriple(@as([*c]const u8, @ptrCast(target_triple.ptr)), &target, &target_error_msg) != 0) {
             defer MLIR.LLVMDisposeMessage(target_error_msg);
             if (self.verbose) {
                 std.debug.print("❌ Failed to get NVPTX target: {s}\n", .{target_error_msg});
@@ -737,7 +739,7 @@ pub const MLIRCodeGen = struct {
         const cpu_str = try std.fmt.allocPrintZ(self.allocator, "sm_{d}", .{sm_version});
         defer self.allocator.free(cpu_str);
 
-        const target_machine = MLIR.LLVMCreateTargetMachine(target, target_triple, cpu_str.ptr, "", // features
+        const target_machine = MLIR.LLVMCreateTargetMachine(target, @as([*c]const u8, @ptrCast(target_triple.ptr)), cpu_str.ptr, "", // features
             MLIR.LLVMCodeGenLevelDefault, MLIR.LLVMRelocDefault, MLIR.LLVMCodeModelDefault);
         defer MLIR.LLVMDisposeTargetMachine(target_machine);
 

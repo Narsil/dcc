@@ -28,7 +28,7 @@ const gpu_targets = [_]GpuTarget{
     GpuTarget{
         .target = "x86_64-linux",
         .remote = "home",
-        .gpu = "nvptx-cuda:sm_50",
+        .gpu = "nvptx64-cuda:sm_50",
     },
 };
 
