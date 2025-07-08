@@ -474,7 +474,7 @@ test "gpu function compilation with valid triplet" {
     }
     defer std.fs.cwd().deleteFile(filename) catch {};
 
-    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, filename, "--gpu", "nvidia-ptx-sm50" } });
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, filename, "--gpu", "nvptx-cuda:sm_50" } });
     defer allocator.free(out.stdout);
     defer allocator.free(out.stderr);
 
@@ -533,7 +533,7 @@ test "gpu function compilation with invalid triplet" {
             }
             // Check that the error message contains the expected text
             if (!std.mem.containsAtLeast(u8, out.stderr, 1, "Invalid GPU triplet") or
-                !std.mem.containsAtLeast(u8, out.stderr, 1, "Expected format: nvidia-ptx-smXX"))
+                !std.mem.containsAtLeast(u8, out.stderr, 1, "Expected format: nvptx-cuda:sm_XX"))
             {
                 std.debug.print("Expected error message about invalid GPU triplet format\n", .{});
                 std.debug.print("stderr: {s}\n", .{out.stderr});
@@ -825,14 +825,14 @@ fn assertCompiles(allocator: std.mem.Allocator, source: []const u8, filename: []
 fn assertReturns(allocator: std.mem.Allocator, filename: []const u8, expected: usize) !void {
     // Extract output name from source file (remove .toy extension)
     const basename = std.fs.path.basename(filename);
-    const output_name = if (std.mem.endsWith(u8, basename, ".toy")) 
-        basename[0..basename.len - 4] 
-    else 
+    const output_name = if (std.mem.endsWith(u8, basename, ".toy"))
+        basename[0 .. basename.len - 4]
+    else
         basename;
-    
+
     const binary_path = try std.fmt.allocPrint(allocator, "./{s}", .{output_name});
     defer allocator.free(binary_path);
-    
+
     const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{binary_path} });
     switch (out.term) {
         .Exited => |term| {
@@ -842,7 +842,7 @@ fn assertReturns(allocator: std.mem.Allocator, filename: []const u8, expected: u
                 std.debug.print("stderr: {s}\n", .{out.stderr});
                 return error.UnexpectedExitCode;
             } else {
-                std.debug.print("Compiled {s} produced correct exit code: {}\n", .{filename, out.term.Exited});
+                std.debug.print("Compiled {s} produced correct exit code: {}\n", .{ filename, out.term.Exited });
             }
         },
         else => {
@@ -1012,7 +1012,7 @@ fn assertMacOsGpuCompileFailure(
     }
     defer std.fs.cwd().deleteFile(filename) catch {};
 
-    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, filename, "--target", "arm64-apple-darwin", "--gpu", "nvidia-ptx-sm50" } });
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, filename, "--target", "aarch64-macos-none", "--gpu", "nvptx-cuda:sm_50" } });
     defer allocator.free(out.stdout);
     defer allocator.free(out.stderr);
 

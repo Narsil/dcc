@@ -148,7 +148,30 @@ fn generatePTXFromPipeline(allocator: std.mem.Allocator, args: Args) ![]const u8
         std.debug.print("🔧 Generating MLIR code using mlir_codegen...\n", .{});
     }
 
-    var codegen = mlir_codegen.MLIRCodeGen.init(allocator, args.sm_version, args.verbose) catch |err| {
+    // Create a CUDA target from the SM version
+    const cuda_target = blk: {
+        const cpu_name = try std.fmt.allocPrint(allocator, "sm_{d}", .{args.sm_version});
+        defer allocator.free(cpu_name);
+        
+        const query = std.Target.Query.parse(.{ 
+            .arch_os_abi = "nvptx64-cuda",
+            .cpu_features = cpu_name
+        }) catch |err| {
+            if (args.verbose) {
+                std.debug.print("❌ Failed to parse CUDA target: {}\n", .{err});
+            }
+            return EmitPtxError.PipelineError;
+        };
+        
+        break :blk std.zig.system.resolveTargetQuery(query) catch |err| {
+            if (args.verbose) {
+                std.debug.print("❌ Failed to resolve CUDA target: {}\n", .{err});
+            }
+            return EmitPtxError.PipelineError;
+        };
+    };
+
+    var codegen = mlir_codegen.MLIRCodeGen.init(allocator, cuda_target, args.verbose) catch |err| {
         if (args.verbose) {
             std.debug.print("❌ Failed to initialize MLIR codegen: {}\n", .{err});
         }

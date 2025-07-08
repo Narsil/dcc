@@ -8,62 +8,16 @@ const parser = @import("parser.zig");
 const typechecker = @import("typechecker.zig");
 const codegen = @import("codegen.zig");
 
-/// Helper function to parse target triple string to std.Target
+/// Helper function to convert std.Target to target triple string using Zig's built-in functionality
+fn targetToTriple(allocator: std.mem.Allocator, target: std.Target) ![]u8 {
+    const query = std.Target.Query.fromTarget(target);
+    return query.zigTriple(allocator);
+}
+
+/// Helper function to parse target triple string to std.Target using Zig's built-in parsing
 fn parseTargetFromTriple(triple: []const u8) !std.Target {
-    var parts = std.mem.splitSequence(u8, triple, "-");
-
-    const arch_str = parts.next() orelse return error.InvalidTargetTriple;
-    const vendor_or_os = parts.next() orelse return error.InvalidTargetTriple;
-
-    // Parse architecture
-    const arch = if (std.mem.eql(u8, arch_str, "x86_64"))
-        std.Target.Cpu.Arch.x86_64
-    else if (std.mem.eql(u8, arch_str, "aarch64") or std.mem.eql(u8, arch_str, "arm64"))
-        std.Target.Cpu.Arch.aarch64
-    else if (std.mem.eql(u8, arch_str, "arm"))
-        std.Target.Cpu.Arch.arm
-    else if (std.mem.eql(u8, arch_str, "riscv64"))
-        std.Target.Cpu.Arch.riscv64
-    else
-        return error.InvalidTargetTriple;
-
-    // Parse OS
-    var os_tag: std.Target.Os.Tag = undefined;
-    if (std.mem.eql(u8, vendor_or_os, "apple")) {
-        const os_part = parts.next() orelse return error.InvalidTargetTriple;
-        if (std.mem.eql(u8, os_part, "darwin") or std.mem.eql(u8, os_part, "macos")) {
-            os_tag = .macos;
-        } else {
-            return error.InvalidTargetTriple;
-        }
-    } else if (std.mem.eql(u8, vendor_or_os, "pc")) {
-        const os_part = parts.next() orelse return error.InvalidTargetTriple;
-        if (std.mem.eql(u8, os_part, "windows")) {
-            os_tag = .windows;
-        } else if (std.mem.eql(u8, os_part, "linux")) {
-            os_tag = .linux;
-        } else {
-            return error.InvalidTargetTriple;
-        }
-    } else if (std.mem.eql(u8, vendor_or_os, "unknown")) {
-        const os_part = parts.next() orelse return error.InvalidTargetTriple;
-        if (std.mem.eql(u8, os_part, "linux")) {
-            os_tag = .linux;
-        } else {
-            return error.InvalidTargetTriple;
-        }
-    } else if (std.mem.eql(u8, vendor_or_os, "linux")) {
-        os_tag = .linux;
-    } else {
-        return error.InvalidTargetTriple;
-    }
-
-    // Create a simple target based on parsed components
-    var target = builtin.target;
-    target.os = std.Target.Os{ .tag = os_tag, .version_range = target.os.version_range };
-    target.cpu = std.Target.Cpu.baseline(arch, target.os);
-    target.abi = std.Target.Abi.default(arch, target.os);
-    return target;
+    const query = std.Target.Query.parse(.{ .arch_os_abi = triple }) catch return error.InvalidTargetTriple;
+    return std.zig.system.resolveTargetQuery(query) catch return error.InvalidTargetTriple;
 }
 
 fn hasMainFunction(ast: parser.ASTNode) bool {
@@ -92,7 +46,7 @@ pub fn main() !void {
 
     if (args.len < 2) {
         std.debug.print("Usage: {s} <source_file> [--target <target_triplet>] [--verbose] [--gpu <gpu_triplet>]\n", .{args[0]});
-        std.debug.print("Example: {s} program.toy --target x86_64-pc-linux-gnu --verbose --gpu nvidia-ptx-sm50\n", .{args[0]});
+        std.debug.print("Example: {s} program.toy --target x86_64-pc-linux-gnu --verbose --gpu nvptx-cuda:sm_50\n", .{args[0]});
         return;
     }
 
@@ -118,7 +72,7 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--gpu")) {
             i += 1;
             if (i >= args.len) {
-                std.debug.print("Error: --gpu requires a GPU triplet (e.g., nvidia-ptx-sm50)\n", .{});
+                std.debug.print("Error: --gpu requires a GPU triplet (e.g., nvptx-cuda:sm_50)\n", .{});
                 return;
             }
             gpu_triplet = args[i];
@@ -148,8 +102,28 @@ pub fn main() !void {
         break :blk builtin.target;
     };
 
+    const gpu_target: ?std.Target = if (gpu_triplet) |gpu| blk: {
+        var iter = std.mem.splitScalar(u8, gpu, ':');
+        const arch_os_abi = iter.next() orelse return error.InvalidGpuTriplet;
+        const cpu_features = iter.next() orelse {
+            std.debug.print("Invalid GPU triplet: {s}. Expected format: nvptx-cuda:sm_XX", .{gpu});
+            return error.InvalidGpuTriplet;
+        };
+
+        const query = std.Target.Query.parse(.{ .arch_os_abi = arch_os_abi, .cpu_features = cpu_features }) catch return error.InvalidTargetTriple;
+        const parsed_target = std.zig.system.resolveTargetQuery(query) catch return error.InvalidTargetTriple;
+        if (parsed_target.os.tag != .cuda) {
+            std.debug.print("Only cuda is supported for now not : {s}", .{gpu});
+            return error.InvalidGpuTriplet;
+        }
+        if (verbose) {
+            std.debug.print("Cross-compiling for target: {s} ({s}-{s})\n", .{ gpu, @tagName(parsed_target.cpu.arch), @tagName(parsed_target.os.tag) });
+        }
+        break :blk parsed_target;
+    } else null;
+
     // Wrap compilation in catch block to handle normal errors gracefully
-    const result = compile(allocator, source_file, target, verbose, gpu_triplet);
+    const result = compile(allocator, source_file, target, verbose, gpu_target);
     if (result) |_| {
         // Compilation successful
     } else |err| {
@@ -279,7 +253,7 @@ pub fn main() !void {
     }
 }
 
-fn compile(allocator: std.mem.Allocator, source_file: []const u8, target: std.Target, verbose: bool, gpu_triplet: ?[]const u8) !void {
+fn compile(allocator: std.mem.Allocator, source_file: []const u8, target: std.Target, verbose: bool, gpu_target: ?std.Target) !void {
     if (verbose) {
         std.debug.print("Compiling: {s}\n", .{source_file});
     }
@@ -331,7 +305,7 @@ fn compile(allocator: std.mem.Allocator, source_file: []const u8, target: std.Ta
         std.debug.print("CodeGen\n", .{});
     }
 
-    var code_gen = try codegen.CodeGen.init(allocator, "toy_program", verbose, target, gpu_triplet);
+    var code_gen = try codegen.CodeGen.init(allocator, "toy_program", verbose, target, gpu_target);
     defer code_gen.deinit();
 
     // Extract output name from source file (remove .toy extension)

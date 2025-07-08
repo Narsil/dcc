@@ -52,48 +52,7 @@ pub const CodeGen = struct {
     mlir_codegen: ?mlir_codegen.MLIRCodeGen,
     cuda_stub_mgr: ?cuda_stub_manager.CudaStubManager,
 
-    /// Parse GPU triplet and extract SM version
-    /// Expected format: nvidia-ptx-smXX (e.g., nvidia-ptx-sm50)
-    fn parseGpuTriplet(triplet: []const u8) !u32 {
-        // Split by '-' to get parts
-        var parts = std.mem.splitSequence(u8, triplet, "-");
-
-        // Part 1: vendor (must be "nvidia")
-        const vendor = parts.next() orelse return error.InvalidGpuTriplet;
-        if (!std.mem.eql(u8, vendor, "nvidia")) {
-            return error.InvalidGpuTriplet;
-        }
-
-        // Part 2: target (must be "ptx")
-        const target = parts.next() orelse return error.InvalidGpuTriplet;
-        if (!std.mem.eql(u8, target, "ptx")) {
-            return error.InvalidGpuTriplet;
-        }
-
-        // Part 3: SM version (must be "smXX")
-        const sm_part = parts.next() orelse return error.InvalidGpuTriplet;
-        if (!std.mem.startsWith(u8, sm_part, "sm")) {
-            return error.InvalidGpuTriplet;
-        }
-
-        // Make sure there are no more parts
-        if (parts.next() != null) {
-            return error.InvalidGpuTriplet;
-        }
-
-        // Extract the numeric part after "sm"
-        const sm_version_str = sm_part[2..]; // Skip "sm"
-        const sm_version = std.fmt.parseInt(u32, sm_version_str, 10) catch return error.InvalidGpuTriplet;
-
-        // Validate SM version is reasonable (20-90)
-        if (sm_version < 20 or sm_version > 90) {
-            return error.InvalidGpuTriplet;
-        }
-
-        return sm_version;
-    }
-
-    pub fn init(allocator: std.mem.Allocator, module_name: []const u8, verbose: bool, target: std.Target, gpu_triplet: ?[]const u8) !CodeGen {
+    pub fn init(allocator: std.mem.Allocator, module_name: []const u8, verbose: bool, target: std.Target, gpu: ?std.Target) !CodeGen {
         // Initialize LLVM X86 target (for x86_64 support)
         LLVM.LLVMInitializeX86TargetInfo();
         LLVM.LLVMInitializeX86Target();
@@ -117,26 +76,20 @@ pub const CodeGen = struct {
 
         // Parse GPU triplet if provided
         var mlir_gen: ?mlir_codegen.MLIRCodeGen = null;
-        if (gpu_triplet) |triplet| {
-            const sm_version = parseGpuTriplet(triplet) catch |err| {
-                std.debug.print("Error: Invalid GPU triplet '{s}': {}\n", .{ triplet, err });
-                std.debug.print("Expected format: nvidia-ptx-smXX (e.g., nvidia-ptx-sm50)\n", .{});
-                return error.CodeGenError;
-            };
-
+        if (gpu) |gpu_target| {
             if (target.os.tag == .macos) {
                 std.debug.print("Error: NVIDIA GPU compilation is not supported on macOS targets\n", .{});
-                std.debug.print("NVIDIA GPUs are not available on macOS. GPU compilation with '{s}' is only supported on Linux targets.\n", .{triplet});
+                std.debug.print("NVIDIA GPUs are not available on macOS. GPU compilation is only supported on Linux targets.\n", .{});
                 std.debug.print("To compile for GPU targets, use a Linux target (e.g., --target x86_64-unknown-linux-gnu).\n", .{});
                 return error.CodeGenError;
             }
 
-            mlir_gen = mlir_codegen.MLIRCodeGen.init(allocator, sm_version, verbose) catch null;
+            mlir_gen = mlir_codegen.MLIRCodeGen.init(allocator, gpu_target, verbose) catch null;
         }
 
         // Initialize CUDA stub manager if GPU compilation is enabled
         var cuda_stub_mgr: ?cuda_stub_manager.CudaStubManager = null;
-        if (gpu_triplet != null) {
+        if (gpu != null) {
             cuda_stub_mgr = cuda_stub_manager.CudaStubManager.init(allocator, verbose) catch |err| blk: {
                 if (verbose) {
                     std.debug.print("⚠️  Warning: Failed to initialize CUDA stub manager: {}\n", .{err});

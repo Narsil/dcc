@@ -206,7 +206,7 @@ fn createLinking(b: *std.Build, exe: *std.Build.Step.Compile, llvm_include_dir: 
         // std.debug.print("MLIR support not available (MLIR_INCLUDE_DIR and MLIR_LIB_DIR not set)\n", .{});
     }
 
-    // Add CUDA cross-compilation support for --target x86_64-unknown-linux --gpu nvidia-ptx
+    // Add CUDA cross-compilation support for --target x86_64-unknown-linux --gpu nvptx-cuda:sm_XX
     // Note: CUDA variables are now declared at the top level of build() function
     // This is just a placeholder comment - the actual CUDA linking is handled per-executable
 

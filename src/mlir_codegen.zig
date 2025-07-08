@@ -25,6 +25,33 @@ const MLIR = @cImport({
     @cInclude("gpu_to_nvvm_wrapper.h"); // Our custom wrapper for GPU to NVVM with options
 });
 
+/// Extract SM version from std.Target for CUDA/NVPTX targets
+/// Returns the SM version as u32, or a default value if not NVPTX or parsing fails
+fn extractSmVersionFromTarget(target: std.Target) u32 {
+    // Check if this is an NVPTX target
+    if (!target.cpu.arch.isNvptx()) {
+        return 50; // Default SM version for non-NVPTX targets
+    }
+
+    // Parse the CPU model name to extract SM version
+    // NVPTX CPU model names are typically like "sm_50", "sm_52", etc.
+    const model_name = target.cpu.model.name;
+    std.debug.print("GPU - CPU name {s}", .{model_name});
+
+    if (std.mem.startsWith(u8, model_name, "sm_")) {
+        const version_str = model_name[3..]; // Skip "sm_" prefix
+        if (std.fmt.parseInt(u32, version_str, 10)) |version| {
+            return version;
+        } else |_| {
+            // If parsing fails, return a reasonable default
+            return 50;
+        }
+    }
+
+    // If model name doesn't match expected pattern, return default
+    return 50;
+}
+
 pub const MLIRCodeGenError = error{
     MLIRError,
     InvalidGpuFunction,
@@ -44,14 +71,14 @@ pub const MLIRCodeGen = struct {
     allocator: std.mem.Allocator,
     verbose: bool,
     generated_mlir: std.ArrayList(u8),
-    sm_version: u32,
+    target: std.Target,
 
-    pub fn init(allocator: std.mem.Allocator, sm_version: u32, verbose: bool) !MLIRCodeGen {
+    pub fn init(allocator: std.mem.Allocator, target: std.Target, verbose: bool) !MLIRCodeGen {
         return MLIRCodeGen{
             .allocator = allocator,
             .verbose = verbose,
             .generated_mlir = std.ArrayList(u8).init(allocator),
-            .sm_version = sm_version,
+            .target = target,
         };
     }
 
@@ -96,19 +123,19 @@ pub const MLIRCodeGen = struct {
 
         // Generate MLIR based on the analyzed information
         try writer.writeAll("gpu.module @kernels {\n");
-        
+
         // Create the function signature based on actual parameters
         try writer.print("  gpu.func @{s}(", .{func.name});
         for (param_info, 0..) |param, i| {
             if (i > 0) try writer.writeAll(", ");
-            try writer.print("%arg{d}: memref<{d}x{s}>", .{i, param.dimension, param.mlir_type});
+            try writer.print("%arg{d}: memref<{d}x{s}>", .{ i, param.dimension, param.mlir_type });
         }
         try writer.writeAll(") kernel {\n");
 
         // Generate constants based on the actual dimensions
         try writer.writeAll("    %c0 = arith.constant 0 : index\n");
         if (param_info.len > 0) {
-            try writer.print("    %c{d} = arith.constant {d} : index\n", .{param_info[0].dimension, param_info[0].dimension});
+            try writer.print("    %c{d} = arith.constant {d} : index\n", .{ param_info[0].dimension, param_info[0].dimension });
         }
         try writer.writeAll("    \n");
 
@@ -163,13 +190,13 @@ pub const MLIRCodeGen = struct {
     /// Analyze function parameters to extract dimension and type information
     fn analyzeParameters(self: *MLIRCodeGen, parameters: []parser.Parameter) ![]ParameterInfo {
         var param_info = try self.allocator.alloc(ParameterInfo, parameters.len);
-        
+
         for (parameters, 0..) |param, i| {
             switch (param.type) {
                 .tensor => |tensor_type| {
                     // Extract dimension (assume 1D tensor for now)
                     const dimension = if (tensor_type.shape.len > 0) tensor_type.shape[0] else 1024;
-                    
+
                     // Convert element type to MLIR type
                     const mlir_type = switch (tensor_type.element_type.*) {
                         .i32 => "i32",
@@ -180,7 +207,7 @@ pub const MLIRCodeGen = struct {
                         .u64 => "i64", // MLIR uses signed types
                         else => "f32", // Default fallback
                     };
-                    
+
                     param_info[i] = ParameterInfo{
                         .dimension = dimension,
                         .mlir_type = mlir_type,
@@ -194,10 +221,10 @@ pub const MLIRCodeGen = struct {
                         .mlir_type = "f32",
                         .element_type = parser.Type.f32,
                     };
-                }
+                },
             }
         }
-        
+
         return param_info;
     }
 
@@ -207,16 +234,16 @@ pub const MLIRCodeGen = struct {
         for (body) |stmt| {
             if (stmt == .parallel_assignment) {
                 const pa = stmt.parallel_assignment;
-                
+
                 // Check if the value is a binary expression
                 if (pa.value.* == .binary_expression) {
                     const bin_expr = pa.value.*.binary_expression;
-                    
+
                     // Create source params slice
                     const source_params = try self.allocator.alloc(usize, 2);
                     source_params[0] = 0;
                     source_params[1] = 1;
-                    
+
                     // For now, assume the first parameter is the target
                     // and extract the operation type
                     return OperationInfo{
@@ -227,12 +254,12 @@ pub const MLIRCodeGen = struct {
                 }
             }
         }
-        
+
         // Default to addition if no clear pattern found
         const default_source_params = try self.allocator.alloc(usize, 2);
         default_source_params[0] = 0;
         default_source_params[1] = 1;
-        
+
         return OperationInfo{
             .operation = parser.BinaryOperator.add,
             .target_param = 0,
@@ -243,18 +270,17 @@ pub const MLIRCodeGen = struct {
     /// Generate MLIR code for the specific operation
     fn generateOperationMLIR(self: *MLIRCodeGen, writer: anytype, param_info: []ParameterInfo, operation_info: OperationInfo) !void {
         _ = self; // Unused parameter for now
-        
+
         // Early return if no parameters to work with
         if (param_info.len == 0) {
             try writer.writeAll("      // No parameters provided for operation\n");
             return;
         }
-        
+
         // Generate load operations for source parameters
         for (operation_info.source_params, 0..) |param_idx, i| {
             if (param_idx < param_info.len) {
-                try writer.print("      %val{d} = memref.load %arg{d}[%global_id] : memref<{d}x{s}>\n", 
-                    .{i + 1, param_idx, param_info[param_idx].dimension, param_info[param_idx].mlir_type});
+                try writer.print("      %val{d} = memref.load %arg{d}[%global_id] : memref<{d}x{s}>\n", .{ i + 1, param_idx, param_info[param_idx].dimension, param_info[param_idx].mlir_type });
             }
         }
         try writer.writeAll("      \n");
@@ -269,24 +295,24 @@ pub const MLIRCodeGen = struct {
 
         const op_comment = switch (operation_info.operation) {
             .add => "addition",
-            .subtract => "subtraction", 
+            .subtract => "subtraction",
             .multiply => "multiplication",
             .divide => "division",
         };
 
-        try writer.print("      // Perform {s}: result = a[i] {s} b[i]\n", .{op_comment, switch (operation_info.operation) {
+        try writer.print("      // Perform {s}: result = a[i] {s} b[i]\n", .{ op_comment, switch (operation_info.operation) {
             .add => "+",
-            .subtract => "-", 
+            .subtract => "-",
             .multiply => "*",
             .divide => "/",
-        }});
+        } });
 
         // Generate the operation instruction
         if (operation_info.source_params.len >= 2) {
-            try writer.print("      %result = {s} %val1, %val2 : {s}\n", .{op_name, param_info[0].mlir_type});
+            try writer.print("      %result = {s} %val1, %val2 : {s}\n", .{ op_name, param_info[0].mlir_type });
         } else {
             // Fallback for single operand (shouldn't happen in normal cases)
-            try writer.print("      %result = {s} %val1, %val1 : {s}\n", .{op_name, param_info[0].mlir_type});
+            try writer.print("      %result = {s} %val1, %val1 : {s}\n", .{ op_name, param_info[0].mlir_type });
         }
         try writer.writeAll("      \n");
 
@@ -294,8 +320,7 @@ pub const MLIRCodeGen = struct {
         const target_param = operation_info.target_param;
         if (target_param < param_info.len) {
             try writer.writeAll("      // Store result back to a[i] (in-place)\n");
-            try writer.print("      memref.store %result, %arg{d}[%global_id] : memref<{d}x{s}>\n", 
-                .{target_param, param_info[target_param].dimension, param_info[target_param].mlir_type});
+            try writer.print("      memref.store %result, %arg{d}[%global_id] : memref<{d}x{s}>\n", .{ target_param, param_info[target_param].dimension, param_info[target_param].mlir_type });
         }
     }
 
@@ -392,7 +417,7 @@ pub const MLIRCodeGen = struct {
         const scf_to_cf_pass = MLIR.mlirCreateConversionSCFToControlFlow();
         MLIR.mlirPassManagerAddOwnedPass(pass_manager, scf_to_cf_pass);
 
-                // Get the default operation pass manager and create nested GPU module pass manager
+        // Get the default operation pass manager and create nested GPU module pass manager
         const default_op_pm = MLIR.mlirPassManagerGetAsOpPassManager(pass_manager);
         const gpu_module_pm = MLIR.mlirOpPassManagerGetNestedUnder(default_op_pm, MLIR.mlirStringRefCreateFromCString("gpu.module"));
 
@@ -409,7 +434,7 @@ pub const MLIRCodeGen = struct {
         const finalize_memref_pass = MLIR.mlirCreateConversionFinalizeMemRefToLLVMConversionPass();
         MLIR.mlirPassManagerAddOwnedPass(pass_manager, finalize_memref_pass);
 
-                // Add convert Func to LLVM pass with bare pointer call convention
+        // Add convert Func to LLVM pass with bare pointer call convention
         const func_to_llvm_pass = MLIR.mlirCreateConversionConvertFuncToLLVMPassWithBarePtr();
         MLIR.mlirPassManagerAddOwnedPass(pass_manager, func_to_llvm_pass);
 
@@ -707,7 +732,9 @@ pub const MLIRCodeGen = struct {
         }
 
         // Create target machine
-        const cpu_str = try std.fmt.allocPrintZ(self.allocator, "sm_{d}", .{self.sm_version});
+        // Extract SM version from target and create CPU string
+        const sm_version = extractSmVersionFromTarget(self.target);
+        const cpu_str = try std.fmt.allocPrintZ(self.allocator, "sm_{d}", .{sm_version});
         defer self.allocator.free(cpu_str);
 
         const target_machine = MLIR.LLVMCreateTargetMachine(target, target_triple, cpu_str.ptr, "", // features
@@ -715,7 +742,7 @@ pub const MLIRCodeGen = struct {
         defer MLIR.LLVMDisposeTargetMachine(target_machine);
 
         if (self.verbose) {
-            std.debug.print("✅ Created target machine for SM {d}\n", .{self.sm_version});
+            std.debug.print("✅ Created target machine for SM {d}\n", .{sm_version});
         }
 
         // Create memory buffer for PTX output
@@ -754,7 +781,11 @@ pub const MLIRCodeGen = struct {
 test "MLIRCodeGen - basic initialization and cleanup" {
     const allocator = std.testing.allocator;
 
-    var mlir_codegen = try MLIRCodeGen.init(allocator, 50, false);
+    // Create a basic CUDA target for testing
+    const query = std.Target.Query.parse(.{ .arch_os_abi = "nvptx64-cuda", .cpu_features = "sm_50" }) catch return;
+    const cuda_target = std.zig.system.resolveTargetQuery(query) catch return;
+
+    var mlir_codegen = try MLIRCodeGen.init(allocator, cuda_target, false);
     defer mlir_codegen.deinit();
 
     // Should initialize without crashing
@@ -764,7 +795,11 @@ test "MLIRCodeGen - basic initialization and cleanup" {
 test "MLIRCodeGen - generate GPU function" {
     const allocator = std.testing.allocator;
 
-    var mlir_codegen = try MLIRCodeGen.init(allocator, 50, false);
+    // Create a basic CUDA target for testing
+    const query = std.Target.Query.parse(.{ .arch_os_abi = "nvptx64-cuda", .cpu_features = "sm_50" }) catch return;
+    const cuda_target = std.zig.system.resolveTargetQuery(query) catch return;
+
+    var mlir_codegen = try MLIRCodeGen.init(allocator, cuda_target, false);
     defer mlir_codegen.deinit();
 
     // Create a dummy function declaration for testing

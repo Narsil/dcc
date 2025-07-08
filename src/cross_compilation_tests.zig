@@ -9,7 +9,7 @@ const Target = struct {
 
 const targets = [_]Target{
     Target{
-        .target = "x86_64-unknown-linux-gnu",
+        .target = "x86_64-linux",
         .remote = "home",
     },
     Target{
@@ -26,9 +26,9 @@ const GpuTarget = struct {
 
 const gpu_targets = [_]GpuTarget{
     GpuTarget{
-        .target = "x86_64-unknown-linux-gnu",
+        .target = "x86_64-linux",
         .remote = "home",
-        .gpu = "nvidia-ptx-sm50",
+        .gpu = "nvptx-cuda:sm_50",
     },
 };
 
