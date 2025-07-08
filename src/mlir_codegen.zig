@@ -162,15 +162,39 @@ pub const MLIRCodeGen = struct {
         try writer.print("  gpu.func @{s}(", .{func.name});
         for (param_info, 0..) |param, i| {
             if (i > 0) try writer.writeAll(", ");
-            try writer.print("%arg{d}: memref<{d}x{s}>", .{ i, param.dimension, param.mlir_type });
+            // Handle multi-dimensional tensors
+            if (param.tensor_shape) |shape| {
+                if (shape.len > 1) {
+                    // Multi-dimensional tensor: generate proper multi-dimensional memref
+                    try writer.print("%arg{d}: memref<", .{i});
+                    for (shape, 0..) |dim, j| {
+                        if (j > 0) try writer.writeAll("x");
+                        try writer.print("{d}", .{dim});
+                    }
+                    try writer.print("x{s}>", .{param.mlir_type});
+                } else {
+                    // 1D tensor
+                    try writer.print("%arg{d}: memref<{d}x{s}>", .{ i, param.dimension, param.mlir_type });
+                }
+            } else {
+                // Default case
+                try writer.print("%arg{d}: memref<{d}x{s}>", .{ i, param.dimension, param.mlir_type });
+            }
         }
         try writer.writeAll(") kernel {\n");
 
         // Generate constants based on the actual dimensions
         try writer.writeAll("    %c0 = arith.constant 0 : index\n");
-        if (param_info.len > 0) {
-            try writer.print("    %c{d} = arith.constant {d} : index\n", .{ param_info[0].dimension, param_info[0].dimension });
-        }
+        
+        // For reduce operations, generate constant for target dimension
+        const bounds_dim = if (operation_info.is_reduce and operation_info.target_param < param_info.len)
+            param_info[operation_info.target_param].dimension
+        else if (param_info.len > 0)
+            param_info[0].dimension
+        else
+            1;
+            
+        try writer.print("    %c{d} = arith.constant {d} : index\n", .{ bounds_dim, bounds_dim });
         try writer.writeAll("    \n");
 
         // Generate GPU thread indexing code
@@ -183,10 +207,8 @@ pub const MLIRCodeGen = struct {
         try writer.writeAll("    \n");
 
         // Generate bounds check
-        if (param_info.len > 0) {
-            try writer.print("    // Bounds check: if (global_id >= {d}) return\n", .{param_info[0].dimension});
-            try writer.print("    %cond = arith.cmpi ult, %global_id, %c{d} : index\n", .{param_info[0].dimension});
-        }
+        try writer.print("    // Bounds check: if (global_id >= {d}) return\n", .{bounds_dim});
+        try writer.print("    %cond = arith.cmpi ult, %global_id, %c{d} : index\n", .{bounds_dim});
         try writer.writeAll("    scf.if %cond {\n");
 
         // Generate the actual operation based on function body analysis
@@ -221,15 +243,39 @@ pub const MLIRCodeGen = struct {
         try writer.print("  gpu.func @{s}(", .{func.name});
         for (param_info, 0..) |param, i| {
             if (i > 0) try writer.writeAll(", ");
-            try writer.print("%arg{d}: memref<{d}x{s}>", .{ i, param.dimension, param.mlir_type });
+            // Handle multi-dimensional tensors
+            if (param.tensor_shape) |shape| {
+                if (shape.len > 1) {
+                    // Multi-dimensional tensor: generate proper multi-dimensional memref
+                    try writer.print("%arg{d}: memref<", .{i});
+                    for (shape, 0..) |dim, j| {
+                        if (j > 0) try writer.writeAll("x");
+                        try writer.print("{d}", .{dim});
+                    }
+                    try writer.print("x{s}>", .{param.mlir_type});
+                } else {
+                    // 1D tensor
+                    try writer.print("%arg{d}: memref<{d}x{s}>", .{ i, param.dimension, param.mlir_type });
+                }
+            } else {
+                // Default case
+                try writer.print("%arg{d}: memref<{d}x{s}>", .{ i, param.dimension, param.mlir_type });
+            }
         }
         try writer.writeAll(") kernel {\n");
 
         // Generate constants based on the actual dimensions
         try writer.writeAll("    %c0 = arith.constant 0 : index\n");
-        if (param_info.len > 0) {
-            try writer.print("    %c{d} = arith.constant {d} : index\n", .{ param_info[0].dimension, param_info[0].dimension });
-        }
+        
+        // For reduce operations, generate constant for target dimension
+        const bounds_dim = if (operation_info.is_reduce and operation_info.target_param < param_info.len)
+            param_info[operation_info.target_param].dimension
+        else if (param_info.len > 0)
+            param_info[0].dimension
+        else
+            1;
+            
+        try writer.print("    %c{d} = arith.constant {d} : index\n", .{ bounds_dim, bounds_dim });
         try writer.writeAll("    \n");
 
         // Generate GPU thread indexing code
@@ -242,10 +288,8 @@ pub const MLIRCodeGen = struct {
         try writer.writeAll("    \n");
 
         // Generate bounds check
-        if (param_info.len > 0) {
-            try writer.print("    // Bounds check: if (global_id >= {d}) return\n", .{param_info[0].dimension});
-            try writer.print("    %cond = arith.cmpi ult, %global_id, %c{d} : index\n", .{param_info[0].dimension});
-        }
+        try writer.print("    // Bounds check: if (global_id >= {d}) return\n", .{bounds_dim});
+        try writer.print("    %cond = arith.cmpi ult, %global_id, %c{d} : index\n", .{bounds_dim});
         try writer.writeAll("    scf.if %cond {\n");
 
         // Generate the actual operation based on function body analysis
@@ -261,6 +305,7 @@ pub const MLIRCodeGen = struct {
         dimension: u32,
         mlir_type: []const u8,
         element_type: parser.Type,
+        tensor_shape: ?[]const u32 = null, // For multi-dimensional tensors
     };
 
     /// Operation information extracted from function body
@@ -268,6 +313,7 @@ pub const MLIRCodeGen = struct {
         operation: parser.BinaryOperator,
         target_param: usize,
         source_params: []usize,
+        is_reduce: bool = false,
     };
 
     /// Analyze function parameters to extract dimension and type information
@@ -295,6 +341,7 @@ pub const MLIRCodeGen = struct {
                         .dimension = dimension,
                         .mlir_type = mlir_type,
                         .element_type = tensor_type.element_type.*,
+                        .tensor_shape = tensor_type.shape,
                     };
                 },
                 else => {
@@ -313,13 +360,29 @@ pub const MLIRCodeGen = struct {
 
     /// Analyze function body to determine the operation being performed
     fn analyzeOperation(self: *MLIRCodeGen, body: []parser.ASTNode) !OperationInfo {
-        // Look for parallel assignment pattern: a[i] = a[i] + b[i]
+        // Look for parallel assignment pattern: a[i] = a[i] + b[i] or reduce pattern
         for (body) |stmt| {
             if (stmt == .parallel_assignment) {
                 const pa = stmt.parallel_assignment;
 
+                // Check if the value is a reduce expression
+                if (pa.value.* == .reduce_expression) {
+                    const reduce_expr = pa.value.*.reduce_expression;
+                    
+                    // For reduce operations, we need to identify which parameter is being reduced
+                    // For now, assume first parameter is source, second is target
+                    const source_params = try self.allocator.alloc(usize, 1);
+                    source_params[0] = 0; // Source tensor to reduce
+                    
+                    return OperationInfo{
+                        .operation = reduce_expr.operator,
+                        .target_param = 1, // Target is second parameter
+                        .source_params = source_params,
+                        .is_reduce = true,
+                    };
+                }
                 // Check if the value is a binary expression
-                if (pa.value.* == .binary_expression) {
+                else if (pa.value.* == .binary_expression) {
                     const bin_expr = pa.value.*.binary_expression;
 
                     // Create source params slice
@@ -333,6 +396,7 @@ pub const MLIRCodeGen = struct {
                         .operation = bin_expr.operator,
                         .target_param = 0,
                         .source_params = source_params,
+                        .is_reduce = false,
                     };
                 }
             }
@@ -347,12 +411,12 @@ pub const MLIRCodeGen = struct {
             .operation = parser.BinaryOperator.add,
             .target_param = 0,
             .source_params = default_source_params,
+            .is_reduce = false,
         };
     }
 
     /// Generate MLIR code for the specific operation
     fn generateOperationMLIR(self: *MLIRCodeGen, writer: anytype, param_info: []ParameterInfo, operation_info: OperationInfo) !void {
-        _ = self; // Unused parameter for now
 
         // Early return if no parameters to work with
         if (param_info.len == 0) {
@@ -360,51 +424,141 @@ pub const MLIRCodeGen = struct {
             return;
         }
 
-        // Generate load operations for source parameters
-        for (operation_info.source_params, 0..) |param_idx, i| {
-            if (param_idx < param_info.len) {
-                try writer.print("      %val{d} = memref.load %arg{d}[%global_id] : memref<{d}x{s}>\n", .{ i + 1, param_idx, param_info[param_idx].dimension, param_info[param_idx].mlir_type });
+        if (operation_info.is_reduce) {
+            // Handle reduce operations differently
+            try self.generateReduceOperationMLIR(writer, param_info, operation_info);
+        } else {
+            // Original binary operation code
+            // Generate load operations for source parameters
+            for (operation_info.source_params, 0..) |param_idx, i| {
+                if (param_idx < param_info.len) {
+                    try writer.print("      %val{d} = memref.load %arg{d}[%global_id] : memref<{d}x{s}>\n", .{ i + 1, param_idx, param_info[param_idx].dimension, param_info[param_idx].mlir_type });
+                }
+            }
+            try writer.writeAll("      \n");
+
+            // Generate the operation based on the binary operator
+            const op_name = switch (operation_info.operation) {
+                .add => if (std.mem.eql(u8, param_info[0].mlir_type, "f32") or std.mem.eql(u8, param_info[0].mlir_type, "f64")) "arith.addf" else "arith.addi",
+                .subtract => if (std.mem.eql(u8, param_info[0].mlir_type, "f32") or std.mem.eql(u8, param_info[0].mlir_type, "f64")) "arith.subf" else "arith.subi",
+                .multiply => if (std.mem.eql(u8, param_info[0].mlir_type, "f32") or std.mem.eql(u8, param_info[0].mlir_type, "f64")) "arith.mulf" else "arith.muli",
+                .divide => if (std.mem.eql(u8, param_info[0].mlir_type, "f32") or std.mem.eql(u8, param_info[0].mlir_type, "f64")) "arith.divf" else "arith.divsi",
+            };
+
+            const op_comment = switch (operation_info.operation) {
+                .add => "addition",
+                .subtract => "subtraction",
+                .multiply => "multiplication",
+                .divide => "division",
+            };
+
+            try writer.print("      // Perform {s}: result = a[i] {s} b[i]\n", .{ op_comment, switch (operation_info.operation) {
+                .add => "+",
+                .subtract => "-",
+                .multiply => "*",
+                .divide => "/",
+            } });
+
+            // Generate the operation instruction
+            if (operation_info.source_params.len >= 2) {
+                try writer.print("      %result = {s} %val1, %val2 : {s}\n", .{ op_name, param_info[0].mlir_type });
+            } else {
+                // Fallback for single operand (shouldn't happen in normal cases)
+                try writer.print("      %result = {s} %val1, %val1 : {s}\n", .{ op_name, param_info[0].mlir_type });
+            }
+            try writer.writeAll("      \n");
+
+            // Generate store operation (in-place modification)
+            const target_param = operation_info.target_param;
+            if (target_param < param_info.len) {
+                try writer.writeAll("      // Store result back to a[i] (in-place)\n");
+                try writer.print("      memref.store %result, %arg{d}[%global_id] : memref<{d}x{s}>\n", .{ target_param, param_info[target_param].dimension, param_info[target_param].mlir_type });
             }
         }
-        try writer.writeAll("      \n");
-
-        // Generate the operation based on the binary operator
-        const op_name = switch (operation_info.operation) {
-            .add => if (std.mem.eql(u8, param_info[0].mlir_type, "f32") or std.mem.eql(u8, param_info[0].mlir_type, "f64")) "arith.addf" else "arith.addi",
-            .subtract => if (std.mem.eql(u8, param_info[0].mlir_type, "f32") or std.mem.eql(u8, param_info[0].mlir_type, "f64")) "arith.subf" else "arith.subi",
-            .multiply => if (std.mem.eql(u8, param_info[0].mlir_type, "f32") or std.mem.eql(u8, param_info[0].mlir_type, "f64")) "arith.mulf" else "arith.muli",
-            .divide => if (std.mem.eql(u8, param_info[0].mlir_type, "f32") or std.mem.eql(u8, param_info[0].mlir_type, "f64")) "arith.divf" else "arith.divsi",
-        };
-
-        const op_comment = switch (operation_info.operation) {
-            .add => "addition",
-            .subtract => "subtraction",
-            .multiply => "multiplication",
-            .divide => "division",
-        };
-
-        try writer.print("      // Perform {s}: result = a[i] {s} b[i]\n", .{ op_comment, switch (operation_info.operation) {
-            .add => "+",
-            .subtract => "-",
-            .multiply => "*",
-            .divide => "/",
-        } });
-
-        // Generate the operation instruction
-        if (operation_info.source_params.len >= 2) {
-            try writer.print("      %result = {s} %val1, %val2 : {s}\n", .{ op_name, param_info[0].mlir_type });
-        } else {
-            // Fallback for single operand (shouldn't happen in normal cases)
-            try writer.print("      %result = {s} %val1, %val1 : {s}\n", .{ op_name, param_info[0].mlir_type });
-        }
-        try writer.writeAll("      \n");
-
-        // Generate store operation (in-place modification)
+    }
+    
+    /// Generate MLIR code for reduce operations
+    fn generateReduceOperationMLIR(self: *MLIRCodeGen, writer: anytype, param_info: []ParameterInfo, operation_info: OperationInfo) !void {
+        _ = self;
+        
+        // For GPU reduce, we need to:
+        // 1. Each thread handles one element of the output (dimension 0)
+        // 2. Each thread loops over the reduction dimension (dimension 1)
+        
+        const source_param = operation_info.source_params[0];
         const target_param = operation_info.target_param;
-        if (target_param < param_info.len) {
-            try writer.writeAll("      // Store result back to a[i] (in-place)\n");
-            try writer.print("      memref.store %result, %arg{d}[%global_id] : memref<{d}x{s}>\n", .{ target_param, param_info[target_param].dimension, param_info[target_param].mlir_type });
+        
+        if (source_param >= param_info.len or target_param >= param_info.len) {
+            try writer.writeAll("      // Invalid parameter indices for reduce\n");
+            return;
         }
+        
+        const source_info = param_info[source_param];
+        const target_info = param_info[target_param];
+        const element_type = target_info.mlir_type;
+        
+        // For 2D to 1D reduction, source should be 2D tensor type
+        // We need to extract the second dimension for the reduction loop
+        const reduction_dim = if (source_info.tensor_shape) |shape|
+            if (shape.len > 1) shape[1] else 1
+        else 1;
+        
+        try writer.writeAll("      // Reduce operation\n");
+        
+        // Initialize accumulator based on operation type
+        const init_value = switch (operation_info.operation) {
+            .add => if (std.mem.eql(u8, element_type, "f32")) "0.0" else if (std.mem.eql(u8, element_type, "f64")) "0.0" else "0",
+            .multiply => if (std.mem.eql(u8, element_type, "f32")) "1.0" else if (std.mem.eql(u8, element_type, "f64")) "1.0" else "1",
+            else => "0", // Default for unsupported operations
+        };
+        
+        try writer.print("      %init = arith.constant {s} : {s}\n", .{ init_value, element_type });
+        try writer.print("      %c1_reduce = arith.constant 1 : index\n", .{});
+        try writer.print("      %c{d}_reduce = arith.constant {d} : index\n", .{ reduction_dim, reduction_dim });
+        
+        // Create the reduction loop
+        try writer.writeAll("      %reduced = scf.for %j = %c0 to %c");
+        try writer.print("{d}_reduce", .{reduction_dim});
+        try writer.writeAll(" step %c1_reduce iter_args(%acc = %init) -> (");
+        try writer.print("{s}", .{element_type});
+        try writer.writeAll(") {\n");
+        
+        // Load element from multi-dimensional source tensor
+        if (source_info.tensor_shape) |shape| {
+            if (shape.len > 1) {
+                // Multi-dimensional access
+                try writer.print("        %elem = memref.load %arg{d}[%global_id, %j] : memref<", .{source_param});
+                for (shape, 0..) |dim, k| {
+                    if (k > 0) try writer.writeAll("x");
+                    try writer.print("{d}", .{dim});
+                }
+                try writer.print("x{s}>\n", .{element_type});
+            } else {
+                // 1D access
+                try writer.print("        %idx1 = arith.muli %global_id, %c{d} : index\n", .{reduction_dim});
+                try writer.writeAll("        %idx = arith.addi %idx1, %j : index\n");
+                try writer.print("        %elem = memref.load %arg{d}[%idx] : memref<{d}x{s}>\n", .{ source_param, source_info.dimension, element_type });
+            }
+        } else {
+            // No shape info - fallback
+            try writer.print("        %idx1 = arith.muli %global_id, %c{d} : index\n", .{reduction_dim});
+            try writer.writeAll("        %idx = arith.addi %idx1, %j : index\n");
+            try writer.print("        %elem = memref.load %arg{d}[%idx] : memref<{d}x{s}>\n", .{ source_param, source_info.dimension, element_type });
+        }
+        
+        // Perform the reduction operation
+        const op_name = switch (operation_info.operation) {
+            .add => if (std.mem.eql(u8, element_type, "f32") or std.mem.eql(u8, element_type, "f64")) "arith.addf" else "arith.addi",
+            .multiply => if (std.mem.eql(u8, element_type, "f32") or std.mem.eql(u8, element_type, "f64")) "arith.mulf" else "arith.muli",
+            else => "arith.addi", // Default
+        };
+        
+        try writer.print("        %new_acc = {s} %acc, %elem : {s}\n", .{ op_name, element_type });
+        try writer.print("        scf.yield %new_acc : {s}\n", .{element_type});
+        try writer.writeAll("      }\n");
+        
+        // Store the reduced value
+        try writer.print("      memref.store %reduced, %arg{d}[%global_id] : memref<{d}x{s}>\n", .{ target_param, target_info.dimension, element_type });
     }
 
     /// Lower MLIR to PTX using the integrated pipeline

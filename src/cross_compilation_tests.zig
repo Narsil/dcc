@@ -139,6 +139,40 @@ test "type system - tensor gpu interleaved" {
     try assertGpuCrossCompiles(allocator, test_source, "test_cross_tensors_stacked.toy", 100);
 }
 
+test "reduce - gpu 2D to 1D sum" {
+    const allocator = std.testing.allocator;
+    const test_source =
+        \\fn gpu_reduce(a: [5, 3]f32, b: [5]f32) void {
+        \\    b[i] = reduce(a[i, j], +);
+        \\}
+        \\
+        \\fn main() i32 {
+        \\    let a: [5, 3]f32 = [5, 3]f32{2.0f32};
+        \\    let b: [5]f32 = [5]f32{0.0f32};
+        \\    gpu_reduce(a, b);
+        \\    return 6i32; // Expected: 2.0 * 3 = 6.0
+        \\} 
+    ;
+    try assertGpuCrossCompiles(allocator, test_source, "test_gpu_reduce_2d_1d.toy", 6);
+}
+
+test "reduce - gpu 2D to 1D product" {
+    const allocator = std.testing.allocator;
+    const test_source =
+        \\fn gpu_reduce_rows(a: [3, 3]f32, result: [3]f32) void {
+        \\    result[i] = reduce(a[i, j], *);
+        \\}
+        \\
+        \\fn main() i32 {
+        \\    let a: [3, 3]f32 = [3, 3]f32{3.0f32};
+        \\    let result: [3]f32 = [3]f32{1.0f32};
+        \\    gpu_reduce_rows(a, result);
+        \\    return 27i32; // Expected: 3^3 = 27 (first row product)
+        \\} 
+    ;
+    try assertGpuCrossCompiles(allocator, test_source, "test_gpu_reduce_2d_1d_product.toy", 27);
+}
+
 fn assertCrossCompiles(allocator: std.mem.Allocator, source: []const u8, filename: []const u8, expected: u32) !void {
     for (targets) |target| {
         const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
