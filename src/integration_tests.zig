@@ -524,20 +524,32 @@ test "gpu function compilation with invalid triplet" {
 
     switch (out.term) {
         .Exited => |code| {
-            // Expect compilation failure with invalid GPU triplet
+            // Expect compilation failure
             if (code == 0) {
                 std.debug.print("Expected GPU compilation to fail with invalid triplet\n", .{});
                 std.debug.print("stdout: {s}\n", .{out.stdout});
                 std.debug.print("stderr: {s}\n", .{out.stderr});
                 return error.TestFailed;
             }
-            // Check that the error message contains the expected text
-            if (!std.mem.containsAtLeast(u8, out.stderr, 1, "Invalid GPU triplet") or
-                !std.mem.containsAtLeast(u8, out.stderr, 1, "Expected format: nvptx64-cuda:sm_XX"))
-            {
-                std.debug.print("Expected error message about invalid GPU triplet format\n", .{});
-                std.debug.print("stderr: {s}\n", .{out.stderr});
-                return error.TestFailed;
+            // Check error message based on platform
+            if (builtin.target.os.tag == .macos) {
+                // On macOS, we should get an error about GPU not being supported
+                if (!std.mem.containsAtLeast(u8, out.stderr, 1, "NVIDIA GPU compilation is not supported on macOS") and
+                    !std.mem.containsAtLeast(u8, out.stderr, 1, "GPU compilation is only supported on Linux"))
+                {
+                    std.debug.print("Expected error message about GPU not supported on macOS\n", .{});
+                    std.debug.print("stderr: {s}\n", .{out.stderr});
+                    return error.TestFailed;
+                }
+            } else {
+                // On other platforms, check for invalid triplet error
+                if (!std.mem.containsAtLeast(u8, out.stderr, 1, "Invalid GPU triplet") or
+                    !std.mem.containsAtLeast(u8, out.stderr, 1, "Expected format: nvptx64-cuda:sm_XX"))
+                {
+                    std.debug.print("Expected error message about invalid GPU triplet format\n", .{});
+                    std.debug.print("stderr: {s}\n", .{out.stderr});
+                    return error.TestFailed;
+                }
             }
         },
         else => return error.TestFailed,

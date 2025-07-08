@@ -3,14 +3,10 @@ const parser = @import("parser.zig");
 const mlir_codegen = @import("mlir_codegen.zig");
 const cuda_llvm_ir_gen = @import("cuda_llvm_ir_gen.zig");
 const cuda_stub_manager = @import("cuda_stub_manager.zig");
-const LLVM = @cImport({
-    @cInclude("llvm-c/Core.h");
-    @cInclude("llvm-c/TargetMachine.h");
-    @cInclude("llvm-c/Target.h");
-    @cInclude("llvm-c/Support.h");
-    @cInclude("llvm-c/BitReader.h");
-    @cInclude("llvm-c/Object.h");
-});
+const gpu_memory_tracker = @import("gpu_memory_tracker.zig");
+const gpu_memory_ops = @import("gpu_memory_ops.zig");
+const llvm_types = @import("llvm_types.zig");
+const LLVM = llvm_types.LLVM;
 
 pub const CodeGenError = error{ InvalidTopLevelNode, InvalidStatement, InvalidExpression, InvalidCallee, UndefinedVariable, UndefinedFunction, TargetError, CodeGenError, MainFunctionNotFound, MissingMainFunction, LinkingFailed, GpuCompilationNotImplemented, InvalidGpuTriplet, InvalidTargetTriple, InvalidCharacter, Overflow, CudaFunctionNotFound, CudaStubInitFailed } || std.mem.Allocator.Error;
 
@@ -78,8 +74,11 @@ pub const CodeGen = struct {
     functions: std.HashMap([]const u8, LLVM.LLVMValueRef, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
     accelerator: ?Accelerator,
     gpu_function_names: ?std.ArrayList([]const u8),
+    gpu_memory_tracker: ?gpu_memory_tracker.GpuMemoryTracker,
+    gpu_memory_ops: ?gpu_memory_ops.GpuMemoryOps,
 
     pub fn init(allocator: std.mem.Allocator, module_name: []const u8, verbose: bool, target: std.Target, gpu: ?std.Target) !CodeGen {
+        _ = target; // Target is passed for completeness but not used in init
         // Initialize LLVM X86 target (for x86_64 support)
         LLVM.LLVMInitializeX86TargetInfo();
         LLVM.LLVMInitializeX86Target();
@@ -104,13 +103,6 @@ pub const CodeGen = struct {
         // Parse GPU triplet if provided
         var accelerator: ?Accelerator = null;
         if (gpu) |gpu_target| {
-            if (target.os.tag == .macos) {
-                std.debug.print("Error: NVIDIA GPU compilation is not supported on macOS targets\n", .{});
-                std.debug.print("NVIDIA GPUs are not available on macOS. GPU compilation is only supported on Linux targets.\n", .{});
-                std.debug.print("To compile for GPU targets, use a Linux target (e.g., --target x86_64-unknown-linux-gnu).\n", .{});
-                return error.CodeGenError;
-            }
-
             accelerator = Accelerator.init(allocator, gpu_target, verbose) catch |err| blk: {
                 if (verbose) {
                     std.debug.print("⚠️  Warning: Failed to initialize accelerator: {}\n", .{err});
@@ -129,6 +121,8 @@ pub const CodeGen = struct {
             .functions = std.HashMap([]const u8, LLVM.LLVMValueRef, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .accelerator = accelerator,
             .gpu_function_names = null,
+            .gpu_memory_tracker = if (accelerator != null) gpu_memory_tracker.GpuMemoryTracker.init(allocator, verbose) else null,
+            .gpu_memory_ops = null, // Will be initialized after CUDA functions are declared
         };
     }
 
@@ -149,6 +143,11 @@ pub const CodeGen = struct {
                 self.allocator.free(name);
             }
             gpu_names.deinit();
+        }
+
+        // Clean up GPU memory tracker
+        if (self.gpu_memory_tracker) |*tracker| {
+            tracker.deinit();
         }
 
         // Clean up accelerator resources
@@ -218,16 +217,34 @@ pub const CodeGen = struct {
         // Generate LLVM IR for the program AST node
         switch (ast) {
             .program => |prog| {
-                // Collect GPU function names early if we have GPU support
-                if (self.accelerator != null) {
-                    self.gpu_function_names = try self.collectGpuFunctionNames(ast, self.allocator);
-                    if (self.verbose and self.gpu_function_names != null) {
-                        std.debug.print("🔧 Collected {} GPU functions: ", .{self.gpu_function_names.?.items.len});
-                        for (self.gpu_function_names.?.items) |name| {
+                // Always collect GPU function names to check if --gpu is needed
+                var temp_gpu_names = try self.collectGpuFunctionNames(ast, self.allocator);
+                const has_gpu_functions = temp_gpu_names.items.len > 0;
+                
+                // If we found GPU functions but don't have GPU support enabled, error out
+                if (has_gpu_functions and self.accelerator == null) {
+                    defer temp_gpu_names.deinit();
+                    std.debug.print("Error: Cannot compile GPU function '{s}' without --gpu flag\n", .{temp_gpu_names.items[0]});
+                    std.debug.print("GPU functions require GPU compilation support. Use --gpu flag to enable.\n", .{});
+                    return error.GpuCompilationNotImplemented;
+                }
+                
+                // Store GPU function names if we have GPU support
+                if (self.accelerator != null and has_gpu_functions) {
+                    self.gpu_function_names = temp_gpu_names;
+                    if (self.verbose) {
+                        std.debug.print("🔧 Collected {} GPU functions: ", .{temp_gpu_names.items.len});
+                        for (temp_gpu_names.items) |name| {
                             std.debug.print("{s} ", .{name});
                         }
                         std.debug.print("\n", .{});
                     }
+                } else if (self.accelerator != null) {
+                    // Have GPU support but no GPU functions
+                    self.gpu_function_names = temp_gpu_names;
+                } else {
+                    // No GPU support, clean up
+                    temp_gpu_names.deinit();
                 }
 
                 // Two-pass approach to handle forward function calls:
@@ -452,23 +469,37 @@ pub const CodeGen = struct {
     }
 
     fn generateReturn(self: *CodeGen, ret: @TypeOf(@as(parser.ASTNode, undefined).return_statement)) CodeGenError!void {
-        // Check if we're in the main function with GPU functions - if so, inject cleanup before return
+        // Check if we're in the main function with GPU functions
         const current_function = LLVM.LLVMGetBasicBlockParent(LLVM.LLVMGetInsertBlock(self.builder));
         const function_name = LLVM.LLVMGetValueName(current_function);
         const is_main = std.mem.eql(u8, std.mem.span(function_name), "main");
 
-        if (is_main and self.hasGpuFunctions()) {
-            if (self.verbose) {
-                std.debug.print("🧹 Injecting CUDA cleanup before return in main function\n", .{});
-            }
-            try self.injectCudaCleanupBeforeReturn();
-        }
-
         if (ret.value) |value| {
+            // Generate the return expression FIRST (this may trigger GPU sync)
             const llvm_value = try self.generateExpression(value.*);
+            
+            // NOW inject CUDA cleanup after expression evaluation but before return
+            if (is_main and self.hasGpuFunctions()) {
+                if (self.verbose) {
+                    std.debug.print("🧹 Injecting CUDA cleanup after expression evaluation\n", .{});
+                }
+                // Free any allocated GPU memory first
+                try self.freeAllocatedGpuMemory();
+                try self.injectCudaCleanupBeforeReturn();
+            }
+            
             _ = LLVM.LLVMBuildRet(self.builder, llvm_value);
         } else {
             // Return statement has no value - must be a void function
+            // Inject cleanup before void return
+            if (is_main and self.hasGpuFunctions()) {
+                if (self.verbose) {
+                    std.debug.print("🧹 Injecting CUDA cleanup before void return\n", .{});
+                }
+                // Free any allocated GPU memory first
+                try self.freeAllocatedGpuMemory();
+                try self.injectCudaCleanupBeforeReturn();
+            }
             _ = LLVM.LLVMBuildRetVoid(self.builder);
         }
     }
@@ -641,6 +672,21 @@ pub const CodeGen = struct {
                     else => return error.InvalidCallee,
                 };
 
+                // Check if this is a GPU function call with optimized memory management
+                if (self.gpu_memory_tracker != null and 
+                    self.gpu_memory_ops != null and 
+                    std.mem.startsWith(u8, callee_name, "gpu_")) {
+                    
+                    // Use the optimized GPU launcher
+                    const launcher_name = try std.fmt.allocPrint(self.allocator, "{s}_gpu_launch", .{callee_name});
+                    defer self.allocator.free(launcher_name);
+                    
+                    if (self.functions.get(launcher_name)) |launcher_function| {
+                        return try self.generateOptimizedGpuCall(call, callee_name, launcher_function);
+                    }
+                }
+
+                // Regular function call
                 if (self.functions.get(callee_name)) |function| {
                     const args = try self.allocator.alloc(LLVM.LLVMValueRef, call.arguments.len);
                     defer self.allocator.free(args);
@@ -695,6 +741,40 @@ pub const CodeGen = struct {
                 const vi_slice = self.variables.get(name_slice) orelse return error.CodeGenError;
                 if (vi_slice.ty != .tensor) return error.CodeGenError;
 
+                // Check if we need to sync GPU data back to CPU
+                if (self.gpu_memory_tracker) |*tracker| {
+                    if (self.verbose) {
+                        std.debug.print("  🔍 Checking GPU sync for tensor_slice of '{s}'\n", .{name_slice});
+                        tracker.printState();
+                    }
+                    if (tracker.needsTransferToCpu(name_slice)) {
+                        if (self.gpu_memory_ops) |*ops| {
+                            if (self.verbose) {
+                                std.debug.print("  🔄 Synchronizing GPU data for '{s}' before CPU access\n", .{name_slice});
+                            }
+                            
+                            // Synchronize GPU operations
+                            ops.synchronize();
+                            
+                            // Copy data back from GPU
+                            if (tracker.getGpuPtr(name_slice)) |gpu_ptr_opt| {
+                                const gpu_ptr = gpu_ptr_opt;
+                                const size_t_type = LLVM.LLVMInt64TypeInContext(self.context);
+                                const tensor_size = LLVM.LLVMConstInt(size_t_type, 1024 * 4, 0); // TODO: get actual size
+                                const ptr_type = LLVM.LLVMPointerType(LLVM.LLVMInt8TypeInContext(self.context), 0);
+                                const host_ptr = LLVM.LLVMBuildBitCast(self.builder, tensor_ptr, ptr_type, "host_ptr");
+                                
+                                ops.copyDeviceToHost(host_ptr, gpu_ptr, tensor_size);
+                                try tracker.markCopiedToCpu(name_slice);
+                                
+                                if (self.verbose) {
+                                    std.debug.print("  ⬇️  Copied '{s}' back to CPU\n", .{name_slice});
+                                }
+                            }
+                        }
+                    }
+                }
+
                 const array_ty = self.toLLVMType(vi_slice.ty);
                 const elem_ty = self.toLLVMType(vi_slice.ty.tensor.element_type.*);
 
@@ -718,6 +798,103 @@ pub const CodeGen = struct {
             },
             else => return error.InvalidExpression,
         }
+    }
+
+    /// Generate an optimized GPU function call with explicit memory management
+    fn generateOptimizedGpuCall(self: *CodeGen, call: @TypeOf(@as(parser.ASTNode, undefined).call_expression), func_name: []const u8, launcher_function: LLVM.LLVMValueRef) CodeGenError!LLVM.LLVMValueRef {
+        var tracker = &self.gpu_memory_tracker.?;
+        var ops = &self.gpu_memory_ops.?;
+        
+        if (self.verbose) {
+            std.debug.print("🚀 Generating optimized GPU call for: {s}\n", .{func_name});
+        }
+
+        // First, evaluate all arguments
+        const args = try self.allocator.alloc(LLVM.LLVMValueRef, call.arguments.len);
+        defer self.allocator.free(args);
+
+        for (call.arguments, 0..) |arg, i| {
+            args[i] = try self.generateExpression(arg);
+        }
+
+        // Get function info to know parameter types
+        // In a real implementation, we'd look up the function declaration
+        // For now, assume all parameters are tensors of i32[1024]
+
+        // Prepare GPU memory for each tensor argument
+        const gpu_args = try self.allocator.alloc(LLVM.LLVMValueRef, args.len);
+        defer self.allocator.free(gpu_args);
+
+        const ptr_type = LLVM.LLVMPointerType(LLVM.LLVMInt8TypeInContext(self.context), 0);
+        const size_t_type = LLVM.LLVMInt64TypeInContext(self.context);
+
+        for (args, 0..) |arg, i| {
+            // For this simplified version, assume all args are tensors
+            // Extract variable name from argument (if it's an identifier)
+            var var_name_buf: []u8 = undefined;
+            var var_name: []const u8 = undefined;
+            var should_free = false;
+            if (call.arguments[i] == .identifier) {
+                var_name = call.arguments[i].identifier.name;
+                if (self.verbose) {
+                    std.debug.print("  📝 Processing variable '{s}' (arg {})\n", .{var_name, i});
+                }
+            } else {
+                var_name_buf = try std.fmt.allocPrint(self.allocator, "tmp_arg_{}", .{i});
+                var_name = var_name_buf;
+                should_free = true;
+            }
+            defer if (should_free) self.allocator.free(var_name_buf);
+
+            // Check if already on GPU
+            if (tracker.getGpuPtr(var_name)) |existing_gpu_ptr| {
+                gpu_args[i] = existing_gpu_ptr;
+                if (self.verbose) {
+                    std.debug.print("  ♻️  Reusing GPU memory for '{s}'\n", .{var_name});
+                }
+            } else {
+                // Need to allocate and transfer
+                const tensor_size = LLVM.LLVMConstInt(size_t_type, 1024 * 4, 0); // 1024 * sizeof(i32)
+                
+                // Allocate GPU memory
+                const gpu_ptr = ops.allocateGpuMemory(tensor_size, var_name);
+                gpu_args[i] = gpu_ptr;
+                
+                // Register with tracker (only if not already registered)
+                if (tracker.getCpuPtr(var_name) == null) {
+                    try tracker.registerVariable(var_name, arg, 1024 * 4);
+                }
+                try tracker.markGpuAllocated(var_name, gpu_ptr);
+                
+                // Copy to GPU
+                const host_ptr = LLVM.LLVMBuildBitCast(self.builder, arg, ptr_type, "host_ptr");
+                ops.copyHostToDevice(gpu_ptr, host_ptr, tensor_size);
+                try tracker.markCopiedToGpu(var_name);
+                
+                if (self.verbose) {
+                    std.debug.print("  ⬆️  Allocated and copied '{s}' to GPU\n", .{var_name});
+                }
+            }
+        }
+
+        // Call the GPU launcher with GPU pointers
+        const launcher_type = LLVM.LLVMGlobalGetValueType(launcher_function);
+        const result = LLVM.LLVMBuildCall2(self.builder, launcher_type, launcher_function, gpu_args.ptr, @intCast(gpu_args.len), "gpu_call");
+
+        // Mark all tensor arguments as modified on GPU
+        for (call.arguments) |arg_node| {
+            if (arg_node == .identifier) {
+                const var_name = arg_node.identifier.name;
+                try tracker.markModifiedOnGpu(var_name);
+            }
+        }
+
+        // Note: We don't synchronize here! That will be done when needed
+        if (self.verbose) {
+            std.debug.print("  ✅ GPU kernel launched (no sync)\n", .{});
+        }
+
+        return result;
     }
 
     /// Similar to generateExpression but aware of the induction variable of a
@@ -1500,9 +1677,11 @@ pub const CodeGen = struct {
 
             // Step 4: Generate host wrapper functions for all GPU functions
             for (gpu_functions.items) |func| {
+                // Generate both the old wrapper (for compatibility) and new launcher
                 try self.generateGpuHostWrapper(func);
+                try self.generateGpuKernelLauncher(func);
                 if (self.verbose) {
-                    std.debug.print("✅ Generated host wrapper for GPU function: {s}\n", .{func.name});
+                    std.debug.print("✅ Generated host wrapper and launcher for GPU function: {s}\n", .{func.name});
                 }
             }
 
@@ -1557,6 +1736,131 @@ pub const CodeGen = struct {
             std.debug.print("Error: Cannot compile GPU function '{s}' without --gpu flag\n", .{func.name});
             std.debug.print("GPU functions require GPU compilation support. Use --gpu flag to enable.\n", .{});
             return error.GpuCompilationNotImplemented;
+        }
+    }
+
+    /// Generates a simple GPU kernel launcher without memory transfers
+    /// Memory transfers will be handled separately at call sites
+    fn generateGpuKernelLauncher(self: *CodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration)) CodeGenError!void {
+        if (self.verbose) {
+            std.debug.print("🚀 Generating GPU kernel launcher (no memory transfers): {s}\n", .{func.name});
+        }
+
+        // Create launcher function with GPU pointer parameters
+        const param_types = try self.allocator.alloc(LLVM.LLVMTypeRef, func.parameters.len);
+        defer self.allocator.free(param_types);
+
+        // All tensor parameters become GPU device pointers (i8*)
+        const ptr_type = LLVM.LLVMPointerType(LLVM.LLVMInt8TypeInContext(self.context), 0);
+        for (func.parameters, 0..) |param, i| {
+            if (param.type == .tensor) {
+                param_types[i] = ptr_type; // GPU device pointer
+            } else {
+                param_types[i] = self.toLLVMType(param.type);
+            }
+        }
+
+        // Create launcher function with _gpu_launch suffix
+        const launcher_name = try std.fmt.allocPrint(self.allocator, "{s}_gpu_launch", .{func.name});
+        defer self.allocator.free(launcher_name);
+
+        const return_type = self.toLLVMType(func.return_type);
+        const launcher_type = LLVM.LLVMFunctionType(return_type, param_types.ptr, @intCast(param_types.len), 0);
+        const launcher_func = LLVM.LLVMAddFunction(self.module, launcher_name.ptr, launcher_type);
+
+        // Store the launcher function
+        const launcher_name_dup = try self.allocator.dupe(u8, launcher_name);
+        try self.functions.put(launcher_name_dup, launcher_func);
+
+        // Create entry block
+        const entry_block = LLVM.LLVMAppendBasicBlockInContext(self.context, launcher_func, "entry");
+        LLVM.LLVMPositionBuilderAtEnd(self.builder, entry_block);
+
+        // Get global CUDA context and module
+        const cuda_context_global = LLVM.LLVMGetNamedGlobal(self.module, "cuda_context") orelse return error.CudaFunctionNotFound;
+        const cuda_module_global = LLVM.LLVMGetNamedGlobal(self.module, "cuda_module") orelse return error.CudaFunctionNotFound;
+
+        _ = LLVM.LLVMBuildLoad2(self.builder, ptr_type, cuda_context_global, "cuda_context");
+        _ = LLVM.LLVMBuildLoad2(self.builder, ptr_type, cuda_module_global, "cuda_module");
+
+        // Get pre-obtained kernel function pointer
+        const func_global_name = try std.fmt.allocPrint(self.allocator, "cuda_func_{s}", .{func.name});
+        defer self.allocator.free(func_global_name);
+        
+        const func_global = LLVM.LLVMGetNamedGlobal(self.module, func_global_name.ptr);
+        if (func_global == null) {
+            return CodeGenError.CudaFunctionNotFound;
+        }
+
+        const kernel_func = LLVM.LLVMBuildLoad2(self.builder, ptr_type, func_global.?, "kernel_func_val");
+
+        // Setup kernel launch parameters
+        const int32_type = LLVM.LLVMInt32TypeInContext(self.context);
+        const grid_x = LLVM.LLVMConstInt(int32_type, 1, 0);
+        const grid_y = LLVM.LLVMConstInt(int32_type, 1, 0);
+        const grid_z = LLVM.LLVMConstInt(int32_type, 1, 0);
+        const block_x = LLVM.LLVMConstInt(int32_type, 1024, 0);
+        const block_y = LLVM.LLVMConstInt(int32_type, 1, 0);
+        const block_z = LLVM.LLVMConstInt(int32_type, 1, 0);
+        const shared_mem = LLVM.LLVMConstInt(int32_type, 0, 0);
+        const stream = LLVM.LLVMConstNull(ptr_type);
+
+        // Create kernel arguments array from launcher parameters
+        const ptr_ptr_type = LLVM.LLVMPointerType(ptr_type, 0);
+        var kernel_param_ptrs = std.ArrayList(LLVM.LLVMValueRef).init(self.allocator);
+        defer kernel_param_ptrs.deinit();
+
+        for (func.parameters, 0..) |param, i| {
+            if (param.type == .tensor) {
+                const gpu_ptr = LLVM.LLVMGetParam(launcher_func, @intCast(i));
+                
+                // Allocate space for the device pointer value
+                const param_ptr = LLVM.LLVMBuildAlloca(self.builder, ptr_type, "param_ptr");
+                _ = LLVM.LLVMBuildStore(self.builder, gpu_ptr, param_ptr);
+                
+                try kernel_param_ptrs.append(param_ptr);
+            }
+        }
+
+        // Create array of parameter pointers
+        const param_array_type = LLVM.LLVMArrayType(ptr_type, @intCast(kernel_param_ptrs.items.len));
+        const param_array = LLVM.LLVMBuildAlloca(self.builder, param_array_type, "param_array");
+
+        for (kernel_param_ptrs.items, 0..) |param_ptr, i| {
+            var indices = [_]LLVM.LLVMValueRef{ 
+                LLVM.LLVMConstInt(int32_type, 0, 0), 
+                LLVM.LLVMConstInt(int32_type, @intCast(i), 0) 
+            };
+            const elem_ptr = LLVM.LLVMBuildGEP2(self.builder, param_array_type, param_array, &indices, 2, "param_elem_ptr");
+            _ = LLVM.LLVMBuildStore(self.builder, param_ptr, elem_ptr);
+        }
+
+        const kernel_args = LLVM.LLVMBuildBitCast(self.builder, param_array, ptr_ptr_type, "kernel_args");
+
+        // Get CUDA function declarations
+        const cuLaunchKernel_func = LLVM.LLVMGetNamedFunction(self.module, "cuLaunchKernel");
+        const cuLaunchKernel_type = LLVM.LLVMGlobalGetValueType(cuLaunchKernel_func);
+
+        // Launch kernel (no synchronization here!)
+        var launch_args = [_]LLVM.LLVMValueRef{ 
+            kernel_func, grid_x, grid_y, grid_z, 
+            block_x, block_y, block_z, shared_mem, 
+            stream, kernel_args, LLVM.LLVMConstNull(ptr_type) 
+        };
+        _ = LLVM.LLVMBuildCall2(self.builder, cuLaunchKernel_type, cuLaunchKernel_func, &launch_args, 11, "launch_result");
+
+        // Return void (no synchronization, no memory copies)
+        if (func.return_type == .void) {
+            _ = LLVM.LLVMBuildRetVoid(self.builder);
+        } else {
+            // For non-void functions, we can't return a value without synchronization
+            // Return a dummy value for now
+            const zero = LLVM.LLVMConstInt(self.toLLVMType(func.return_type), 0, 0);
+            _ = LLVM.LLVMBuildRet(self.builder, zero);
+        }
+
+        if (self.verbose) {
+            std.debug.print("✅ Generated GPU kernel launcher: {s}\n", .{launcher_name});
         }
     }
 
@@ -1749,6 +2053,11 @@ pub const CodeGen = struct {
         try self.generateCudaCreateContextInMainModule(cuDeviceGet_func, cuDeviceGet_type, cuCtxCreate_func, cuCtxCreate_type);
         try self.generateCudaLoadModuleInMainModule(cuModuleLoadData_func, cuModuleLoadData_type);
         try self.generateCudaCleanupInMainModule(cuCtxDestroy_func, cuCtxDestroy_type, cuModuleUnload_func, cuModuleUnload_type, cuDevicePrimaryCtxReset_func, cuDevicePrimaryCtxReset_type, void_type);
+
+        // Initialize GPU memory operations now that CUDA functions are declared
+        if (self.gpu_memory_tracker != null) {
+            self.gpu_memory_ops = gpu_memory_ops.GpuMemoryOps.init(self.context, self.module, self.builder, self.verbose);
+        }
 
         if (self.verbose) {
             std.debug.print("✅ All CUDA functions added to main module\n", .{});
@@ -2077,6 +2386,31 @@ pub const CodeGen = struct {
 
         if (self.verbose) {
             std.debug.print("✅ All GPU function pointers retrieved and stored\n", .{});
+        }
+    }
+
+    fn freeAllocatedGpuMemory(self: *CodeGen) CodeGenError!void {
+        if (self.gpu_memory_tracker == null or self.gpu_memory_ops == null) {
+            return;
+        }
+        
+        var tracker = &self.gpu_memory_tracker.?;
+        var ops = &self.gpu_memory_ops.?;
+        
+        if (self.verbose) {
+            std.debug.print("🗑️  Freeing allocated GPU memory\n", .{});
+        }
+        
+        // Iterate through all tracked variables and free GPU memory
+        var it = tracker.variables.iterator();
+        while (it.next()) |entry| {
+            const info = entry.value_ptr.*;
+            if (info.gpu_ptr) |gpu_ptr| {
+                ops.freeGpuMemory(gpu_ptr);
+                if (self.verbose) {
+                    std.debug.print("  🗑️  Freed GPU memory for '{s}'\n", .{entry.key_ptr.*});
+                }
+            }
         }
     }
 

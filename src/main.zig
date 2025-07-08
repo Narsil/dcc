@@ -103,10 +103,17 @@ pub fn main() !void {
     };
 
     const gpu_target: ?std.Target = if (gpu_triplet) |gpu| blk: {
+        // Check target OS first - GPU compilation is only supported on Linux targets
+        if (target.os.tag == .macos) {
+            std.debug.print("Error: NVIDIA GPU compilation is not supported on macOS targets\n", .{});
+            std.debug.print("NVIDIA GPUs are not available on macOS. GPU compilation is only supported on Linux targets.\n", .{});
+            return error.GpuNotSupportedOnMacOS;
+        }
+        
         var iter = std.mem.splitScalar(u8, gpu, ':');
         const arch_os_abi = iter.next() orelse return error.InvalidGpuTriplet;
         const cpu_features = iter.next() orelse {
-            std.debug.print("Invalid GPU triplet: {s}. Expected format: nvptx-cuda:sm_XX", .{gpu});
+            std.debug.print("Invalid GPU triplet: {s}. Expected format: nvptx64-cuda:sm_XX", .{gpu});
             return error.InvalidGpuTriplet;
         };
 
@@ -211,6 +218,10 @@ pub fn main() !void {
                 std.debug.print("Error: Invalid target triplet format\n", .{});
                 std.process.exit(1);
             },
+            error.GpuNotSupportedOnMacOS => {
+                // Error already printed in main
+                std.process.exit(1);
+            },
             codegen.CodeGenError.CudaFunctionNotFound => {
                 std.debug.print("Error: CUDA function not found in module\n", .{});
                 std.process.exit(1);
@@ -253,7 +264,7 @@ pub fn main() !void {
     }
 }
 
-fn compile(allocator: std.mem.Allocator, source_file: []const u8, target: std.Target, verbose: bool, gpu_target: ?std.Target) !void {
+fn compile(allocator: std.mem.Allocator, source_file: []const u8, target: std.Target, verbose: bool, gpu_target: ?std.Target) anyerror!void {
     if (verbose) {
         std.debug.print("Compiling: {s}\n", .{source_file});
     }
