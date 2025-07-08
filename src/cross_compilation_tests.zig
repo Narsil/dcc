@@ -58,7 +58,7 @@ test "type system - different integer types" {
     try assertCrossCompiles(allocator, test_source, "test_cross_integers.toy", 30);
 }
 
-test "type system - tensor gpu" {
+test "type system - tensor gpu add" {
     const allocator = std.testing.allocator;
     // Create a test file with different integer types
     const test_source =
@@ -72,10 +72,10 @@ test "type system - tensor gpu" {
         \\    return a[0];
         \\} 
     ;
-    try assertGpuCrossCompiles(allocator, test_source, "test_cross_tensors.toy", 6);
+    try assertGpuCrossCompiles(allocator, test_source, "test_cross_tensors_add.toy", 6);
 }
 
-test "type system - tensor gpu stacked" {
+test "type system - tensor gpu mul" {
     const allocator = std.testing.allocator;
     // Create a test file with different integer types
     const test_source =
@@ -89,7 +89,28 @@ test "type system - tensor gpu stacked" {
         \\    return a[0];
         \\} 
     ;
-    try assertGpuCrossCompiles(allocator, test_source, "test_cross_tensors_stacked.toy", 8);
+    try assertGpuCrossCompiles(allocator, test_source, "test_cross_tensors_mul.toy", 8);
+}
+
+test "type system - tensor gpu stacked" {
+    const allocator = std.testing.allocator;
+    // Create a test file with different integer types
+    const test_source =
+        \\fn gpu_vector_add(a: [1024]i32, b: [1024]i32) void{
+        \\    a[i] = a[i] + b[i];
+        \\}
+        \\fn gpu_vector_mul(a: [1024]i32, b: [1024]i32) void{
+        \\    a[i] = a[i] * b[i];
+        \\}
+        \\fn main() i32 {
+        \\    let a: [1024]i32 = [1024]i32{2i32};
+        \\    let b: [1024]i32 = [1024]i32{4i32};
+        \\    gpu_vector_add(a, b);
+        \\    gpu_vector_mul(a, b);
+        \\    return a[0];
+        \\} 
+    ;
+    try assertGpuCrossCompiles(allocator, test_source, "test_cross_tensors_stacked.toy", 24);
 }
 
 fn assertCrossCompiles(allocator: std.mem.Allocator, source: []const u8, filename: []const u8, expected: u32) !void {

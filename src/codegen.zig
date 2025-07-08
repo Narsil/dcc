@@ -77,6 +77,7 @@ pub const CodeGen = struct {
     variables: std.HashMap([]const u8, VarInfo, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
     functions: std.HashMap([]const u8, LLVM.LLVMValueRef, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
     accelerator: ?Accelerator,
+    gpu_function_names: ?std.ArrayList([]const u8),
 
     pub fn init(allocator: std.mem.Allocator, module_name: []const u8, verbose: bool, target: std.Target, gpu: ?std.Target) !CodeGen {
         // Initialize LLVM X86 target (for x86_64 support)
@@ -127,6 +128,7 @@ pub const CodeGen = struct {
             .variables = std.HashMap([]const u8, VarInfo, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .functions = std.HashMap([]const u8, LLVM.LLVMValueRef, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .accelerator = accelerator,
+            .gpu_function_names = null,
         };
     }
 
@@ -140,6 +142,14 @@ pub const CodeGen = struct {
 
         // Variables are cleaned up after each function, so just deinit the HashMap
         self.variables.deinit();
+
+        // Free GPU function names if allocated
+        if (self.gpu_function_names) |gpu_names| {
+            for (gpu_names.items) |name| {
+                self.allocator.free(name);
+            }
+            gpu_names.deinit();
+        }
 
         // Clean up accelerator resources
         if (self.accelerator) |*accel| {
@@ -179,6 +189,27 @@ pub const CodeGen = struct {
         return self.accelerator != null;
     }
 
+    fn collectGpuFunctionNames(self: *CodeGen, ast: parser.ASTNode, allocator: std.mem.Allocator) !std.ArrayList([]const u8) {
+        _ = self;
+        var gpu_function_names = std.ArrayList([]const u8).init(allocator);
+        
+        switch (ast) {
+            .program => |prog| {
+                for (prog.statements) |stmt| {
+                    if (stmt == .function_declaration) {
+                        const func = stmt.function_declaration;
+                        if (std.mem.startsWith(u8, func.name, "gpu_")) {
+                            try gpu_function_names.append(try allocator.dupe(u8, func.name));
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+        
+        return gpu_function_names;
+    }
+
     pub fn generate(self: *CodeGen, ast: parser.ASTNode) CodeGenError!void {
         return self.generateWithMode(ast, .executable);
     }
@@ -187,6 +218,18 @@ pub const CodeGen = struct {
         // Generate LLVM IR for the program AST node
         switch (ast) {
             .program => |prog| {
+                // Collect GPU function names early if we have GPU support
+                if (self.accelerator != null) {
+                    self.gpu_function_names = try self.collectGpuFunctionNames(ast, self.allocator);
+                    if (self.verbose and self.gpu_function_names != null) {
+                        std.debug.print("🔧 Collected {} GPU functions: ", .{self.gpu_function_names.?.items.len});
+                        for (self.gpu_function_names.?.items) |name| {
+                            std.debug.print("{s} ", .{name});
+                        }
+                        std.debug.print("\n", .{});
+                    }
+                }
+
                 // Two-pass approach to handle forward function calls:
                 // Pass 1: Declare all functions (signatures only)
                 for (prog.statements) |stmt| {
@@ -199,13 +242,19 @@ pub const CodeGen = struct {
                 var main_processed = false;
                 var main_func_decl: ?@TypeOf(@as(parser.ASTNode, undefined).function_declaration) = null;
 
-                // First, process GPU functions
+                // First, collect and process all GPU functions together in a single module
+                if (self.accelerator != null and self.gpu_function_names != null and self.gpu_function_names.?.items.len > 0) {
+                    try self.generateAllGpuFunctions(prog.statements);
+                }
+
+                // Then, process non-GPU functions
                 for (prog.statements) |stmt| {
                     if (stmt == .function_declaration) {
                         const func = stmt.function_declaration;
                         if (std.mem.eql(u8, func.name, "main")) {
                             main_func_decl = func;
-                        } else {
+                        } else if (!std.mem.startsWith(u8, func.name, "gpu_")) {
+                            // Skip GPU functions as they're processed separately above
                             try self.generateFunctionBody(func);
                         }
                     }
@@ -285,9 +334,13 @@ pub const CodeGen = struct {
     }
 
     fn generateFunctionBody(self: *CodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration)) CodeGenError!void {
-        // Detect GPU functions by naming convention and bail out for now
+        // GPU functions are processed separately in generateAllGpuFunctions
         if (std.mem.startsWith(u8, func.name, "gpu_")) {
-            return self.generateGpuFunction(func);
+            // This should not be reached since GPU functions are filtered out in generateWithMode
+            if (self.verbose) {
+                std.debug.print("⚠️  GPU function {s} reached generateFunctionBody - this should not happen\n", .{func.name});
+            }
+            return;
         }
 
         // Get the already declared function
@@ -1377,6 +1430,92 @@ pub const CodeGen = struct {
         }
     }
 
+    /// Generate all GPU functions together in a single MLIR module
+    fn generateAllGpuFunctions(self: *CodeGen, statements: []parser.ASTNode) CodeGenError!void {
+        if (self.accelerator) |*accel| {
+            if (self.verbose) {
+                std.debug.print("🚀 Compiling all GPU functions together in a single module\n", .{});
+            }
+
+            // Collect all GPU function declarations
+            var gpu_functions = std.ArrayList(@TypeOf(@as(parser.ASTNode, undefined).function_declaration)).init(self.allocator);
+            defer gpu_functions.deinit();
+
+            for (statements) |stmt| {
+                if (stmt == .function_declaration) {
+                    const func = stmt.function_declaration;
+                    if (std.mem.startsWith(u8, func.name, "gpu_")) {
+                        try gpu_functions.append(func);
+                        if (self.verbose) {
+                            std.debug.print("🔧 Collected GPU function: {s}\n", .{func.name});
+                        }
+                    }
+                }
+            }
+
+            if (gpu_functions.items.len == 0) {
+                if (self.verbose) {
+                    std.debug.print("❌ No GPU functions found to compile\n", .{});
+                }
+                return;
+            }
+
+            // Step 1: Generate MLIR for all GPU functions in a single module
+            accel.codegen.generateGpuModule(gpu_functions.items) catch |err| {
+                if (self.verbose) {
+                    std.debug.print("MLIR GPU module compilation failed: {}\n", .{err});
+                }
+                // Fall back to generating CPU wrappers for all functions
+                for (gpu_functions.items) |func| {
+                    self.generateGpuHostWrapper(func) catch {};
+                }
+                return;
+            };
+
+            if (self.verbose) {
+                accel.codegen.printMLIR();
+            }
+
+            // Step 2: Generate PTX from the combined MLIR module
+            // Use the first function name as a representative for the module
+            const ptx_code = accel.codegen.lowerMLIRToPTX(gpu_functions.items[0].name) catch |err| {
+                if (self.verbose) {
+                    std.debug.print("PTX generation failed: {}\n", .{err});
+                }
+                // Fall back to generating CPU wrappers for all functions
+                for (gpu_functions.items) |func| {
+                    self.generateGpuHostWrapper(func) catch {};
+                }
+                return;
+            };
+            defer self.allocator.free(ptx_code);
+
+            if (self.verbose) {
+                std.debug.print("✅ Generated PTX code for all GPU functions ({d} bytes)\n", .{ptx_code.len});
+            }
+
+            // Step 3: Generate CUDA LLVM IR wrapper using the combined PTX
+            // Use the first function for the wrapper but the PTX contains all functions
+            try self.generateCudaLLVMIRWrapper(gpu_functions.items[0], ptx_code);
+
+            // Step 4: Generate host wrapper functions for all GPU functions
+            for (gpu_functions.items) |func| {
+                try self.generateGpuHostWrapper(func);
+                if (self.verbose) {
+                    std.debug.print("✅ Generated host wrapper for GPU function: {s}\n", .{func.name});
+                }
+            }
+
+            if (self.verbose) {
+                std.debug.print("✅ Successfully compiled all {} GPU functions together\n", .{gpu_functions.items.len});
+            }
+        } else {
+            std.debug.print("Error: Cannot compile GPU functions without --gpu flag\n", .{});
+            std.debug.print("GPU functions require GPU compilation support. Use --gpu flag to enable.\n", .{});
+            return error.GpuCompilationNotImplemented;
+        }
+    }
+
     fn generateGpuFunction(self: *CodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration)) CodeGenError!void {
         if (self.accelerator) |*accel| {
             if (self.verbose) {
@@ -1588,6 +1727,22 @@ pub const CodeGen = struct {
         const cuda_module_global = LLVM.LLVMAddGlobal(self.module, ptr_type, "cuda_module");
         LLVM.LLVMSetInitializer(cuda_module_global, LLVM.LLVMConstNull(ptr_type));
         LLVM.LLVMSetLinkage(cuda_module_global, LLVM.LLVMInternalLinkage);
+
+        // Create global variables to store GPU function pointers
+        if (self.gpu_function_names) |gpu_names| {
+            for (gpu_names.items) |func_name| {
+                const global_name = try std.fmt.allocPrintZ(self.allocator, "cuda_func_{s}", .{func_name});
+                defer self.allocator.free(global_name);
+                
+                const func_global = LLVM.LLVMAddGlobal(self.module, ptr_type, global_name.ptr);
+                LLVM.LLVMSetInitializer(func_global, LLVM.LLVMConstNull(ptr_type));
+                LLVM.LLVMSetLinkage(func_global, LLVM.LLVMInternalLinkage);
+                
+                if (self.verbose) {
+                    std.debug.print("🔧 Created global variable for GPU function: {s}\n", .{func_name});
+                }
+            }
+        }
 
         // Generate CUDA wrapper functions in the main module
         try self.generateCudaInitInMainModule(cuInit_func, cuInit_type);
@@ -1853,10 +2008,75 @@ pub const CodeGen = struct {
             // Store module in global variable
             const module_val = LLVM.LLVMBuildLoad2(self.builder, ptr_type, module_var, "module_val");
             _ = LLVM.LLVMBuildStore(self.builder, module_val, cuda_module_global.?);
+
+            // 5. Get all GPU function pointers from the PTX module and store them in global variables
+            try self.getAllGpuFunctionPointers(module_val);
         }
 
         if (self.verbose) {
             std.debug.print("✅ CUDA one-time initialization injected into main function\n", .{});
+        }
+    }
+
+    fn getAllGpuFunctionPointers(self: *CodeGen, cuda_module: LLVM.LLVMValueRef) CodeGenError!void {
+        if (self.verbose) {
+            std.debug.print("🔧 Getting all GPU function pointers from PTX module\n", .{});
+        }
+
+        // Get cuModuleGetFunction that should already be declared
+        const cuModuleGetFunction_func = LLVM.LLVMGetNamedFunction(self.module, "cuModuleGetFunction");
+        if (cuModuleGetFunction_func == null) {
+            if (self.verbose) {
+                std.debug.print("❌ cuModuleGetFunction not found\n", .{});
+            }
+            return CodeGenError.CudaFunctionNotFound;
+        }
+
+        const cuModuleGetFunction_type = LLVM.LLVMGlobalGetValueType(cuModuleGetFunction_func.?);
+        
+        // Basic types
+        const int8_type = LLVM.LLVMInt8TypeInContext(self.context);
+        const ptr_type = LLVM.LLVMPointerType(int8_type, 0);
+
+        // Get all GPU function pointers
+        if (self.gpu_function_names) |gpu_names| {
+            for (gpu_names.items) |func_name| {
+                // Get the global variable for this function
+                const global_name = try std.fmt.allocPrintZ(self.allocator, "cuda_func_{s}", .{func_name});
+                defer self.allocator.free(global_name);
+                
+                const func_global = LLVM.LLVMGetNamedGlobal(self.module, global_name.ptr);
+                if (func_global == null) {
+                    if (self.verbose) {
+                        std.debug.print("❌ Global variable not found for GPU function: {s}\n", .{func_name});
+                    }
+                    continue;
+                }
+
+                // Allocate space for the function pointer
+                const func_ptr_var = LLVM.LLVMBuildAlloca(self.builder, ptr_type, "func_ptr");
+                
+                // Create kernel name string
+                const kernel_name = try std.fmt.allocPrintZ(self.allocator, "{s}", .{func_name});
+                defer self.allocator.free(kernel_name);
+                const kernel_name_global = LLVM.LLVMBuildGlobalStringPtr(self.builder, kernel_name.ptr, "kernel_name");
+
+                // Call cuModuleGetFunction(func_ptr, module, kernel_name)
+                var get_func_args = [_]LLVM.LLVMValueRef{ func_ptr_var, cuda_module, kernel_name_global };
+                _ = LLVM.LLVMBuildCall2(self.builder, cuModuleGetFunction_type, cuModuleGetFunction_func.?, &get_func_args, 3, "get_func_result");
+
+                // Load the function pointer and store it in the global variable
+                const func_ptr = LLVM.LLVMBuildLoad2(self.builder, ptr_type, func_ptr_var, "func_ptr_val");
+                _ = LLVM.LLVMBuildStore(self.builder, func_ptr, func_global.?);
+
+                if (self.verbose) {
+                    std.debug.print("✅ Retrieved function pointer for GPU function: {s}\n", .{func_name});
+                }
+            }
+        }
+
+        if (self.verbose) {
+            std.debug.print("✅ All GPU function pointers retrieved and stored\n", .{});
         }
     }
 
@@ -1943,10 +2163,9 @@ pub const CodeGen = struct {
         // Load the global context and module
         // Note: cuda_context not used in current implementation but available if needed
         _ = LLVM.LLVMBuildLoad2(self.builder, ptr_type, cuda_context_global.?, "cuda_context");
-        const cuda_module = LLVM.LLVMBuildLoad2(self.builder, ptr_type, cuda_module_global.?, "cuda_module");
+        _ = LLVM.LLVMBuildLoad2(self.builder, ptr_type, cuda_module_global.?, "cuda_module");
 
         // Get additional CUDA functions that should already be declared in addCudaFunctionsToMainModule
-        const cuModuleGetFunction_func = LLVM.LLVMGetNamedFunction(self.module, "cuModuleGetFunction");
         const cuMemAlloc_func = LLVM.LLVMGetNamedFunction(self.module, "cuMemAlloc_v2");
         const cuMemcpyHtoD_func = LLVM.LLVMGetNamedFunction(self.module, "cuMemcpyHtoD_v2");
         const cuLaunchKernel_func = LLVM.LLVMGetNamedFunction(self.module, "cuLaunchKernel");
@@ -1954,7 +2173,7 @@ pub const CodeGen = struct {
         const cuMemcpyDtoH_func = LLVM.LLVMGetNamedFunction(self.module, "cuMemcpyDtoH_v2");
         const cuMemFree_func = LLVM.LLVMGetNamedFunction(self.module, "cuMemFree_v2");
 
-        if (cuModuleGetFunction_func == null or cuMemAlloc_func == null or cuMemcpyHtoD_func == null or
+        if (cuMemAlloc_func == null or cuMemcpyHtoD_func == null or
             cuLaunchKernel_func == null or cuCtxSynchronize_func == null or cuMemcpyDtoH_func == null or cuMemFree_func == null)
         {
             if (self.verbose) {
@@ -1964,7 +2183,6 @@ pub const CodeGen = struct {
         }
 
         // Get function types from existing functions
-        const cuModuleGetFunction_type = LLVM.LLVMGlobalGetValueType(cuModuleGetFunction_func.?);
         const cuMemAlloc_type = LLVM.LLVMGlobalGetValueType(cuMemAlloc_func.?);
         const cuMemcpyHtoD_type = LLVM.LLVMGlobalGetValueType(cuMemcpyHtoD_func.?);
         const cuLaunchKernel_type = LLVM.LLVMGlobalGetValueType(cuLaunchKernel_func.?);
@@ -1974,15 +2192,24 @@ pub const CodeGen = struct {
 
         const zero = LLVM.LLVMConstInt(int32_type, 0, 0);
 
-        // 1. Get kernel function from the pre-loaded module
-        const kernel_func_ptr = LLVM.LLVMBuildAlloca(self.builder, ptr_type, "kernel_func");
-        const kernel_name = try std.fmt.allocPrintZ(self.allocator, "{s}", .{func.name});
-        defer self.allocator.free(kernel_name);
-        const kernel_name_global = LLVM.LLVMBuildGlobalStringPtr(self.builder, kernel_name.ptr, "kernel_name");
+        // 1. Get kernel function from the pre-obtained global variable
+        const global_name = try std.fmt.allocPrintZ(self.allocator, "cuda_func_{s}", .{func.name});
+        defer self.allocator.free(global_name);
+        
+        const func_global = LLVM.LLVMGetNamedGlobal(self.module, global_name.ptr);
+        if (func_global == null) {
+            if (self.verbose) {
+                std.debug.print("❌ Pre-obtained function pointer not found for GPU function: {s}\n", .{func.name});
+            }
+            return CodeGenError.CudaFunctionNotFound;
+        }
 
-        var get_func_args = [_]LLVM.LLVMValueRef{ kernel_func_ptr, cuda_module, kernel_name_global };
-        _ = LLVM.LLVMBuildCall2(self.builder, cuModuleGetFunction_type, cuModuleGetFunction_func.?, &get_func_args, 3, "get_func_result");
-        const kernel_func = LLVM.LLVMBuildLoad2(self.builder, ptr_type, kernel_func_ptr, "kernel_func_val");
+        // Load the pre-obtained function pointer
+        const kernel_func = LLVM.LLVMBuildLoad2(self.builder, ptr_type, func_global.?, "kernel_func_val");
+
+        if (self.verbose) {
+            std.debug.print("✅ Using pre-obtained function pointer for GPU function: {s}\n", .{func.name});
+        }
 
         // 6. Allocate GPU memory and copy data for each parameter
         var gpu_ptrs = std.ArrayList(LLVM.LLVMValueRef).init(self.allocator);

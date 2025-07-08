@@ -100,15 +100,51 @@ pub const MLIRCodeGen = struct {
         }
 
         // Generate the exact MLIR structure from simple_vector_add_gpu.mlir
-        try self.generateGpuModuleMLIR(func);
+        try self.generateGpuFunctionMLIR(func);
 
         if (self.verbose) {
             std.debug.print("✅ Successfully generated GPU MLIR for function: {s}\n", .{func.name});
         }
     }
 
-    /// Generate the GPU module MLIR based on the actual function declaration
-    fn generateGpuModuleMLIR(self: *MLIRCodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration)) MLIRCodeGenError!void {
+    /// Generate multiple GPU functions in a single MLIR module
+    pub fn generateGpuModule(self: *MLIRCodeGen, functions: []@TypeOf(@as(parser.ASTNode, undefined).function_declaration)) MLIRCodeGenError!void {
+        if (self.verbose) {
+            std.debug.print("🔧 Generating GPU module with {} functions\n", .{functions.len});
+        }
+
+        const writer = self.generated_mlir.writer();
+
+        // Start the GPU module
+        try writer.writeAll("gpu.module @kernels {\n");
+
+        // Generate all GPU functions within the same module
+        for (functions) |func| {
+            if (self.verbose) {
+                std.debug.print("🔧 Adding GPU function to module: {s}\n", .{func.name});
+            }
+            try self.generateSingleGpuFunction(writer, func);
+        }
+
+        // Close the GPU module
+        try writer.writeAll("}\n");
+
+        // Store the generated MLIR for debugging
+        if (self.verbose) {
+            const generated_mlir_content = self.generated_mlir.items;
+            std.fs.cwd().writeFile(.{ .sub_path = "generated_mlir.mlir", .data = generated_mlir_content }) catch |err| {
+                std.debug.print("Warning: Could not save generated MLIR to file: {}\n", .{err});
+            };
+            std.debug.print("📄 Generated MLIR saved to generated_mlir.mlir\n", .{});
+        }
+
+        if (self.verbose) {
+            std.debug.print("✅ Successfully generated GPU module with {} functions\n", .{functions.len});
+        }
+    }
+
+    /// Generate the GPU function MLIR (with module wrapper for single function)
+    fn generateGpuFunctionMLIR(self: *MLIRCodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration)) MLIRCodeGenError!void {
         const writer = self.generated_mlir.writer();
 
         // Analyze function parameters to determine dimensions and types
@@ -169,6 +205,55 @@ pub const MLIRCodeGen = struct {
             };
             std.debug.print("📄 Generated MLIR saved to generated_mlir.mlir\n", .{});
         }
+    }
+
+    /// Generate a single GPU function inside an existing module
+    fn generateSingleGpuFunction(self: *MLIRCodeGen, writer: anytype, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration)) MLIRCodeGenError!void {
+        // Analyze function parameters to determine dimensions and types
+        const param_info = try self.analyzeParameters(func.parameters);
+        defer self.allocator.free(param_info);
+
+        // Analyze function body to determine the operation
+        const operation_info = try self.analyzeOperation(func.body);
+        defer self.allocator.free(operation_info.source_params);
+
+        // Create the function signature based on actual parameters
+        try writer.print("  gpu.func @{s}(", .{func.name});
+        for (param_info, 0..) |param, i| {
+            if (i > 0) try writer.writeAll(", ");
+            try writer.print("%arg{d}: memref<{d}x{s}>", .{ i, param.dimension, param.mlir_type });
+        }
+        try writer.writeAll(") kernel {\n");
+
+        // Generate constants based on the actual dimensions
+        try writer.writeAll("    %c0 = arith.constant 0 : index\n");
+        if (param_info.len > 0) {
+            try writer.print("    %c{d} = arith.constant {d} : index\n", .{ param_info[0].dimension, param_info[0].dimension });
+        }
+        try writer.writeAll("    \n");
+
+        // Generate GPU thread indexing code
+        try writer.writeAll("    // Calculate global thread index: blockIdx.x * blockDim.x + threadIdx.x\n");
+        try writer.writeAll("    %block_id = gpu.block_id x\n");
+        try writer.writeAll("    %block_dim = gpu.block_dim x\n");
+        try writer.writeAll("    %thread_id = gpu.thread_id x\n");
+        try writer.writeAll("    %block_offset = arith.muli %block_id, %block_dim : index\n");
+        try writer.writeAll("    %global_id = arith.addi %block_offset, %thread_id : index\n");
+        try writer.writeAll("    \n");
+
+        // Generate bounds check
+        if (param_info.len > 0) {
+            try writer.print("    // Bounds check: if (global_id >= {d}) return\n", .{param_info[0].dimension});
+            try writer.print("    %cond = arith.cmpi ult, %global_id, %c{d} : index\n", .{param_info[0].dimension});
+        }
+        try writer.writeAll("    scf.if %cond {\n");
+
+        // Generate the actual operation based on function body analysis
+        try self.generateOperationMLIR(writer, param_info, operation_info);
+
+        try writer.writeAll("    }\n");
+        try writer.writeAll("    gpu.return\n");
+        try writer.writeAll("  }\n");
     }
 
     /// Parameter information for MLIR generation
