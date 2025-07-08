@@ -199,7 +199,7 @@ test "type system - type mismatch in binary expression" {
         \\}
     ;
 
-    try assertCompileFailure(allocator, test_source, "test_binary_mismatch.toy", "Cannot perform parser.BinaryOperator.add operation on types parser.Type{ .i64 = void } and parser.Type{ .f64 = void }", "    let z: i64 = x + y;");
+    try assertCompileFailure(allocator, test_source, "test_binary_mismatch.toy", "Cannot perform parser.BinaryOperator.add operation on types i64 and f64", "    let z: i64 = x + y;");
 
     std.debug.print("Binary expression type mismatch error test passed\n", .{});
 }
@@ -237,7 +237,7 @@ test "type system - signed vs unsigned mismatch" {
         \\}
     ;
 
-    try assertCompileFailure(allocator, test_source, "test_signed_unsigned.toy", "Cannot perform parser.BinaryOperator.add operation on types parser.Type{ .u64 = void } and parser.Type{ .i64 = void }", "    let z: u64 = x + y;");
+    try assertCompileFailure(allocator, test_source, "test_signed_unsigned.toy", "Cannot perform parser.BinaryOperator.add operation on types u64 and i64", "    let z: u64 = x + y;");
 
     std.debug.print("Signed/unsigned type mismatch error test passed\n", .{});
 }
@@ -705,6 +705,253 @@ test "vector operations - add then multiply" {
     try assertReturns(allocator, "test_vector_ops.toy", 15);
 
     std.debug.print("vector operations test passed - program correctly returns 15\n", .{});
+}
+
+test "reduce operation - simple sum" {
+    const allocator = std.testing.allocator;
+    
+    const test_source =
+        \\fn main() i32 {
+        \\    // Create a 1D tensor with 5 elements
+        \\    let a: [5]i32 = [5]i32{10i32};
+        \\    
+        \\    // Reduce by summing all elements using implicit index
+        \\    let sum: i32 = reduce(a[i], +);
+        \\    
+        \\    // Should return 50 (sum of five 10s)
+        \\    return sum;
+        \\}
+    ;
+    
+    try assertCompiles(allocator, test_source, "test_reduce_sum.toy");
+    try assertReturns(allocator, "test_reduce_sum.toy", 50);
+    
+    std.debug.print("reduce sum operation test passed - correctly returns 50\n", .{});
+}
+
+test "reduce operation - product" {
+    const allocator = std.testing.allocator;
+    
+    const test_source =
+        \\fn main() i32 {
+        \\    // Create a 1D tensor with 4 elements
+        \\    let a: [4]i32 = [4]i32{3i32};
+        \\    
+        \\    // Reduce by multiplying all elements using implicit index
+        \\    let product: i32 = reduce(a[i], *);
+        \\    
+        \\    // Should return 81 (3 * 3 * 3 * 3)
+        \\    return product;
+        \\}
+    ;
+    
+    try assertCompiles(allocator, test_source, "test_reduce_product.toy");
+    try assertReturns(allocator, "test_reduce_product.toy", 81);
+    
+    std.debug.print("reduce product operation test passed - correctly returns 81\n", .{});
+}
+
+test "reduce operation - error on non-implicit tensor expression" {
+    const allocator = std.testing.allocator;
+    
+    const test_source =
+        \\fn main() i32 {
+        \\    let a: [5]i32 = [5]i32{10i32};
+        \\    
+        \\    // This should fail - reduce requires implicit tensor index
+        \\    let sum: i32 = reduce(a, +);
+        \\    
+        \\    return sum;
+        \\}
+    ;
+    
+    try assertCompileFailure(allocator, test_source, "test_reduce_error.toy", "first argument of reduce must be an implicit tensor expression", "    let sum: i32 = reduce(a, +);");
+    
+    std.debug.print("reduce error test passed - correctly rejects non-implicit tensor expression\n", .{});
+}
+
+test "reduce operation - multiple reductions (second dimension then first)" {
+    const allocator = std.testing.allocator;
+    
+    const test_source =
+        \\fn main() i32 {
+        \\    // Create a 2D tensor 5x3 filled with 1s
+        \\    let a: [5, 3]i32 = [5, 3]i32{1i32};
+        \\    
+        \\    // First reduce along second dimension (j) - sum across columns
+        \\    // Result should be a 1D tensor of size 5, each element = 3
+        \\    let b: [5]i32 = [5]i32{0i32};
+        \\    b[i] = reduce(a[i, j], +);
+        \\    
+        \\    // Then reduce the result - multiply all elements
+        \\    // Result should be 3 * 3 * 3 * 3 * 3 = 243
+        \\    let c: i32 = reduce(b[i], *);
+        \\    
+        \\    return c;
+        \\}
+    ;
+    
+    try assertCompiles(allocator, test_source, "test_reduce_multi_2d_1d.toy");
+    // TODO: Current implementation reduces all elements, not per-dimension
+    // Expected: 243 (3^5), Actual: Will compute 15^5 = too large
+    // Commenting out until multi-dimensional reduction is properly implemented
+    try assertReturns(allocator, "test_reduce_multi_2d_1d.toy", 243);
+    
+    std.debug.print("reduce multiple operations test passed - correctly returns 243\n", .{});
+}
+
+test "reduce operation - different dimension order" {
+    const allocator = std.testing.allocator;
+    
+    const test_source =
+        \\fn main() i32 {
+        \\    // Create a 2D tensor 4x2 filled with 2s
+        \\    let a: [4, 2]i32 = [4, 2]i32{2i32};
+        \\    
+        \\    // First reduce along first dimension (i) - sum down rows
+        \\    // Result should be a 1D tensor of size 2, each element = 8 (4 * 2)
+        \\    let b: [2]i32 = [2]i32{0i32};
+        \\    b[j] = reduce(a[i, j], +);
+        \\    
+        \\    // Then reduce the result - sum all elements
+        \\    // Result should be 16 (8 + 8)
+        \\    let c: i32 = reduce(b[j], +);
+        \\    
+        \\    return c;
+        \\}
+    ;
+    
+    try assertCompiles(allocator, test_source, "test_reduce_diff_dims.toy");
+    // TODO: Current implementation reduces all elements, not per-dimension
+    // Expected: 16, Actual: Different value due to full reduction
+    // Commenting out until multi-dimensional reduction is properly implemented
+    try assertReturns(allocator, "test_reduce_diff_dims.toy", 16);
+    
+    std.debug.print("reduce different dimension order test passed - correctly returns 16\n", .{});
+}
+
+test "reduce operation - error: LHS rank greater than RHS rank" {
+    const allocator = std.testing.allocator;
+    
+    const test_source =
+        \\fn main() i32 {
+        \\    let a: [3, 4]i32 = [3, 4]i32{1i32};
+        \\    let b: [3, 4, 5]i32 = [3, 4, 5]i32{0i32};
+        \\    // Error: trying to reduce from rank 2 to rank 3
+        \\    b[i, j, k] = reduce(a[i, j], +);
+        \\    return 0i32;
+        \\}
+    ;
+    
+    try assertCompileFailure(allocator, test_source, "test_reduce_rank_mismatch.toy", "Cannot reduce to higher or equal rank", "    b[i, j, k] = reduce(a[i, j], +);");
+    
+    std.debug.print("reduce rank mismatch error test passed\n", .{});
+}
+
+test "reduce operation - error: non-matching free indices" {
+    const allocator = std.testing.allocator;
+    
+    const test_source =
+        \\fn main() i32 {
+        \\    let a: [3]i32 = [3]i32{0i32};
+        \\    let b: [3, 4]i32 = [3, 4]i32{1i32};
+        \\    // Error: LHS has index 'i' but reduce has indices 'j, k'
+        \\    a[i] = reduce(b[j, k], +);
+        \\    return 0i32;
+        \\}
+    ;
+    
+    try assertCompileFailure(allocator, test_source, "test_reduce_index_mismatch.toy", "Free indices must match", "    a[i] = reduce(b[j, k], +);");
+    
+    std.debug.print("reduce index mismatch error test passed\n", .{});
+}
+
+test "reduce operation - error: implicit index conflicts with variable" {
+    const allocator = std.testing.allocator;
+    
+    const test_source =
+        \\fn main() i32 {
+        \\    let a: i32 = 5i32;
+        \\    let b: [3, 4]i32 = [3, 4]i32{1i32};
+        \\    let c: [3]i32 = [3]i32{0i32};
+        \\    // Error: 'a' is already a variable, can't use as implicit index
+        \\    c[i] = reduce(b[i, a], +);
+        \\    return 0i32;
+        \\}
+    ;
+    
+    try assertCompileFailure(allocator, test_source, "test_reduce_var_conflict.toy", "Implicit index 'a' conflicts with variable", "    c[i] = reduce(b[i, a], +);");
+    
+    std.debug.print("reduce variable conflict error test passed\n", .{});
+}
+
+test "reduce operation - error: duplicate indices" {
+    const allocator = std.testing.allocator;
+    
+    const test_source =
+        \\fn main() i32 {
+        \\    let a: [3, 3]i32 = [3, 3]i32{1i32};
+        \\    // Error: using 'i' twice in the same expression
+        \\    let b: i32 = reduce(a[i, i], +);
+        \\    return b;
+        \\}
+    ;
+    
+    try assertCompileFailure(allocator, test_source, "test_reduce_dup_indices.toy", "Duplicate implicit index", "    let b: i32 = reduce(a[i, i], +);");
+    
+    std.debug.print("reduce duplicate indices error test passed\n", .{});
+}
+
+test "reduce operation - error: invalid operator" {
+    const allocator = std.testing.allocator;
+    
+    const test_source =
+        \\fn main() i32 {
+        \\    let a: [5]i32 = [5]i32{10i32};
+        \\    // Error: subtraction is not a valid reduction operator
+        \\    let b: i32 = reduce(a[i], -);
+        \\    return b;
+        \\}
+    ;
+    
+    try assertCompileFailure(allocator, test_source, "test_reduce_invalid_op.toy", "Invalid reduction operator", "    let b: i32 = reduce(a[i], -);");
+    
+    std.debug.print("reduce invalid operator error test passed\n", .{});
+}
+
+test "reduce operation - error: non-tensor argument" {
+    const allocator = std.testing.allocator;
+    
+    const test_source =
+        \\fn main() i32 {
+        \\    let a: i32 = 5i32;
+        \\    // Error: can't reduce a scalar
+        \\    let b: i32 = reduce(a, +);
+        \\    return b;
+        \\}
+    ;
+    
+    try assertCompileFailure(allocator, test_source, "test_reduce_non_tensor.toy", "first argument of reduce must be an implicit tensor expression", "    let b: i32 = reduce(a, +);");
+    
+    std.debug.print("reduce non-tensor argument error test passed\n", .{});
+}
+
+test "reduce operation - error: mismatched index in parallel assignment" {
+    const allocator = std.testing.allocator;
+    
+    const test_source =
+        \\fn main() i32 {
+        \\    let a: [3, 4]i32 = [3, 4]i32{1i32};
+        \\    let b: [3, 5]i32 = [3, 5]i32{0i32};
+        \\    // Error: LHS has [i,j] but reduce result would have [i,k]
+        \\    b[i, j] = reduce(a[i, j, k], +);
+        \\    return 0i32;
+        \\}
+    ;
+    
+    try assertCompileFailure(allocator, test_source, "test_reduce_parallel_mismatch.toy", "Index count", "    b[i, j] = reduce(a[i, j, k], +);");
+    
+    std.debug.print("reduce parallel assignment mismatch error test passed\n", .{});
 }
 
 test "integration test" {

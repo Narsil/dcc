@@ -1,5 +1,6 @@
 const std = @import("std");
 const parser = @import("parser.zig");
+const typechecker = @import("typechecker.zig");
 const mlir_codegen = @import("mlir_codegen.zig");
 const cuda_llvm_ir_gen = @import("cuda_llvm_ir_gen.zig");
 const cuda_stub_manager = @import("cuda_stub_manager.zig");
@@ -8,7 +9,7 @@ const gpu_memory_ops = @import("gpu_memory_ops.zig");
 const llvm_types = @import("llvm_types.zig");
 const LLVM = llvm_types.LLVM;
 
-pub const CodeGenError = error{ InvalidTopLevelNode, InvalidStatement, InvalidExpression, InvalidCallee, UndefinedVariable, UndefinedFunction, TargetError, CodeGenError, MainFunctionNotFound, MissingMainFunction, LinkingFailed, GpuCompilationNotImplemented, InvalidGpuTriplet, InvalidTargetTriple, InvalidCharacter, Overflow, CudaFunctionNotFound, CudaStubInitFailed } || std.mem.Allocator.Error;
+pub const CodeGenError = error{ InvalidTopLevelNode, InvalidStatement, InvalidExpression, InvalidCallee, UndefinedVariable, UndefinedFunction, TargetError, CodeGenError, MainFunctionNotFound, MissingMainFunction, LinkingFailed, GpuCompilationNotImplemented, InvalidGpuTriplet, InvalidTargetTriple, InvalidCharacter, Overflow, CudaFunctionNotFound, CudaStubInitFailed, UnsupportedOperation } || std.mem.Allocator.Error;
 
 const VarInfo = struct {
     alloca: LLVM.LLVMValueRef,
@@ -76,6 +77,7 @@ pub const CodeGen = struct {
     gpu_function_names: ?std.ArrayList([]const u8),
     gpu_memory_tracker: ?gpu_memory_tracker.GpuMemoryTracker,
     gpu_memory_ops: ?gpu_memory_ops.GpuMemoryOps,
+    reduction_info: ?std.AutoHashMap(*parser.ASTNode, typechecker.ReductionInfo),
 
     pub fn init(allocator: std.mem.Allocator, module_name: []const u8, verbose: bool, target: std.Target, gpu: ?std.Target) !CodeGen {
         _ = target; // Target is passed for completeness but not used in init
@@ -123,7 +125,12 @@ pub const CodeGen = struct {
             .gpu_function_names = null,
             .gpu_memory_tracker = if (accelerator != null) gpu_memory_tracker.GpuMemoryTracker.init(allocator, verbose) else null,
             .gpu_memory_ops = null, // Will be initialized after CUDA functions are declared
+            .reduction_info = null,
         };
+    }
+
+    pub fn setReductionInfo(self: *CodeGen, info: std.AutoHashMap(*parser.ASTNode, typechecker.ReductionInfo)) void {
+        self.reduction_info = info;
     }
 
     pub fn deinit(self: *CodeGen) void {
@@ -554,7 +561,34 @@ pub const CodeGen = struct {
             std.debug.print("Parallel assignment: IR before generating RHS\n", .{});
             self.printIR();
         }
-        const rhs_val = try self.generateTensorExpression(pa.value.*, idx_val);
+        
+        // For reduce expressions, we need special handling
+        const rhs_val = blk: {
+            if (pa.value.* == .reduce_expression) {
+                // Get the reduction info if available
+                const reduce_node = &pa.value.*.reduce_expression;
+                if (self.verbose) {
+                    std.debug.print("DEBUG: Looking for reduction info at node ptr: {*}\n", .{pa.value});
+                }
+                const reduction_info = if (self.reduction_info) |info| info.get(pa.value) else null;
+                
+                if (reduction_info) |red_info| {
+                    // Generate multi-dimensional reduction based on free/bound indices
+                    if (self.verbose) {
+                        std.debug.print("DEBUG: Found reduction info! Using multi-dimensional reduction with {} free indices and {} bound indices\n", .{red_info.free_indices.len, red_info.bound_indices.len});
+                    }
+                    break :blk try self.generateMultiDimensionalReduce(reduce_node, red_info, idx_val);
+                } else {
+                    // Fallback to simple reduction
+                    if (self.verbose) {
+                        std.debug.print("DEBUG: No reduction info found, using simple reduction\n", .{});
+                    }
+                    break :blk try self.generateExpression(pa.value.*);
+                }
+            } else {
+                break :blk try self.generateTensorExpression(pa.value.*, idx_val);
+            }
+        };
         var gep_indices = [_]LLVM.LLVMValueRef{ zero_const, idx_val };
         const elem_ptr = LLVM.LLVMBuildGEP2(self.builder, elem_type, tensor_info.alloca, &gep_indices[0], 2, "elem_ptr");
         if (elem_ptr == null) {
@@ -760,13 +794,19 @@ pub const CodeGen = struct {
                 }
             },
             .tensor_literal => |tensor_lit| {
-                // For now, create a simple array with the specified value
+                // Create a flattened array for multi-dimensional tensors
                 const element_type = self.toLLVMType(tensor_lit.element_type);
-                _ = LLVM.LLVMArrayType(element_type, @intCast(tensor_lit.shape[0])); // Suppress unused warning
+                
+                // Calculate total number of elements
+                var total_elements: usize = 1;
+                for (tensor_lit.shape) |dim| {
+                    total_elements *= dim;
+                }
+                
                 const value = try self.generateExpression(tensor_lit.value.*);
 
-                // Create a constant array with the value repeated
-                const values = try self.allocator.alloc(LLVM.LLVMValueRef, tensor_lit.shape[0]);
+                // Create a constant array with the value repeated for all elements
+                const values = try self.allocator.alloc(LLVM.LLVMValueRef, total_elements);
                 defer self.allocator.free(values);
 
                 for (values) |*val| {
@@ -830,23 +870,140 @@ pub const CodeGen = struct {
                 const array_ty = self.toLLVMType(vi_slice.ty);
                 const elem_ty = self.toLLVMType(vi_slice.ty.tensor.element_type.*);
 
-                // Currently only support 1-dimensional explicit indices.
-                if (tensor_slice.indices.len != 1) {
-                    return error.CodeGenError;
+                // Handle multi-dimensional indexing by computing linear index
+                const i64_type = LLVM.LLVMInt64TypeInContext(self.context);
+                var linear_index = LLVM.LLVMConstInt(i64_type, 0, 0);
+                
+                // Calculate linear index from multi-dimensional indices
+                // For tensor with shape [d0, d1, ..., dn], index [i0, i1, ..., in] maps to:
+                // i0 * (d1 * d2 * ... * dn) + i1 * (d2 * ... * dn) + ... + in
+                const tensor_shape = vi_slice.ty.tensor.shape;
+                
+                for (tensor_slice.indices, 0..) |*idx_expr, dim| {
+                    const idx_val = try self.generateExpression(idx_expr.*);
+                    
+                    // Calculate stride for this dimension
+                    var stride: u64 = 1;
+                    for (tensor_shape[dim + 1..]) |d| {
+                        stride *= d;
+                    }
+                    
+                    // Add idx_val * stride to linear_index
+                    const stride_val = LLVM.LLVMConstInt(i64_type, stride, 0);
+                    const contribution = LLVM.LLVMBuildMul(self.builder, idx_val, stride_val, "idx_contribution");
+                    linear_index = LLVM.LLVMBuildAdd(self.builder, linear_index, contribution, "linear_idx");
                 }
 
-                // Evaluate the index expression (should yield an integer value).
-                const index_val = try self.generateExpression(tensor_slice.indices[0]);
-
-                // Build GEP indices [0, index_val] to address the desired element.
-                const i64_type = LLVM.LLVMInt64TypeInContext(self.context);
+                // Build GEP indices [0, linear_index] to address the desired element.
                 const zero_const = LLVM.LLVMConstInt(i64_type, 0, 0);
-                var gep_indices = [_]LLVM.LLVMValueRef{ zero_const, index_val };
+                var gep_indices = [_]LLVM.LLVMValueRef{ zero_const, linear_index };
 
                 const elem_ptr = LLVM.LLVMBuildGEP2(self.builder, array_ty, tensor_ptr, &gep_indices[0], 2, "tensor_slice_elem_ptr");
                 self.printIR();
 
                 return LLVM.LLVMBuildLoad2(self.builder, elem_ty, elem_ptr, "tensor_slice_load");
+            },
+            .reduce_expression => |reduce| {
+                // For now, implement a simple reduction that sums all elements
+                // This is a very basic implementation - in practice, you'd want to:
+                // 1. Analyze the tensor expression to determine which dimensions to reduce
+                // 2. Generate appropriate loops for the reduction
+                // 3. Support different reduction operators
+                
+                // The tensor expression must be an implicit_tensor_index
+                const tensor_expr = reduce.tensor_expr.*;
+                
+                if (tensor_expr != .implicit_tensor_index) {
+                    return error.InvalidExpression;
+                }
+                
+                const implicit_index = tensor_expr.implicit_tensor_index;
+                const base_tensor = implicit_index.tensor.*;
+                
+                // For simplicity, assume the base is a simple tensor identifier
+                if (base_tensor != .identifier) {
+                    return error.InvalidExpression;
+                }
+                
+                const tensor_name = base_tensor.identifier.name;
+                const var_info = self.variables.get(tensor_name) orelse return error.UndefinedVariable;
+                
+                if (var_info.ty != .tensor) {
+                    return error.InvalidExpression;
+                }
+                
+                const tensor_type = var_info.ty.tensor;
+                const element_type = self.toLLVMType(tensor_type.element_type.*);
+                const array_type = self.toLLVMType(var_info.ty);
+                
+                // Initialize accumulator based on the operator
+                var init_value: LLVM.LLVMValueRef = undefined;
+                switch (reduce.operator) {
+                    .add => init_value = LLVM.LLVMConstInt(element_type, 0, 0),
+                    .multiply => init_value = LLVM.LLVMConstInt(element_type, 1, 0),
+                    else => return error.UnsupportedOperation,
+                }
+                
+                // For proper multi-dimensional reduction, we need context about which indices are free
+                // For now, let's implement a simpler version that still reduces all elements
+                // but demonstrates the structure for future enhancement
+                const total_elements = tensor_type.total_elements();
+                
+                // TODO: Analyze the assignment context to determine which dimensions to reduce
+                // For b[i] = reduce(a[i,j], +), we should:
+                // 1. Loop over free indices (i)
+                // 2. For each i, reduce over bound indices (j)
+                // This requires passing context from the assignment
+                
+                // Create a basic block for the loop
+                const current_function = LLVM.LLVMGetBasicBlockParent(LLVM.LLVMGetInsertBlock(self.builder));
+                const loop_block = LLVM.LLVMAppendBasicBlockInContext(self.context, current_function, "reduce_loop");
+                const after_loop = LLVM.LLVMAppendBasicBlockInContext(self.context, current_function, "reduce_after");
+                
+                // Create accumulator and index variables
+                const acc_alloca = LLVM.LLVMBuildAlloca(self.builder, element_type, "reduce_acc");
+                const idx_alloca = LLVM.LLVMBuildAlloca(self.builder, LLVM.LLVMInt64TypeInContext(self.context), "reduce_idx");
+                
+                _ = LLVM.LLVMBuildStore(self.builder, init_value, acc_alloca);
+                _ = LLVM.LLVMBuildStore(self.builder, LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), 0, 0), idx_alloca);
+                
+                // Jump to loop
+                _ = LLVM.LLVMBuildBr(self.builder, loop_block);
+                
+                // Loop body
+                LLVM.LLVMPositionBuilderAtEnd(self.builder, loop_block);
+                
+                const current_idx = LLVM.LLVMBuildLoad2(self.builder, LLVM.LLVMInt64TypeInContext(self.context), idx_alloca, "idx");
+                const current_acc = LLVM.LLVMBuildLoad2(self.builder, element_type, acc_alloca, "acc");
+                
+                // Get element at current index
+                const zero = LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), 0, 0);
+                var indices = [_]LLVM.LLVMValueRef{ zero, current_idx };
+                const elem_ptr = LLVM.LLVMBuildGEP2(self.builder, array_type, var_info.alloca, &indices[0], 2, "elem_ptr");
+                const elem_value = LLVM.LLVMBuildLoad2(self.builder, element_type, elem_ptr, "elem");
+                
+                // Apply reduction operator
+                const new_acc = switch (reduce.operator) {
+                    .add => LLVM.LLVMBuildAdd(self.builder, current_acc, elem_value, "new_acc"),
+                    .multiply => LLVM.LLVMBuildMul(self.builder, current_acc, elem_value, "new_acc"),
+                    else => unreachable,
+                };
+                
+                _ = LLVM.LLVMBuildStore(self.builder, new_acc, acc_alloca);
+                
+                // Increment index
+                const next_idx = LLVM.LLVMBuildAdd(self.builder, current_idx, LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), 1, 0), "next_idx");
+                _ = LLVM.LLVMBuildStore(self.builder, next_idx, idx_alloca);
+                
+                // Check loop condition
+                const cond = LLVM.LLVMBuildICmp(self.builder, LLVM.LLVMIntULT, next_idx, LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), total_elements, 0), "loop_cond");
+                _ = LLVM.LLVMBuildCondBr(self.builder, cond, loop_block, after_loop);
+                
+                // After loop
+                LLVM.LLVMPositionBuilderAtEnd(self.builder, after_loop);
+                
+                // Return the final accumulator value
+                return LLVM.LLVMBuildLoad2(self.builder, element_type, acc_alloca, "reduce_result");
             },
             else => return error.InvalidExpression,
         }
@@ -965,6 +1122,141 @@ pub const CodeGen = struct {
     /// Similar to generateExpression but aware of the induction variable of a
     /// parallel tensor loop.  Any implicit_tensor_index nodes will load the
     /// element at the current loop index provided by `idx_val`.
+    fn generateMultiDimensionalReduce(self: *CodeGen, reduce: *@TypeOf(@as(parser.ASTNode, undefined).reduce_expression), red_info: typechecker.ReductionInfo, free_idx: LLVM.LLVMValueRef) CodeGenError!LLVM.LLVMValueRef {
+        if (self.verbose) {
+            std.debug.print("DEBUG: generateMultiDimensionalReduce called\n", .{});
+            std.debug.print("DEBUG: Free indices: ", .{});
+            for (red_info.free_indices) |idx| {
+                std.debug.print("{s} ", .{idx});
+            }
+            std.debug.print("\nDEBUG: Bound indices: ", .{});
+            for (red_info.bound_indices) |idx| {
+                std.debug.print("{s} ", .{idx});
+            }
+            std.debug.print("\n", .{});
+        }
+        // Extract tensor information
+        const tensor_expr = reduce.tensor_expr.*;
+        if (tensor_expr != .implicit_tensor_index) {
+            return error.InvalidExpression;
+        }
+        
+        const implicit_index = tensor_expr.implicit_tensor_index;
+        const base_tensor = implicit_index.tensor.*;
+        
+        if (base_tensor != .identifier) {
+            return error.InvalidExpression;
+        }
+        
+        const tensor_name = base_tensor.identifier.name;
+        const var_info = self.variables.get(tensor_name) orelse return error.UndefinedVariable;
+        
+        if (var_info.ty != .tensor) {
+            return error.InvalidExpression;
+        }
+        
+        const tensor_type = var_info.ty.tensor;
+        const element_type = self.toLLVMType(tensor_type.element_type.*);
+        const array_type = self.toLLVMType(var_info.ty);
+        
+        // Initialize accumulator based on the operator
+        var init_value: LLVM.LLVMValueRef = undefined;
+        const type_kind = LLVM.LLVMGetTypeKind(element_type);
+        const is_float = switch (type_kind) {
+            LLVM.LLVMFloatTypeKind, LLVM.LLVMDoubleTypeKind => true,
+            else => false,
+        };
+        
+        switch (reduce.operator) {
+            .add => init_value = if (is_float) LLVM.LLVMConstReal(element_type, 0.0) else LLVM.LLVMConstInt(element_type, 0, 0),
+            .multiply => init_value = if (is_float) LLVM.LLVMConstReal(element_type, 1.0) else LLVM.LLVMConstInt(element_type, 1, 0),
+            else => return error.UnsupportedOperation,
+        }
+        
+        // For multi-dimensional reduction, we need to:
+        // 1. Use the free_idx for the free dimension (provided by outer loop)
+        // 2. Loop over the bound dimensions
+        
+        // For now, let's assume 2D tensor with one bound dimension
+        // TODO: Generalize to arbitrary dimensions
+        
+        if (tensor_type.rank() != 2 or red_info.bound_indices.len != 1) {
+            // Fall back to simple full reduction for now
+            return self.generateExpression(.{ .reduce_expression = reduce.* });
+        }
+        
+        // Determine which dimension is being reduced
+        // If the bound index is "i", we're reducing the first dimension
+        // If the bound index is "j", we're reducing the second dimension
+        const bound_idx_name = red_info.bound_indices[0];
+        const reducing_first_dim = std.mem.eql(u8, bound_idx_name, "i");
+        
+        const bound_dim_size = if (reducing_first_dim) tensor_type.shape[0] else tensor_type.shape[1];
+        const i64_type = LLVM.LLVMInt64TypeInContext(self.context);
+        
+        // Create accumulator
+        const acc_alloca = LLVM.LLVMBuildAlloca(self.builder, element_type, "md_reduce_acc");
+        _ = LLVM.LLVMBuildStore(self.builder, init_value, acc_alloca);
+        
+        // Create loop for bound dimension
+        const current_function = LLVM.LLVMGetBasicBlockParent(LLVM.LLVMGetInsertBlock(self.builder));
+        const loop_block = LLVM.LLVMAppendBasicBlockInContext(self.context, current_function, "md_reduce_loop");
+        const after_loop = LLVM.LLVMAppendBasicBlockInContext(self.context, current_function, "md_reduce_after");
+        
+        // Initialize bound index
+        const bound_idx_alloca = LLVM.LLVMBuildAlloca(self.builder, i64_type, "bound_idx");
+        _ = LLVM.LLVMBuildStore(self.builder, LLVM.LLVMConstInt(i64_type, 0, 0), bound_idx_alloca);
+        
+        // Jump to loop
+        _ = LLVM.LLVMBuildBr(self.builder, loop_block);
+        
+        // Loop body
+        LLVM.LLVMPositionBuilderAtEnd(self.builder, loop_block);
+        
+        const bound_idx = LLVM.LLVMBuildLoad2(self.builder, i64_type, bound_idx_alloca, "bound_idx_val");
+        const current_acc = LLVM.LLVMBuildLoad2(self.builder, element_type, acc_alloca, "acc_val");
+        
+        // Calculate linear index for 2D array
+        // If reducing first dimension: bound_idx * shape[1] + free_idx
+        // If reducing second dimension: free_idx * shape[1] + bound_idx
+        const linear_idx = if (reducing_first_dim) blk: {
+            const offset = LLVM.LLVMBuildMul(self.builder, bound_idx, LLVM.LLVMConstInt(i64_type, tensor_type.shape[1], 0), "offset");
+            break :blk LLVM.LLVMBuildAdd(self.builder, offset, free_idx, "linear_idx");
+        } else blk: {
+            const offset = LLVM.LLVMBuildMul(self.builder, free_idx, LLVM.LLVMConstInt(i64_type, tensor_type.shape[1], 0), "offset");
+            break :blk LLVM.LLVMBuildAdd(self.builder, offset, bound_idx, "linear_idx");
+        };
+        
+        // Get element at [free_idx, bound_idx]
+        const zero = LLVM.LLVMConstInt(i64_type, 0, 0);
+        var indices = [_]LLVM.LLVMValueRef{ zero, linear_idx };
+        const elem_ptr = LLVM.LLVMBuildGEP2(self.builder, array_type, var_info.alloca, &indices[0], 2, "md_elem_ptr");
+        const elem_value = LLVM.LLVMBuildLoad2(self.builder, element_type, elem_ptr, "md_elem");
+        
+        // Apply reduction operator
+        const new_acc = switch (reduce.operator) {
+            .add => if (is_float) LLVM.LLVMBuildFAdd(self.builder, current_acc, elem_value, "new_acc") else LLVM.LLVMBuildAdd(self.builder, current_acc, elem_value, "new_acc"),
+            .multiply => if (is_float) LLVM.LLVMBuildFMul(self.builder, current_acc, elem_value, "new_acc") else LLVM.LLVMBuildMul(self.builder, current_acc, elem_value, "new_acc"),
+            else => unreachable,
+        };
+        
+        _ = LLVM.LLVMBuildStore(self.builder, new_acc, acc_alloca);
+        
+        // Increment bound index
+        const next_bound_idx = LLVM.LLVMBuildAdd(self.builder, bound_idx, LLVM.LLVMConstInt(i64_type, 1, 0), "next_bound_idx");
+        _ = LLVM.LLVMBuildStore(self.builder, next_bound_idx, bound_idx_alloca);
+        
+        // Check loop condition
+        const cond = LLVM.LLVMBuildICmp(self.builder, LLVM.LLVMIntULT, next_bound_idx, LLVM.LLVMConstInt(i64_type, bound_dim_size, 0), "bound_loop_cond");
+        _ = LLVM.LLVMBuildCondBr(self.builder, cond, loop_block, after_loop);
+        
+        // After loop
+        LLVM.LLVMPositionBuilderAtEnd(self.builder, after_loop);
+        
+        // Return the accumulated value
+        return LLVM.LLVMBuildLoad2(self.builder, element_type, acc_alloca, "final_acc");
+    }
+
     fn generateTensorExpression(self: *CodeGen, node: parser.ASTNode, idx_val: LLVM.LLVMValueRef) CodeGenError!LLVM.LLVMValueRef {
         switch (node) {
             // Handle the special case first

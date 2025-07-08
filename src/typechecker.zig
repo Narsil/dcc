@@ -26,6 +26,12 @@ pub const FunctionSignature = struct {
     return_type: parser.Type,
 };
 
+pub const ReductionInfo = struct {
+    free_indices: [][]const u8,     // Indices that appear on both sides (not reduced)
+    bound_indices: [][]const u8,    // Indices that only appear in reduce (reduced)
+    operator: parser.BinaryOperator,
+};
+
 pub const TypeChecker = struct {
     allocator: std.mem.Allocator,
     source: []const u8,
@@ -34,6 +40,7 @@ pub const TypeChecker = struct {
     functions: std.HashMap([]const u8, FunctionSignature, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
     current_function_return_type: ?parser.Type,
     allocated_types: std.ArrayList(parser.Type),
+    reduction_info: std.AutoHashMap(*parser.ASTNode, ReductionInfo),
 
     pub fn init(allocator: std.mem.Allocator, source: []const u8, verbose: bool) TypeChecker {
         return TypeChecker{
@@ -44,6 +51,7 @@ pub const TypeChecker = struct {
             .functions = std.HashMap([]const u8, FunctionSignature, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .current_function_return_type = null,
             .allocated_types = std.ArrayList(parser.Type).init(allocator),
+            .reduction_info = std.AutoHashMap(*parser.ASTNode, ReductionInfo).init(allocator),
         };
     }
 
@@ -66,6 +74,14 @@ pub const TypeChecker = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.functions.deinit();
+        
+        // Free reduction info
+        var red_iter = self.reduction_info.iterator();
+        while (red_iter.next()) |entry| {
+            self.allocator.free(entry.value_ptr.free_indices);
+            self.allocator.free(entry.value_ptr.bound_indices);
+        }
+        self.reduction_info.deinit();
     }
 
     pub fn typeCheck(self: *TypeChecker, ast: parser.ASTNode) TypeCheckError!void {
@@ -286,6 +302,7 @@ pub const TypeChecker = struct {
                 call.*.return_type = return_type;
                 return return_type;
             },
+            .reduce_expression => |reduce| try self.typeCheckReduceExpression(reduce),
             else => return error.InvalidExpression,
         };
         if (self.verbose) {
@@ -297,9 +314,13 @@ pub const TypeChecker = struct {
     fn typeCheckBinaryOperation(self: *TypeChecker, op: parser.BinaryOperator, left_type: parser.Type, right_type: parser.Type, expr: @TypeOf(@as(parser.ASTNode, undefined).binary_expression)) TypeCheckError!parser.Type {
         // Check if operands are compatible for the operation
         if (!self.typesCompatible(left_type, right_type)) {
-            const pos = self.getNodePosition(expr.left.*);
-            std.debug.print("Error at line {}, column {}: Cannot perform {} operation on types {} and {}\n", .{ pos.line, pos.column, op, left_type, right_type });
-            self.printSourceContext(self.getNodeOffset(expr.left.*));
+            const pos = self.getPositionFromOffset(expr.offset);
+            std.debug.print("Error at line {}, column {}: Cannot perform {} operation on types ", .{ pos.line, pos.column, op });
+            self.printType(left_type);
+            std.debug.print(" and ", .{});
+            self.printType(right_type);
+            std.debug.print("\n", .{});
+            self.printSourceContext(expr.offset);
             return error.InvalidBinaryOperation;
         }
 
@@ -421,6 +442,7 @@ pub const TypeChecker = struct {
             .implicit_tensor_index => |n| n.offset,
             .tensor_slice => |n| n.offset,
             .parallel_assignment => |n| n.offset,
+            .reduce_expression => |n| n.offset,
         };
         const pos = lexer.Lexer.offsetToLineColumn(self.source, offset);
         return .{ .line = @as(usize, pos.line), .column = @as(usize, pos.column) };
@@ -470,18 +492,25 @@ pub const TypeChecker = struct {
         }
 
         // Check for scope conflicts
-        if (self.variables.contains(tensor_index.implicit_index)) {
-            const pos = self.getNodePosition(tensor_index.tensor.*);
-            std.debug.print("Error at line {}, column {}: Implicit index '{s}' conflicts with variable in scope\n", .{ pos.line, pos.column, tensor_index.implicit_index });
-            self.printSourceContext(self.getNodeOffset(tensor_index.tensor.*));
-            return error.ImplicitIndexConflictsWithVariable;
+        for (tensor_index.implicit_indices) |index_name| {
+            if (self.verbose) {
+                std.debug.print("DEBUG: Checking implicit index '{s}' for conflicts\n", .{index_name});
+            }
+            if (self.variables.contains(index_name)) {
+                const pos = self.getNodePosition(tensor_index.tensor.*);
+                std.debug.print("Error at line {}, column {}: Implicit index '{s}' conflicts with variable in scope\n", .{ pos.line, pos.column, index_name });
+                self.printSourceContext(self.getNodeOffset(tensor_index.tensor.*));
+                return error.ImplicitIndexConflictsWithVariable;
+            }
         }
 
-        // For now, assume 1D tensors and return element type
-        // TODO: Handle multi-dimensional tensors properly
-        if (tensor_type.tensor.rank() != 1) {
+        // Check that the number of indices matches the tensor rank
+        const expected_indices = tensor_type.tensor.rank();
+        const provided_indices = tensor_index.implicit_indices.len;
+        
+        if (provided_indices != expected_indices) {
             const pos = self.getNodePosition(tensor_index.tensor.*);
-            std.debug.print("Error at line {}, column {}: Multi-dimensional tensor indexing not yet supported\n", .{ pos.line, pos.column });
+            std.debug.print("Error at line {}, column {}: Index count {} does not match tensor rank {}\n", .{ pos.line, pos.column, provided_indices, expected_indices });
             self.printSourceContext(self.getNodeOffset(tensor_index.tensor.*));
             return error.IndexCountMismatch;
         }
@@ -554,10 +583,117 @@ pub const TypeChecker = struct {
         }
     }
 
+    fn typeCheckReduceExpression(self: *TypeChecker, reduce: @TypeOf(@as(parser.ASTNode, undefined).reduce_expression)) TypeCheckError!parser.Type {
+        // Check for valid reduction operator
+        switch (reduce.operator) {
+            .add, .multiply => {}, // Valid
+            .subtract, .divide => {
+                const pos = self.getPositionFromOffset(reduce.offset);
+                std.debug.print("Error at line {}, column {}: Invalid reduction operator '{}' - only '+' and '*' are supported\n", .{ pos.line, pos.column, reduce.operator });
+                self.printSourceContext(reduce.offset);
+                return error.InvalidBinaryOperation;
+            },
+        }
+        
+        // Ensure the expression is an implicit tensor index
+        if (reduce.tensor_expr.* != .implicit_tensor_index) {
+            const pos = self.getNodePosition(reduce.tensor_expr.*);
+            std.debug.print("Error at line {}, column {}: first argument of reduce must be an implicit tensor expression\n", .{ pos.line, pos.column });
+            self.printSourceContext(self.getNodeOffset(reduce.tensor_expr.*));
+            return error.TypeMismatch;
+        }
+        
+        // Type check the entire implicit tensor expression - this will check for variable conflicts
+        _ = try self.typeCheckExpression(reduce.tensor_expr);
+        
+        // Get the implicit index info
+        const implicit_index = reduce.tensor_expr.*.implicit_tensor_index;
+        
+        // Check for duplicate indices in the implicit tensor expression
+        const indices = implicit_index.implicit_indices;
+        for (indices, 0..) |idx1, i| {
+            for (indices[i + 1..]) |idx2| {
+                if (std.mem.eql(u8, idx1, idx2)) {
+                    const pos = self.getPositionFromOffset(reduce.offset);
+                    std.debug.print("Error at line {}, column {}: Duplicate implicit index '{s}' in reduce expression\n", .{ pos.line, pos.column, idx1 });
+                    self.printSourceContext(reduce.offset);
+                    return error.InvalidExpression;
+                }
+            }
+        }
+        
+        // Get the base tensor type
+        const base_tensor_type = try self.typeCheckExpression(implicit_index.tensor);
+        
+        // Ensure the base is a tensor
+        if (base_tensor_type != .tensor) {
+            const pos = self.getNodePosition(implicit_index.tensor.*);
+            std.debug.print("Error at line {}, column {}: reduce expects a tensor expression, got {}\n", .{ pos.line, pos.column, base_tensor_type });
+            self.printSourceContext(self.getNodeOffset(implicit_index.tensor.*));
+            return error.TypeMismatch;
+        }
+        
+        const tensor_type = base_tensor_type.tensor;
+        
+        // For now, we support reducing tensors of rank >= 1
+        if (tensor_type.rank() < 1) {
+            const pos = self.getNodePosition(reduce.tensor_expr.*);
+            std.debug.print("Error at line {}, column {}: cannot reduce a scalar\n", .{ pos.line, pos.column });
+            self.printSourceContext(self.getNodeOffset(reduce.tensor_expr.*));
+            return error.TypeMismatch;
+        }
+        
+        // The result type depends on the tensor expression
+        // If the expression has implicit indices, we need to determine which dimensions are reduced
+        // For now, return the element type for simplicity
+        // TODO: Properly handle rank reduction based on implicit indices
+        
+        // Check if the operator is valid for the element type
+        if (!self.isNumericType(tensor_type.element_type.*)) {
+            const pos = self.getNodePosition(reduce.tensor_expr.*);
+            std.debug.print("Error at line {}, column {}: reduce operator {} requires numeric element type, got {}\n", .{ pos.line, pos.column, reduce.operator, tensor_type.element_type.* });
+            self.printSourceContext(self.getNodeOffset(reduce.tensor_expr.*));
+            return error.InvalidBinaryOperation;
+        }
+        
+        // Determine which dimensions are being reduced
+        // The dimensions that appear in the reduce expression but not in the assignment target
+        // are the ones being reduced
+        
+        // For now, if we have a[i,j] on the right in reduce, we need to know what's on the left
+        // This is tricky without more context. For simplicity, let's return the element type
+        // if all indices are present (full reduction)
+        
+        if (implicit_index.implicit_indices.len == tensor_type.rank()) {
+            // All dimensions are indexed, so we're reducing to a scalar
+            return tensor_type.element_type.*;
+        }
+        
+        // Otherwise, we'd need to know which indices are free vs bound
+        // This requires more sophisticated analysis
+        return tensor_type.element_type.*;
+    }
+
     fn typeCheckParallelAssignment(self: *TypeChecker, parallel_assign: @TypeOf(@as(parser.ASTNode, undefined).parallel_assignment)) TypeCheckError!void {
         // Check that target is an implicit tensor index
+        if (parallel_assign.target.* != .implicit_tensor_index) {
+            const pos = self.getNodePosition(parallel_assign.target.*);
+            std.debug.print("Error at line {}, column {}: Parallel assignment target must be an implicit tensor index\n", .{ pos.line, pos.column });
+            self.printSourceContext(self.getNodeOffset(parallel_assign.target.*));
+            return error.TypeMismatch;
+        }
+        
+        const target_indices = parallel_assign.target.*.implicit_tensor_index.implicit_indices;
         const target_type = try self.typeCheckExpression(parallel_assign.target);
 
+        // Special handling for reduce expressions
+        if (parallel_assign.value.* == .reduce_expression) {
+            const reduce_expr = &parallel_assign.value.*.reduce_expression;
+            
+            // Analyze the reduction and store with the value ASTNode pointer
+            try self.analyzeReduction(target_indices, reduce_expr, parallel_assign.value);
+        }
+        
         // Check that value is compatible with tensor element type
         const value_type = try self.typeCheckExpression(parallel_assign.value);
 
@@ -569,6 +705,116 @@ pub const TypeChecker = struct {
         }
 
         // Parallel assignment is valid
+    }
+
+    fn analyzeReduction(self: *TypeChecker, target_indices: [][]const u8, reduce_expr: *@TypeOf(@as(parser.ASTNode, undefined).reduce_expression), reduce_node: *parser.ASTNode) TypeCheckError!void {
+        // The reduce expression must contain an implicit tensor index
+        if (reduce_expr.tensor_expr.* != .implicit_tensor_index) {
+            return; // This error is handled in typeCheckReduceExpression
+        }
+        
+        const reduce_indices = reduce_expr.tensor_expr.*.implicit_tensor_index.implicit_indices;
+        
+        // Check for valid reduction operator
+        switch (reduce_expr.operator) {
+            .add, .multiply => {}, // Valid
+            .subtract, .divide => {
+                const pos = self.getPositionFromOffset(reduce_node.*.reduce_expression.offset);
+                std.debug.print("Error at line {}, column {}: Invalid reduction operator '{}' - only '+' and '*' are supported\n", .{ pos.line, pos.column, reduce_expr.operator });
+                self.printSourceContext(reduce_node.*.reduce_expression.offset);
+                return error.InvalidBinaryOperation;
+            },
+        }
+        
+        // Check for duplicate indices in reduce expression
+        for (reduce_indices, 0..) |idx1, i| {
+            for (reduce_indices[i + 1..]) |idx2| {
+                if (std.mem.eql(u8, idx1, idx2)) {
+                    const pos = self.getPositionFromOffset(reduce_node.*.reduce_expression.offset);
+                    std.debug.print("Error at line {}, column {}: Duplicate implicit index '{s}' in reduce expression\n", .{ pos.line, pos.column, idx1 });
+                    self.printSourceContext(reduce_node.*.reduce_expression.offset);
+                    return error.InvalidExpression;
+                }
+            }
+        }
+        
+        // Determine which indices are free (appear in target) vs bound (only in reduce)
+        var free_indices = std.ArrayList([]const u8).init(self.allocator);
+        var bound_indices = std.ArrayList([]const u8).init(self.allocator);
+        defer free_indices.deinit();
+        defer bound_indices.deinit();
+        
+        // Check each reduce index to see if it appears in the target
+        for (reduce_indices) |reduce_idx| {
+            var found_in_target = false;
+            for (target_indices) |target_idx| {
+                if (std.mem.eql(u8, reduce_idx, target_idx)) {
+                    found_in_target = true;
+                    break;
+                }
+            }
+            
+            if (found_in_target) {
+                try free_indices.append(reduce_idx);
+            } else {
+                try bound_indices.append(reduce_idx);
+            }
+        }
+        
+        // Validate that we're actually reducing dimensions (bound indices must be non-empty)
+        if (bound_indices.items.len == 0) {
+            const pos = self.getPositionFromOffset(reduce_node.*.reduce_expression.offset);
+            std.debug.print("Error at line {}, column {}: Cannot reduce to higher or equal rank - reduce expression must have more indices than target\n", .{ pos.line, pos.column });
+            self.printSourceContext(reduce_node.*.reduce_expression.offset);
+            return error.InvalidExpression;
+        }
+        
+        // Validate that free indices match target indices
+        if (free_indices.items.len != target_indices.len) {
+            const pos = self.getPositionFromOffset(reduce_node.*.reduce_expression.offset);
+            std.debug.print("Error at line {}, column {}: Free indices must match between target and reduce expression\n", .{ pos.line, pos.column });
+            self.printSourceContext(reduce_node.*.reduce_expression.offset);
+            return error.InvalidExpression;
+        }
+        
+        // Check that all free indices appear in target
+        for (free_indices.items) |free_idx| {
+            var found = false;
+            for (target_indices) |target_idx| {
+                if (std.mem.eql(u8, free_idx, target_idx)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                const pos = self.getPositionFromOffset(reduce_node.*.reduce_expression.offset);
+                std.debug.print("Error at line {}, column {}: Free index '{s}' in reduce expression does not match any target index\n", .{ pos.line, pos.column, free_idx });
+                self.printSourceContext(reduce_node.*.reduce_expression.offset);
+                return error.InvalidExpression;
+            }
+        }
+        
+        // Store the reduction info
+        const info = ReductionInfo{
+            .free_indices = try self.allocator.dupe([]const u8, free_indices.items),
+            .bound_indices = try self.allocator.dupe([]const u8, bound_indices.items),
+            .operator = reduce_expr.operator,
+        };
+        
+        try self.reduction_info.put(reduce_node, info);
+        
+        if (self.verbose) {
+            std.debug.print("DEBUG: Storing reduction info at node ptr: {*}\n", .{reduce_node});
+            std.debug.print("DEBUG: Reduction analysis - free indices: ", .{});
+            for (free_indices.items) |idx| {
+                std.debug.print("{s} ", .{idx});
+            }
+            std.debug.print(", bound indices: ", .{});
+            for (bound_indices.items) |idx| {
+                std.debug.print("{s} ", .{idx});
+            }
+            std.debug.print("\n", .{});
+        }
     }
 
     fn getNodeOffset(_: *TypeChecker, node: parser.ASTNode) usize {
@@ -588,6 +834,7 @@ pub const TypeChecker = struct {
             .implicit_tensor_index => |n| n.offset,
             .tensor_slice => |n| n.offset,
             .parallel_assignment => |n| n.offset,
+            .reduce_expression => |n| n.offset,
         };
     }
 
@@ -618,5 +865,43 @@ pub const TypeChecker = struct {
     fn getPositionFromOffset(self: *TypeChecker, offset: usize) struct { line: usize, column: usize } {
         const pos = lexer.Lexer.offsetToLineColumn(self.source, offset);
         return .{ .line = @as(usize, pos.line), .column = @as(usize, pos.column) };
+    }
+    
+    fn printType(_: *TypeChecker, t: parser.Type) void {
+        switch (t) {
+            .u8 => std.debug.print("u8", .{}),
+            .u16 => std.debug.print("u16", .{}),
+            .u32 => std.debug.print("u32", .{}),
+            .u64 => std.debug.print("u64", .{}),
+            .i8 => std.debug.print("i8", .{}),
+            .i16 => std.debug.print("i16", .{}),
+            .i32 => std.debug.print("i32", .{}),
+            .i64 => std.debug.print("i64", .{}),
+            .f32 => std.debug.print("f32", .{}),
+            .f64 => std.debug.print("f64", .{}),
+            .void => std.debug.print("void", .{}),
+            .tensor => |tensor_type| {
+                std.debug.print("[", .{});
+                for (tensor_type.shape, 0..) |dim, i| {
+                    if (i > 0) std.debug.print(", ", .{});
+                    std.debug.print("{}", .{dim});
+                }
+                std.debug.print("]", .{});
+                switch (tensor_type.element_type.*) {
+                    .u8 => std.debug.print("u8", .{}),
+                    .u16 => std.debug.print("u16", .{}),
+                    .u32 => std.debug.print("u32", .{}),
+                    .u64 => std.debug.print("u64", .{}),
+                    .i8 => std.debug.print("i8", .{}),
+                    .i16 => std.debug.print("i16", .{}),
+                    .i32 => std.debug.print("i32", .{}),
+                    .i64 => std.debug.print("i64", .{}),
+                    .f32 => std.debug.print("f32", .{}),
+                    .f64 => std.debug.print("f64", .{}),
+                    .void => std.debug.print("void", .{}),
+                    .tensor => std.debug.print("tensor", .{}),
+                }
+            },
+        }
     }
 };

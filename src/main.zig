@@ -318,6 +318,9 @@ fn compile(allocator: std.mem.Allocator, source_file: []const u8, target: std.Ta
 
     var code_gen = try codegen.CodeGen.init(allocator, "toy_program", verbose, target, gpu_target);
     defer code_gen.deinit();
+    
+    // Pass reduction info from typechecker to codegen
+    code_gen.setReductionInfo(type_checker.reduction_info);
 
     // Extract output name from source file (remove .toy extension)
     const basename = std.fs.path.basename(source_file);

@@ -219,11 +219,11 @@ pub const ASTNode = union(enum) {
         element_type: Type,
         value: *ASTNode, // The fill value
     },
-    // Implicit tensor indexing: vector[i]
+    // Implicit tensor indexing: vector[i] or matrix[i, j]
     implicit_tensor_index: struct {
         offset: usize,
         tensor: *ASTNode, // The tensor being indexed
-        implicit_index: []const u8, // The implicit index name
+        implicit_indices: [][]const u8, // The implicit index names
     },
     // Explicit tensor indexing: vector[0] - reduces rank
     tensor_slice: struct {
@@ -236,6 +236,12 @@ pub const ASTNode = union(enum) {
         offset: usize,
         target: *ASTNode, // The target (implicit_tensor_index)
         value: *ASTNode, // The value expression
+    },
+    // Reduce expression: reduce(tensor[i, j], +)
+    reduce_expression: struct {
+        offset: usize,
+        tensor_expr: *ASTNode, // The tensor expression to reduce
+        operator: BinaryOperator, // The reduction operator (+, *, etc.)
     },
 };
 
@@ -346,6 +352,10 @@ pub const Parser = struct {
                 }
                 self.allocator.free(prog.statements);
             },
+            .reduce_expression => |reduce| {
+                self.cleanupASTNode(reduce.tensor_expr);
+                self.allocator.destroy(reduce.tensor_expr);
+            },
             .identifier, .number_literal, .parameter, .tensor_literal, .implicit_tensor_index, .tensor_slice, .parallel_assignment => {},
         }
     }
@@ -398,6 +408,10 @@ pub const Parser = struct {
                 }
                 self.allocator.free(prog.statements);
             },
+            .reduce_expression => |reduce| {
+                self.cleanupASTNode(reduce.tensor_expr);
+                self.allocator.destroy(reduce.tensor_expr);
+            },
             .identifier, .number_literal, .parameter, .tensor_literal, .implicit_tensor_index, .tensor_slice, .parallel_assignment => {},
         }
     }
@@ -432,6 +446,7 @@ pub const Parser = struct {
                         .implicit_tensor_index => |n| n.offset,
                         .tensor_slice => |n| n.offset,
                         .parallel_assignment => |n| n.offset,
+                        .reduce_expression => |n| n.offset,
                     };
                     break :blk off;
                 } else 0,
@@ -497,6 +512,7 @@ pub const Parser = struct {
                     .implicit_tensor_index => |n| n.offset,
                     .tensor_slice => |n| n.offset,
                     .parallel_assignment => |n| n.offset,
+                    .reduce_expression => |n| n.offset,
                 };
                 return ASTNode{
                     .expression_statement = .{
@@ -798,6 +814,7 @@ pub const Parser = struct {
                 .implicit_tensor_index => |n| n.offset,
                 .tensor_slice => |n| n.offset,
                 .parallel_assignment => |n| n.offset,
+                .reduce_expression => |n| n.offset,
             };
             expr = ASTNode{
                 .call_expression = .{
@@ -846,6 +863,10 @@ pub const Parser = struct {
                     .type = number_info.type,
                 },
             };
+        }
+
+        if (self.match(.reduce)) {
+            return try self.parseReduceExpression();
         }
 
         if (self.match(.identifier)) {
@@ -1012,20 +1033,32 @@ pub const Parser = struct {
         // Parse tensor[index] syntax
         _ = try self.consume(.left_bracket, "Expected '['");
 
-        var indices = std.ArrayList(ASTNode).init(self.allocator);
-        defer indices.deinit();
+        var numeric_indices = std.ArrayList(ASTNode).init(self.allocator);
+        defer numeric_indices.deinit();
+        
+        var implicit_indices = std.ArrayList([]const u8).init(self.allocator);
+        defer implicit_indices.deinit();
+        
+        var has_implicit = false;
+        var has_numeric = false;
 
         // Parse indices (can be numbers or identifiers)
         while (true) {
             if (self.check(.number)) {
                 // Explicit numeric index
+                has_numeric = true;
+                if (has_implicit) {
+                    self.reportError(self.peek().offset, "Cannot mix numeric and implicit indices");
+                    return error.ParseError;
+                }
+                
                 const index_token = try self.consume(.number, "Expected index");
                 const index_str = self.source[index_token.offset .. index_token.offset + index_token.getLength()];
 
                 // Parse the number and extract type
                 const number_info = try self.parseNumberWithType(index_str);
 
-                try indices.append(ASTNode{
+                try numeric_indices.append(ASTNode{
                     .number_literal = .{
                         .offset = index_token.offset,
                         .value = index_str,
@@ -1034,23 +1067,15 @@ pub const Parser = struct {
                 });
             } else if (self.check(.identifier)) {
                 // Implicit index (identifier)
+                has_implicit = true;
+                if (has_numeric) {
+                    self.reportError(self.peek().offset, "Cannot mix numeric and implicit indices");
+                    return error.ParseError;
+                }
+                
                 const index_token = try self.consume(.identifier, "Expected index");
                 const index_name = self.source[index_token.offset .. index_token.offset + index_token.getLength()];
-
-                // For now, treat any identifier as implicit index
-                // Scope checking will happen in type checker
-                const tensor_ptr = try self.allocator.create(ASTNode);
-                tensor_ptr.* = base;
-
-                _ = try self.consume(.right_bracket, "Expected ']'");
-
-                return ASTNode{
-                    .implicit_tensor_index = .{
-                        .offset = index_token.offset,
-                        .tensor = tensor_ptr,
-                        .implicit_index = try self.allocator.dupe(u8, index_name),
-                    },
-                };
+                try implicit_indices.append(try self.allocator.dupe(u8, index_name));
             } else {
                 self.reportError(self.peek().offset, "Expected number or identifier for index");
                 return error.ParseError;
@@ -1065,15 +1090,73 @@ pub const Parser = struct {
 
         _ = try self.consume(.right_bracket, "Expected ']'");
 
-        // Create tensor slice for explicit numeric indices
-        const tensor_ptr = try self.allocator.create(ASTNode);
-        tensor_ptr.* = base;
+        if (has_implicit) {
+            // Create implicit tensor index with multiple indices
+            const tensor_ptr = try self.allocator.create(ASTNode);
+            tensor_ptr.* = base;
 
+            return ASTNode{
+                .implicit_tensor_index = .{
+                    .offset = 0,
+                    .tensor = tensor_ptr,
+                    .implicit_indices = try implicit_indices.toOwnedSlice(),
+                },
+            };
+        } else {
+            // Create tensor slice for explicit numeric indices
+            const tensor_ptr = try self.allocator.create(ASTNode);
+            tensor_ptr.* = base;
+
+            return ASTNode{
+                .tensor_slice = .{
+                    .offset = 0,
+                    .tensor = tensor_ptr,
+                    .indices = try numeric_indices.toOwnedSlice(),
+                },
+            };
+        }
+    }
+
+    fn parseReduceExpression(self: *Parser) ParseError!ASTNode {
+        const reduce_offset = self.previous().offset; // 'reduce' token offset
+        
+        // Expect '('
+        _ = try self.consume(.left_paren, "Expected '(' after 'reduce'");
+        
+        // Parse the tensor expression
+        const tensor_expr = try self.parseExpression();
+        
+        // Expect ','
+        _ = try self.consume(.comma, "Expected ',' after tensor expression");
+        
+        // Parse the operator
+        var operator: BinaryOperator = undefined;
+        if (self.match(.plus)) {
+            operator = .add;
+        } else if (self.match(.multiply)) {
+            operator = .multiply;
+        } else if (self.match(.minus)) {
+            operator = .subtract;
+        } else if (self.match(.divide)) {
+            operator = .divide;
+        } else {
+            self.cleanupASTNode(&tensor_expr);
+            self.reportError(self.peek().offset, "Expected operator (+, *, -, /) for reduce");
+            return error.ParseError;
+        }
+        
+        // Expect ')'
+        _ = try self.consume(.right_paren, "Expected ')' after reduce operator");
+        
+        // Create the reduce expression node
+        const tensor_expr_ptr = try self.allocator.create(ASTNode);
+        tensor_expr_ptr.* = tensor_expr;
+        
         return ASTNode{
-            .tensor_slice = .{
-                .offset = 0,
-                .tensor = tensor_ptr,
-                .indices = try indices.toOwnedSlice(),
+            .reduce_expression = .{
+                .offset = reduce_offset,
+                .tensor_expr = tensor_expr_ptr,
+                .operator = operator,
             },
         };
     }
@@ -1254,8 +1337,11 @@ pub fn freeAST(allocator: std.mem.Allocator, node: ASTNode) void {
             allocator.free(tensor_slice.indices);
         },
         .implicit_tensor_index => |tensor_index| {
-            // Free the implicit index name string
-            allocator.free(tensor_index.implicit_index);
+            // Free the implicit index name strings
+            for (tensor_index.implicit_indices) |index| {
+                allocator.free(index);
+            }
+            allocator.free(tensor_index.implicit_indices);
             freeAST(allocator, tensor_index.tensor.*);
             allocator.destroy(tensor_index.tensor);
         },
@@ -1264,6 +1350,10 @@ pub fn freeAST(allocator: std.mem.Allocator, node: ASTNode) void {
             freeAST(allocator, pa.value.*);
             allocator.destroy(pa.target);
             allocator.destroy(pa.value);
+        },
+        .reduce_expression => |reduce| {
+            freeAST(allocator, reduce.tensor_expr.*);
+            allocator.destroy(reduce.tensor_expr);
         },
         .identifier, .number_literal, .parameter => {},
     }
