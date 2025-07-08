@@ -106,7 +106,10 @@ pub const GpuMemoryTracker = struct {
     /// Check if a variable needs to be transferred to GPU
     pub fn needsTransferToGpu(self: *GpuMemoryTracker, name: []const u8) bool {
         if (self.variables.get(name)) |info| {
-            return info.location == .cpu;
+            // Need transfer if:
+            // 1. Data is only on CPU
+            // 2. Data is on both but was last modified on CPU
+            return info.location == .cpu or (info.location == .both and info.last_modified == .cpu);
         }
         return true; // Conservative: if unknown, assume transfer needed
     }

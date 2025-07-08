@@ -603,6 +603,39 @@ pub const CodeGen = struct {
             .identifier => |ident| {
                 if (self.variables.get(ident.name)) |info| {
                     if (info.ty == .tensor) {
+                        // Check if we need to sync GPU data back to CPU
+                        if (self.gpu_memory_tracker) |*tracker| {
+                            if (self.verbose) {
+                                std.debug.print("  🔍 Checking GPU sync for tensor identifier '{s}'\n", .{ident.name});
+                                tracker.printState();
+                            }
+                            if (tracker.needsTransferToCpu(ident.name)) {
+                                if (self.gpu_memory_ops) |*ops| {
+                                    if (self.verbose) {
+                                        std.debug.print("  🔄 Synchronizing GPU data for '{s}' before CPU access\n", .{ident.name});
+                                    }
+                                    
+                                    // Synchronize GPU operations
+                                    ops.synchronize();
+                                    
+                                    // Copy data back from GPU
+                                    if (tracker.getGpuPtr(ident.name)) |gpu_ptr_opt| {
+                                        const gpu_ptr = gpu_ptr_opt;
+                                        const size_t_type = LLVM.LLVMInt64TypeInContext(self.context);
+                                        const tensor_size = LLVM.LLVMConstInt(size_t_type, 1024 * 4, 0); // TODO: get actual size
+                                        const ptr_type = LLVM.LLVMPointerType(LLVM.LLVMInt8TypeInContext(self.context), 0);
+                                        const host_ptr = LLVM.LLVMBuildBitCast(self.builder, info.alloca, ptr_type, "host_ptr");
+                                        
+                                        ops.copyDeviceToHost(host_ptr, gpu_ptr, tensor_size);
+                                        try tracker.markCopiedToCpu(ident.name);
+                                        
+                                        if (self.verbose) {
+                                            std.debug.print("  ⬇️  Copied '{s}' back to CPU\n", .{ident.name});
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         return info.alloca; // use pointer for tensors
                     }
 
@@ -702,7 +735,26 @@ pub const CodeGen = struct {
                     // Get the actual function type from the stored function
                     const function_type = LLVM.LLVMGlobalGetValueType(function);
 
-                    return LLVM.LLVMBuildCall2(self.builder, function_type, function, args.ptr, @intCast(args.len), "call");
+                    const result = LLVM.LLVMBuildCall2(self.builder, function_type, function, args.ptr, @intCast(args.len), "call");
+                    
+                    // Mark tensor arguments as modified on CPU (for non-GPU functions)
+                    if (self.gpu_memory_tracker) |*tracker| {
+                        for (call.arguments) |arg_node| {
+                            if (arg_node == .identifier) {
+                                const var_name = arg_node.identifier.name;
+                                if (self.variables.get(var_name)) |var_info| {
+                                    if (var_info.ty == .tensor) {
+                                        try tracker.markModifiedOnCpu(var_name);
+                                        if (self.verbose) {
+                                            std.debug.print("  ✏️  Marked '{s}' as modified by CPU function '{s}'\n", .{ var_name, callee_name });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    return result;
                 } else {
                     return error.UndefinedFunction;
                 }
@@ -846,11 +898,24 @@ pub const CodeGen = struct {
             }
             defer if (should_free) self.allocator.free(var_name_buf);
 
-            // Check if already on GPU
+            // Check if already on GPU and if transfer is needed
             if (tracker.getGpuPtr(var_name)) |existing_gpu_ptr| {
                 gpu_args[i] = existing_gpu_ptr;
-                if (self.verbose) {
-                    std.debug.print("  ♻️  Reusing GPU memory for '{s}'\n", .{var_name});
+                
+                // Check if we need to update GPU data from CPU
+                if (tracker.needsTransferToGpu(var_name)) {
+                    const tensor_size = LLVM.LLVMConstInt(size_t_type, 1024 * 4, 0); // TODO: get actual size
+                    const host_ptr = LLVM.LLVMBuildBitCast(self.builder, arg, ptr_type, "host_ptr");
+                    ops.copyHostToDevice(existing_gpu_ptr, host_ptr, tensor_size);
+                    try tracker.markCopiedToGpu(var_name);
+                    
+                    if (self.verbose) {
+                        std.debug.print("  🔄 Updated GPU memory for '{s}' from CPU\n", .{var_name});
+                    }
+                } else {
+                    if (self.verbose) {
+                        std.debug.print("  ♻️  Reusing GPU memory for '{s}'\n", .{var_name});
+                    }
                 }
             } else {
                 // Need to allocate and transfer

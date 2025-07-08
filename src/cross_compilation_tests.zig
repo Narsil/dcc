@@ -113,6 +113,32 @@ test "type system - tensor gpu stacked" {
     try assertGpuCrossCompiles(allocator, test_source, "test_cross_tensors_stacked.toy", 24);
 }
 
+test "type system - tensor gpu interleaved" {
+    const allocator = std.testing.allocator;
+    // Create a test file with different integer types
+    const test_source =
+        \\fn gpu_vector_add(a: [1024]i32, b: [1024]i32) void{
+        \\    a[i] = a[i] + b[i];
+        \\}
+        \\fn gpu_vector_mul(a: [1024]i32, b: [1024]i32) void{
+        \\    a[i] = a[i] * b[i];
+        \\}
+        \\fn vector_mul(a: [1024]i32, b: [1024]i32) void{
+        \\    a[i] = a[i] * b[i];
+        \\}
+        \\fn main() i32 {
+        \\    let a: [1024]i32 = [1024]i32{2i32};
+        \\    let b: [1024]i32 = [1024]i32{4i32};
+        \\    gpu_vector_add(a, b);
+        \\    gpu_vector_mul(a, b);
+        \\    vector_mul(a, b);
+        \\    gpu_vector_add(a, b);
+        \\    return a[0];
+        \\} 
+    ;
+    try assertGpuCrossCompiles(allocator, test_source, "test_cross_tensors_stacked.toy", 100);
+}
+
 fn assertCrossCompiles(allocator: std.mem.Allocator, source: []const u8, filename: []const u8, expected: u32) !void {
     for (targets) |target| {
         const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
