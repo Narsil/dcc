@@ -1,0 +1,48 @@
+// Basic Reduce Example (CPU only)
+// Demonstrates the reduce operation without GPU functions
+
+// Sum all elements in each row of a matrix
+fn sum_matrix_rows(matrix: [4, 3]i32, row_sums: [4]i32) void {
+    // The reduce operation sums along dimension j (columns)
+    // Each element row_sums[i] gets the sum of matrix[i, 0..2]
+    row_sums[i] = reduce(matrix[i, j], +);
+}
+
+// Compute products along rows
+fn product_matrix_rows(matrix: [3, 3]i32, row_products: [3]i32) void {
+    // Multiply all elements in each row
+    row_products[i] = reduce(matrix[i, j], *);
+}
+
+// Example with floating point
+fn average_preparation(data: [5, 10]f32, sums: [5]f32) void {
+    // Sum each row (first step to compute averages)
+    sums[i] = reduce(data[i, j], +);
+    // To get averages, you would divide sums[i] by 10
+}
+
+fn main() i32 {
+    // Example 1: Sum rows of a 4x3 matrix
+    let matrix: [4, 3]i32 = [4, 3]i32{2i32};  // Fill with 2s
+    let sums: [4]i32 = [4]i32{0i32};
+    
+    sum_matrix_rows(matrix, sums);
+    // Each sum should be 6 (2 + 2 + 2)
+    
+    // Example 2: Product of rows in a 3x3 matrix
+    let square: [3, 3]i32 = [3, 3]i32{3i32};  // Fill with 3s
+    let products: [3]i32 = [3]i32{1i32};
+    
+    product_matrix_rows(square, products);
+    // Each product should be 27 (3 * 3 * 3)
+    
+    // Example 3: Floating point reduction
+    let data: [5, 10]f32 = [5, 10]f32{1.5f32};
+    let row_totals: [5]f32 = [5]f32{0.0f32};
+    
+    average_preparation(data, row_totals);
+    // Each total should be 15.0 (10 * 1.5)
+    
+    // Return the first sum as our result
+    return sums[0];
+}

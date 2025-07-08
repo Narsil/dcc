@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./zig-out/bin/dcc:*)",
+      "Bash(ls:*)",
+      "Bash(zig-out/bin/dcc test:*)",
+      "Bash(echo:*)",
+      "Bash(./test_gpu_stacked_debug)",
+      "Bash(scp:*)",
+      "Bash(rg:*)",
+      "Bash(zig build:*)",
+      "Bash(grep:*)",
+      "Bash(find:*)",
+      "Bash(./test_reduce_basic)",
+      "Bash(rm:*)",
+      "Bash(./test_reduce_manual)",
+      "Bash(zig test:*)",
+      "Bash(./dcc:*)",
+      "Bash(SHELL=/bin/sh zig build)",
+      "Bash(./test_simple_2d_reduce)",
+      "Bash(./test_simple_reduce_debug)",
+      "Bash(./test_reduce_debug)",
+      "Bash(./test_reduce_product)",
+      "Bash(./test_reduce_multi_2d_1d:*)",
+      "Bash(./test_reduce_debug2)",
+      "Bash(cat:*)",
+      "Bash(./test_reduce_first_dim)",
+      "Bash(./test_init_check)",
+      "Bash(./test_reduce_basics)"
+    ],
+    "deny": []
+  }
+}
