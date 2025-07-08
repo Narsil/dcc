@@ -27,7 +27,7 @@ const MLIR = @cImport({
 
 /// Extract SM version from std.Target for CUDA/NVPTX targets
 /// Returns the SM version as u32, or a default value if not NVPTX or parsing fails
-fn extractSmVersionFromTarget(target: std.Target) u32 {
+fn extractSmVersionFromTarget(target: std.Target) !u32 {
     // Check if this is an NVPTX target
     if (!target.cpu.arch.isNvptx()) {
         return 50; // Default SM version for non-NVPTX targets
@@ -36,7 +36,6 @@ fn extractSmVersionFromTarget(target: std.Target) u32 {
     // Parse the CPU model name to extract SM version
     // NVPTX CPU model names are typically like "sm_50", "sm_52", etc.
     const model_name = target.cpu.model.name;
-    std.debug.print("GPU - CPU name {s}", .{model_name});
 
     if (std.mem.startsWith(u8, model_name, "sm_")) {
         const version_str = model_name[3..]; // Skip "sm_" prefix
@@ -47,9 +46,8 @@ fn extractSmVersionFromTarget(target: std.Target) u32 {
             return 50;
         }
     }
-
-    // If model name doesn't match expected pattern, return default
-    return 50;
+    std.debug.panic("Cannot detect cuda sm version on {}", .{target});
+    return error.SMNotFound;
 }
 
 pub const MLIRCodeGenError = error{
@@ -735,7 +733,7 @@ pub const MLIRCodeGen = struct {
 
         // Create target machine
         // Extract SM version from target and create CPU string
-        const sm_version = extractSmVersionFromTarget(self.target);
+        const sm_version = try extractSmVersionFromTarget(self.target);
         const cpu_str = try std.fmt.allocPrintZ(self.allocator, "sm_{d}", .{sm_version});
         defer self.allocator.free(cpu_str);
 

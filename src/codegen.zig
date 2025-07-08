@@ -12,7 +12,7 @@ const LLVM = @cImport({
     @cInclude("llvm-c/Object.h");
 });
 
-pub const CodeGenError = error{ InvalidTopLevelNode, InvalidStatement, InvalidExpression, InvalidCallee, UndefinedVariable, UndefinedFunction, TargetError, CodeGenError, MainFunctionNotFound, MissingMainFunction, LinkingFailed, GpuCompilationNotImplemented, InvalidGpuTriplet, InvalidTargetTriple, InvalidCharacter, Overflow, CudaFunctionNotFound } || std.mem.Allocator.Error;
+pub const CodeGenError = error{ InvalidTopLevelNode, InvalidStatement, InvalidExpression, InvalidCallee, UndefinedVariable, UndefinedFunction, TargetError, CodeGenError, MainFunctionNotFound, MissingMainFunction, LinkingFailed, GpuCompilationNotImplemented, InvalidGpuTriplet, InvalidTargetTriple, InvalidCharacter, Overflow, CudaFunctionNotFound, CudaStubInitFailed } || std.mem.Allocator.Error;
 
 const VarInfo = struct {
     alloca: LLVM.LLVMValueRef,
@@ -41,6 +41,33 @@ extern fn lld_main(args: [*]const [*:0]const u8, argc: c_int) c_int;
 // Darwin ARM64 system call numbers
 const SYS_EXIT_DARWIN = 1; // exit() system call on Darwin
 
+pub const Accelerator = struct {
+    codegen: mlir_codegen.MLIRCodeGen,
+    stub: cuda_stub_manager.CudaStubManager,
+
+    pub fn init(allocator: std.mem.Allocator, gpu_target: std.Target, verbose: bool) !Accelerator {
+        const mlir_gen = try mlir_codegen.MLIRCodeGen.init(allocator, gpu_target, verbose);
+        const cuda_stub_mgr = cuda_stub_manager.CudaStubManager.init(allocator, verbose) catch |err| {
+            if (verbose) {
+                std.debug.print("⚠️  Warning: Failed to initialize CUDA stub manager: {}\n", .{err});
+            }
+            // If CUDA stub manager fails, we still want to continue with MLIR codegen
+            // Create a minimal stub manager or handle this case appropriately
+            return error.CudaStubInitFailed;
+        };
+
+        return Accelerator{
+            .codegen = mlir_gen,
+            .stub = cuda_stub_mgr,
+        };
+    }
+
+    pub fn deinit(self: *Accelerator) void {
+        self.codegen.deinit();
+        self.stub.deinit();
+    }
+};
+
 pub const CodeGen = struct {
     context: LLVM.LLVMContextRef,
     module: LLVM.LLVMModuleRef,
@@ -49,8 +76,7 @@ pub const CodeGen = struct {
     verbose: bool,
     variables: std.HashMap([]const u8, VarInfo, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
     functions: std.HashMap([]const u8, LLVM.LLVMValueRef, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
-    mlir_codegen: ?mlir_codegen.MLIRCodeGen,
-    cuda_stub_mgr: ?cuda_stub_manager.CudaStubManager,
+    accelerator: ?Accelerator,
 
     pub fn init(allocator: std.mem.Allocator, module_name: []const u8, verbose: bool, target: std.Target, gpu: ?std.Target) !CodeGen {
         // Initialize LLVM X86 target (for x86_64 support)
@@ -75,7 +101,7 @@ pub const CodeGen = struct {
         const builder = LLVM.LLVMCreateBuilderInContext(context);
 
         // Parse GPU triplet if provided
-        var mlir_gen: ?mlir_codegen.MLIRCodeGen = null;
+        var accelerator: ?Accelerator = null;
         if (gpu) |gpu_target| {
             if (target.os.tag == .macos) {
                 std.debug.print("Error: NVIDIA GPU compilation is not supported on macOS targets\n", .{});
@@ -84,15 +110,9 @@ pub const CodeGen = struct {
                 return error.CodeGenError;
             }
 
-            mlir_gen = mlir_codegen.MLIRCodeGen.init(allocator, gpu_target, verbose) catch null;
-        }
-
-        // Initialize CUDA stub manager if GPU compilation is enabled
-        var cuda_stub_mgr: ?cuda_stub_manager.CudaStubManager = null;
-        if (gpu != null) {
-            cuda_stub_mgr = cuda_stub_manager.CudaStubManager.init(allocator, verbose) catch |err| blk: {
+            accelerator = Accelerator.init(allocator, gpu_target, verbose) catch |err| blk: {
                 if (verbose) {
-                    std.debug.print("⚠️  Warning: Failed to initialize CUDA stub manager: {}\n", .{err});
+                    std.debug.print("⚠️  Warning: Failed to initialize accelerator: {}\n", .{err});
                 }
                 break :blk null;
             };
@@ -106,8 +126,7 @@ pub const CodeGen = struct {
             .verbose = verbose,
             .variables = std.HashMap([]const u8, VarInfo, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .functions = std.HashMap([]const u8, LLVM.LLVMValueRef, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
-            .mlir_codegen = mlir_gen,
-            .cuda_stub_mgr = cuda_stub_mgr,
+            .accelerator = accelerator,
         };
     }
 
@@ -122,14 +141,9 @@ pub const CodeGen = struct {
         // Variables are cleaned up after each function, so just deinit the HashMap
         self.variables.deinit();
 
-        // Clean up MLIR resources
-        if (self.mlir_codegen) |*mlir| {
-            mlir.deinit();
-        }
-
-        // Clean up CUDA stub manager
-        if (self.cuda_stub_mgr) |*cuda_mgr| {
-            cuda_mgr.deinit();
+        // Clean up accelerator resources
+        if (self.accelerator) |*accel| {
+            accel.deinit();
         }
 
         // Clean up LLVM resources
@@ -162,7 +176,7 @@ pub const CodeGen = struct {
         // Since functions may not be registered yet when this is called,
         // we'll use a simple check for the MLIR codegen being non-null
         // which indicates GPU compilation support is active
-        return self.mlir_codegen != null;
+        return self.accelerator != null;
     }
 
     pub fn generate(self: *CodeGen, ast: parser.ASTNode) CodeGenError!void {
@@ -321,7 +335,7 @@ pub const CodeGen = struct {
         if (is_main) {
             if (self.verbose) {
                 std.debug.print("🔧 In main function, checking for GPU functions...\n", .{});
-                std.debug.print("   self.mlir_codegen != null: {}\n", .{self.mlir_codegen != null});
+                std.debug.print("   self.accelerator != null: {}\n", .{self.accelerator != null});
                 std.debug.print("   hasGpuFunctions(): {}\n", .{self.hasGpuFunctions()});
             }
             if (self.hasGpuFunctions()) {
@@ -800,8 +814,8 @@ pub const CodeGen = struct {
                 // ELF executable arguments
                 try args.append(try self.allocator.dupeZ(u8, "ld.lld"));
                 try args.append(try self.allocator.dupeZ(u8, "--entry=_start"));
-                // Only set dynamic linker if we're linking against dynamic libraries (i.e., when mlir_codegen is present)
-                if (self.mlir_codegen != null) {
+                // Only set dynamic linker if we're linking against dynamic libraries (i.e., when accelerator is present)
+                if (self.accelerator != null) {
                     try args.append(try self.allocator.dupeZ(u8, "--dynamic-linker=/lib64/ld-linux-x86-64.so.2"));
                 }
                 try args.append(try self.allocator.dupeZ(u8, "-o"));
@@ -815,11 +829,10 @@ pub const CodeGen = struct {
         // No libc needed - using Linux syscall for exit() in cross-compilation
 
         // Add CUDA library linking for Linux targets if GPU code is present
-        if (target.os.tag == .linux and self.mlir_codegen != null) {
+        if (target.os.tag == .linux and self.accelerator != null) {
             // Check if we have CUDA stub libraries available
-            if (self.cuda_stub_mgr) |*stub_mgr| {
-                // Use CUDA stub library for linking, but set RPATH to system library
-                const stub_lib_path = stub_mgr.getLibCudaPath() catch |err| {
+            if (self.accelerator) |*accel| {
+                const stub_lib_path = accel.stub.getLibCudaPath() catch |err| {
                     if (self.verbose) {
                         std.debug.print("⚠️  Warning: Failed to get CUDA stub library path: {}\n", .{err});
                     }
@@ -863,11 +876,11 @@ pub const CodeGen = struct {
                     std.debug.print("🔗 Added CUDA stub library for linking: {s}\n", .{stub_lib_path});
                 }
             } else {
-                // No stub manager, use system libraries
+                // No accelerator, use system libraries
                 try args.append(try self.allocator.dupeZ(u8, "-lcuda"));
 
                 if (self.verbose) {
-                    std.debug.print("🔗 Added system CUDA library linking (no stub manager)\n", .{});
+                    std.debug.print("🔗 Added system CUDA library linking (no accelerator)\n", .{});
                 }
             }
         }
@@ -1365,13 +1378,13 @@ pub const CodeGen = struct {
     }
 
     fn generateGpuFunction(self: *CodeGen, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration)) CodeGenError!void {
-        if (self.mlir_codegen) |*mlir| {
+        if (self.accelerator) |*accel| {
             if (self.verbose) {
                 std.debug.print("🚀 Compiling GPU function: {s}\n", .{func.name});
             }
 
             // Step 1: Generate MLIR for the GPU function
-            mlir.generateGpuFunction(func) catch |err| {
+            accel.codegen.generateGpuFunction(func) catch |err| {
                 if (self.verbose) {
                     std.debug.print("MLIR GPU compilation failed: {}\n", .{err});
                 }
@@ -1379,11 +1392,11 @@ pub const CodeGen = struct {
             };
 
             if (self.verbose) {
-                mlir.printMLIR();
+                accel.codegen.printMLIR();
             }
 
             // Step 2: Generate PTX from MLIR
-            const ptx_code = mlir.lowerMLIRToPTX(func.name) catch |err| {
+            const ptx_code = accel.codegen.lowerMLIRToPTX(func.name) catch |err| {
                 if (self.verbose) {
                     std.debug.print("PTX generation failed: {}\n", .{err});
                 }
@@ -1448,8 +1461,8 @@ pub const CodeGen = struct {
         }
 
         // Check if we should use CUDA stubs and extract them if needed
-        if (self.cuda_stub_mgr) |*stub_mgr| {
-            stub_mgr.extractAndCompile() catch |err| {
+        if (self.accelerator) |*accel| {
+            accel.stub.extractAndCompile() catch |err| {
                 if (self.verbose) {
                     std.debug.print("⚠️  Warning: Failed to extract CUDA stub files: {}\n", .{err});
                     std.debug.print("   Proceeding with CUDA LLVM IR generation only\n", .{});
@@ -1459,10 +1472,10 @@ pub const CodeGen = struct {
 
             if (self.verbose) {
                 std.debug.print("✅ CUDA stub files extracted and ready\n", .{});
-                if (stub_mgr.getIncludePath()) |include_path| {
+                if (accel.stub.getIncludePath()) |include_path| {
                     std.debug.print("   Include path: {s}\n", .{include_path});
                 }
-                if (stub_mgr.getLibPath()) |lib_path| {
+                if (accel.stub.getLibPath()) |lib_path| {
                     std.debug.print("   Library path: {s}\n", .{lib_path});
                 }
             }
