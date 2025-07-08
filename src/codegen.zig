@@ -12,7 +12,7 @@ const LLVM = @cImport({
     @cInclude("llvm-c/Object.h");
 });
 
-pub const CodeGenError = error{ InvalidTopLevelNode, InvalidStatement, InvalidExpression, InvalidCallee, UndefinedVariable, UndefinedFunction, TargetError, CodeGenError, MainFunctionNotFound, MissingMainFunction, LinkingFailed, GpuCompilationNotImplemented, InvalidGpuTriplet, InvalidCharacter, Overflow, CudaFunctionNotFound } || std.mem.Allocator.Error;
+pub const CodeGenError = error{ InvalidTopLevelNode, InvalidStatement, InvalidExpression, InvalidCallee, UndefinedVariable, UndefinedFunction, TargetError, CodeGenError, MainFunctionNotFound, MissingMainFunction, LinkingFailed, GpuCompilationNotImplemented, InvalidGpuTriplet, InvalidTargetTriple, InvalidCharacter, Overflow, CudaFunctionNotFound } || std.mem.Allocator.Error;
 
 const VarInfo = struct {
     alloca: LLVM.LLVMValueRef,
@@ -93,7 +93,7 @@ pub const CodeGen = struct {
         return sm_version;
     }
 
-    pub fn init(allocator: std.mem.Allocator, module_name: []const u8, verbose: bool, gpu_triplet: ?[]const u8) !CodeGen {
+    pub fn init(allocator: std.mem.Allocator, module_name: []const u8, verbose: bool, target: std.Target, gpu_triplet: ?[]const u8) !CodeGen {
         // Initialize LLVM X86 target (for x86_64 support)
         LLVM.LLVMInitializeX86TargetInfo();
         LLVM.LLVMInitializeX86Target();
@@ -123,6 +123,14 @@ pub const CodeGen = struct {
                 std.debug.print("Expected format: nvidia-ptx-smXX (e.g., nvidia-ptx-sm50)\n", .{});
                 return error.CodeGenError;
             };
+
+            if (target.os.tag == .macos) {
+                std.debug.print("Error: NVIDIA GPU compilation is not supported on macOS targets\n", .{});
+                std.debug.print("NVIDIA GPUs are not available on macOS. GPU compilation with '{s}' is only supported on Linux targets.\n", .{triplet});
+                std.debug.print("To compile for GPU targets, use a Linux target (e.g., --target x86_64-unknown-linux-gnu).\n", .{});
+                return error.CodeGenError;
+            }
+
             mlir_gen = mlir_codegen.MLIRCodeGen.init(allocator, sm_version, verbose) catch null;
         }
 
@@ -767,35 +775,15 @@ pub const CodeGen = struct {
         }
     }
 
-    pub fn default_triplet(allocator: std.mem.Allocator) ![]u8 {
-        const default_triple = LLVM.LLVMGetDefaultTargetTriple();
-        const triple_str = std.mem.span(default_triple);
-        const triple_copy = try allocator.dupe(u8, triple_str);
-        defer LLVM.LLVMDisposeMessage(default_triple);
-        return triple_copy;
-    }
+    pub fn generateExecutable(self: *CodeGen, output_path: []const u8, target: std.Target) CodeGenError!void {
+        const llvm = try getLLVMTarget(self.allocator, target);
+        defer LLVM.LLVMDisposeTargetMachine(llvm.machine);
 
-    pub fn generateExecutable(self: *CodeGen, output_path: []const u8, target_triplet: []const u8) CodeGenError!void {
-        var target: LLVM.LLVMTargetRef = null;
-        var error_message: [*c]u8 = undefined;
-
-        if (LLVM.LLVMGetTargetFromTriple(target_triplet.ptr, &target, &error_message) != 0) {
-            defer LLVM.LLVMDisposeMessage(error_message);
-            std.debug.print("Error getting target: {s}\n", .{error_message});
-            std.debug.print("Tried target triple: {s}\n", .{target_triplet});
-            return error.TargetError;
-        }
-
-        // Temporarily disable _start function to test main computation alignment
-        const is_linux = std.mem.indexOf(u8, target_triplet, "linux") != null;
-        if (is_linux) {
+        if (target.os.tag == .linux) {
             try self.generateStartFunction();
         }
 
-        // Create target machine optimized for executables
-        const target_machine = LLVM.LLVMCreateTargetMachine(target.?, target_triplet.ptr, "generic", "", LLVM.LLVMCodeGenLevelDefault, LLVM.LLVMRelocDefault, // Static relocation for executables
-            LLVM.LLVMCodeModelDefault);
-        defer LLVM.LLVMDisposeTargetMachine(target_machine);
+        var error_message: [*c]u8 = undefined;
 
         // Generate object file
         const obj_path = try std.fmt.allocPrint(self.allocator, "{s}.o", .{output_path});
@@ -804,7 +792,7 @@ pub const CodeGen = struct {
         const obj_path_z = try self.allocator.dupeZ(u8, obj_path);
         defer self.allocator.free(obj_path_z);
 
-        if (LLVM.LLVMTargetMachineEmitToFile(target_machine, self.module, obj_path_z.ptr, LLVM.LLVMObjectFile, &error_message) != 0) {
+        if (LLVM.LLVMTargetMachineEmitToFile(llvm.machine, self.module, obj_path_z.ptr, LLVM.LLVMObjectFile, &error_message) != 0) {
             defer LLVM.LLVMDisposeMessage(error_message);
             std.debug.print("Error generating object file: {s}\n", .{error_message});
             return error.CodeGenError;
@@ -815,17 +803,14 @@ pub const CodeGen = struct {
         }
 
         // Link object file into executable
-        try self.linkExecutable(obj_path, output_path, target_triplet);
+        try self.linkExecutable(obj_path, output_path, target);
 
         // Clean up object file
         std.fs.cwd().deleteFile(obj_path) catch {};
     }
 
-    fn linkExecutable(self: *CodeGen, obj_path: []const u8, output_path: []const u8, target_triple: []const u8) CodeGenError!void {
+    fn linkExecutable(self: *CodeGen, obj_path: []const u8, output_path: []const u8, target: std.Target) CodeGenError!void {
         // Use lld directly without external process calls
-        const is_darwin = std.mem.indexOf(u8, target_triple, "darwin") != null;
-        const is_windows = std.mem.indexOf(u8, target_triple, "windows") != null;
-
         var args = std.ArrayList([*:0]const u8).init(self.allocator);
         defer args.deinit();
 
@@ -834,43 +819,41 @@ pub const CodeGen = struct {
             self.allocator.free(std.mem.span(arg));
         };
 
-        // Build arguments for lld
-        const linker_name = if (is_darwin) "ld64.lld" else if (is_windows) "lld-link" else "ld.lld";
-        try args.append(try self.allocator.dupeZ(u8, linker_name));
-
-        if (is_darwin) {
-            // Mach-O executable arguments
-            try args.append(try self.allocator.dupeZ(u8, "-arch"));
-            // Extract architecture from target_triple (e.g., "aarch64-apple-darwin" -> "arm64")
-            var arch_end: usize = 0;
-            while (arch_end < target_triple.len and target_triple[arch_end] != '-') : (arch_end += 1) {}
-            var arch = target_triple[0..arch_end];
-            if (std.mem.eql(u8, arch, "aarch64")) {
-                arch = "arm64";
-            }
-            try args.append(try self.allocator.dupeZ(u8, arch));
-            try args.append(try self.allocator.dupeZ(u8, "-platform_version"));
-            try args.append(try self.allocator.dupeZ(u8, "macos"));
-            try args.append(try self.allocator.dupeZ(u8, "10.15"));
-            try args.append(try self.allocator.dupeZ(u8, "10.15"));
-        } else if (is_windows) {
-            // COFF/PE executable arguments (note: no /dll flag for executables)
-            try args.append(try self.allocator.dupeZ(u8, "/subsystem:console"));
-        } else {
-            // ELF executable arguments
-            try args.append(try self.allocator.dupeZ(u8, "--entry=_start"));
-            // Only set dynamic linker if we're linking against dynamic libraries (i.e., when mlir_codegen is present)
-            if (self.mlir_codegen != null) {
-                try args.append(try self.allocator.dupeZ(u8, "--dynamic-linker=/lib64/ld-linux-x86-64.so.2"));
-            }
-        }
-
-        // Add output file
-        if (is_windows) {
-            try args.append(try std.fmt.allocPrintZ(self.allocator, "/out:{s}", .{output_path}));
-        } else {
-            try args.append(try self.allocator.dupeZ(u8, "-o"));
-            try args.append(try self.allocator.dupeZ(u8, output_path));
+        switch (target.os.tag) {
+            .macos => {
+                // Mach-O executable arguments
+                try args.append(try self.allocator.dupeZ(u8, "ld64.lld"));
+                try args.append(try self.allocator.dupeZ(u8, "-arch"));
+                switch (target.cpu.arch) {
+                    .aarch64 => {
+                        try args.append(try self.allocator.dupeZ(u8, "arm64"));
+                    },
+                    else => std.debug.panic("Unhandled arch on macos", .{}),
+                }
+                try args.append(try self.allocator.dupeZ(u8, "-platform_version"));
+                try args.append(try self.allocator.dupeZ(u8, "macos"));
+                try args.append(try self.allocator.dupeZ(u8, "10.15"));
+                try args.append(try self.allocator.dupeZ(u8, "10.15"));
+                try args.append(try self.allocator.dupeZ(u8, "-o"));
+                try args.append(try self.allocator.dupeZ(u8, output_path));
+            },
+            .windows => {
+                // COFF/PE executable arguments (note: no /dll flag for executables)
+                try args.append(try self.allocator.dupeZ(u8, "lld-link"));
+                try args.append(try self.allocator.dupeZ(u8, "/subsystem:console"));
+                try args.append(try std.fmt.allocPrintZ(self.allocator, "/out:{s}", .{output_path}));
+            },
+            else => {
+                // ELF executable arguments
+                try args.append(try self.allocator.dupeZ(u8, "ld.lld"));
+                try args.append(try self.allocator.dupeZ(u8, "--entry=_start"));
+                // Only set dynamic linker if we're linking against dynamic libraries (i.e., when mlir_codegen is present)
+                if (self.mlir_codegen != null) {
+                    try args.append(try self.allocator.dupeZ(u8, "--dynamic-linker=/lib64/ld-linux-x86-64.so.2"));
+                }
+                try args.append(try self.allocator.dupeZ(u8, "-o"));
+                try args.append(try self.allocator.dupeZ(u8, output_path));
+            },
         }
 
         // Add object file
@@ -879,61 +862,52 @@ pub const CodeGen = struct {
         // No libc needed - using Linux syscall for exit() in cross-compilation
 
         // Add CUDA library linking for Linux targets if GPU code is present
-        if (!is_darwin and !is_windows and self.mlir_codegen != null) {
+        if (target.os.tag == .linux and self.mlir_codegen != null) {
             // Check if we have CUDA stub libraries available
             if (self.cuda_stub_mgr) |*stub_mgr| {
-                if (cuda_stub_manager.CudaStubManager.shouldUseStubs(target_triple)) {
-                    // Use CUDA stub library for linking, but set RPATH to system library
-                    const stub_lib_path = stub_mgr.getLibCudaPath() catch |err| {
-                        if (self.verbose) {
-                            std.debug.print("⚠️  Warning: Failed to get CUDA stub library path: {}\n", .{err});
-                        }
-                        // Fall back to system libraries
-                        try args.append(try self.allocator.dupeZ(u8, "-lcuda"));
-
-                        if (self.verbose) {
-                            std.debug.print("🔗 Added system CUDA library linking (fallback)\n", .{});
-                        }
-                        return;
-                    };
-                    defer self.allocator.free(stub_lib_path);
-
-                    // Add the stub library directory for linking
-                    const stub_lib_dir = std.fs.path.dirname(stub_lib_path) orelse ".";
-                    const lib_dir_flag = try std.fmt.allocPrintZ(self.allocator, "-L{s}", .{stub_lib_dir});
-                    try args.append(lib_dir_flag);
-
-                    // Set RPATH to standard Linux CUDA library paths for cross-compilation
-                    // For cross-compilation, use the most common Linux CUDA library paths
-                    const linux_cuda_paths = [_][]const u8{
-                        "/run/opengl-driver/lib", // NixOS
-                        "/usr/local/cuda/lib64", // Standard CUDA installation
-                        "/usr/lib/x86_64-linux-gnu", // Ubuntu/Debian
-                        "/usr/lib64", // RHEL/CentOS
-                    };
-
-                    // Add multiple RPATH entries for better compatibility
-                    for (linux_cuda_paths) |cuda_path| {
-                        const rpath_flag = try std.fmt.allocPrintZ(self.allocator, "--rpath={s}", .{cuda_path});
-                        try args.append(rpath_flag);
-                    }
-
+                // Use CUDA stub library for linking, but set RPATH to system library
+                const stub_lib_path = stub_mgr.getLibCudaPath() catch |err| {
                     if (self.verbose) {
-                        std.debug.print("🔗 Using standard Linux CUDA library paths in RPATH for cross-compilation\n", .{});
+                        std.debug.print("⚠️  Warning: Failed to get CUDA stub library path: {}\n", .{err});
                     }
-
+                    // Fall back to system libraries
                     try args.append(try self.allocator.dupeZ(u8, "-lcuda"));
 
                     if (self.verbose) {
-                        std.debug.print("🔗 Added CUDA stub library for linking: {s}\n", .{stub_lib_path});
+                        std.debug.print("🔗 Added system CUDA library linking (fallback)\n", .{});
                     }
-                } else {
-                    // Use system CUDA libraries
-                    try args.append(try self.allocator.dupeZ(u8, "-lcuda"));
+                    return;
+                };
+                defer self.allocator.free(stub_lib_path);
 
-                    if (self.verbose) {
-                        std.debug.print("🔗 Added system CUDA library linking\n", .{});
-                    }
+                // Add the stub library directory for linking
+                const stub_lib_dir = std.fs.path.dirname(stub_lib_path) orelse ".";
+                const lib_dir_flag = try std.fmt.allocPrintZ(self.allocator, "-L{s}", .{stub_lib_dir});
+                try args.append(lib_dir_flag);
+
+                // Set RPATH to standard Linux CUDA library paths for cross-compilation
+                // For cross-compilation, use the most common Linux CUDA library paths
+                const linux_cuda_paths = [_][]const u8{
+                    "/run/opengl-driver/lib", // NixOS
+                    "/usr/local/cuda/lib64", // Standard CUDA installation
+                    "/usr/lib/x86_64-linux-gnu", // Ubuntu/Debian
+                    "/usr/lib64", // RHEL/CentOS
+                };
+
+                // Add multiple RPATH entries for better compatibility
+                for (linux_cuda_paths) |cuda_path| {
+                    const rpath_flag = try std.fmt.allocPrintZ(self.allocator, "--rpath={s}", .{cuda_path});
+                    try args.append(rpath_flag);
+                }
+
+                if (self.verbose) {
+                    std.debug.print("🔗 Using standard Linux CUDA library paths in RPATH for cross-compilation\n", .{});
+                }
+
+                try args.append(try self.allocator.dupeZ(u8, "-lcuda"));
+
+                if (self.verbose) {
+                    std.debug.print("🔗 Added CUDA stub library for linking: {s}\n", .{stub_lib_path});
                 }
             } else {
                 // No stub manager, use system libraries
@@ -968,50 +942,9 @@ pub const CodeGen = struct {
         }
     }
 
-    pub fn generateSharedLibrary(self: *CodeGen, output_path: []const u8, target_triple: ?[]const u8) CodeGenError!void {
-        // Use provided target triple or default to host triple
-        const final_triple = if (target_triple) |triple| blk: {
-            break :blk triple;
-        } else blk: {
-            const default_triple = LLVM.LLVMGetDefaultTargetTriple();
-            const triple_str = std.mem.span(default_triple);
-            const triple_copy = try self.allocator.dupe(u8, triple_str);
-            defer LLVM.LLVMDisposeMessage(default_triple);
-            defer self.allocator.free(triple_copy);
-
-            const normalized_triple = if (std.mem.startsWith(u8, triple_copy, "arm64-apple-darwin"))
-                "arm64-apple-darwin"
-            else if (std.mem.startsWith(u8, triple_copy, "x86_64-apple-darwin"))
-                "x86_64-apple-darwin"
-            else if (std.mem.startsWith(u8, triple_copy, "x86_64-pc-linux"))
-                "x86_64-pc-linux-gnu"
-            else
-                triple_copy;
-
-            break :blk normalized_triple;
-        };
-
-        if (self.verbose) {
-            std.debug.print("Target triple: {s}\n", .{final_triple});
-        }
-
-        const triple_z = try self.allocator.dupeZ(u8, final_triple);
-        defer self.allocator.free(triple_z);
-
-        var target: LLVM.LLVMTargetRef = null;
-        var error_message: [*c]u8 = undefined;
-
-        if (LLVM.LLVMGetTargetFromTriple(triple_z.ptr, &target, &error_message) != 0) {
-            defer LLVM.LLVMDisposeMessage(error_message);
-            std.debug.print("Error getting target: {s}\n", .{error_message});
-            std.debug.print("Tried target triple: {s}\n", .{final_triple});
-            return error.TargetError;
-        }
-
-        // Create target machine optimized for shared libraries
-        const target_machine = LLVM.LLVMCreateTargetMachine(target.?, triple_z.ptr, "generic", "", LLVM.LLVMCodeGenLevelDefault, LLVM.LLVMRelocPIC, // Position Independent Code for shared libraries
-            LLVM.LLVMCodeModelDefault);
-        defer LLVM.LLVMDisposeTargetMachine(target_machine);
+    pub fn generateSharedLibrary(self: *CodeGen, output_path: []const u8, target: std.Target) CodeGenError!void {
+        const llvm = try getLLVMTarget(self.allocator, target);
+        defer LLVM.LLVMDisposeTargetMachine(llvm.machine);
 
         // Generate object file
         const obj_path = try std.fmt.allocPrint(self.allocator, "{s}.o", .{output_path});
@@ -1020,7 +953,8 @@ pub const CodeGen = struct {
         const obj_path_z = try self.allocator.dupeZ(u8, obj_path);
         defer self.allocator.free(obj_path_z);
 
-        if (LLVM.LLVMTargetMachineEmitToFile(target_machine, self.module, obj_path_z.ptr, LLVM.LLVMObjectFile, &error_message) != 0) {
+        var error_message: [*c]u8 = undefined;
+        if (LLVM.LLVMTargetMachineEmitToFile(llvm.machine, self.module, obj_path_z.ptr, LLVM.LLVMObjectFile, &error_message) != 0) {
             defer LLVM.LLVMDisposeMessage(error_message);
             std.debug.print("Error generating object file: {s}\n", .{error_message});
             return error.CodeGenError;
@@ -1030,26 +964,23 @@ pub const CodeGen = struct {
             std.debug.print("Generated object file: {s}\n", .{obj_path});
         }
 
-        // Determine the appropriate shared library extension
-        const is_darwin = std.mem.indexOf(u8, final_triple, "darwin") != null;
-        const is_windows = std.mem.indexOf(u8, final_triple, "windows") != null;
-
-        const lib_extension = if (is_darwin) ".dylib" else if (is_windows) ".dll" else ".so";
+        const lib_extension = switch (target.os.tag) {
+            .macos => ".dylib",
+            .windows => ".dll",
+            else => ".so",
+        };
         const lib_file = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ output_path, lib_extension });
         defer self.allocator.free(lib_file);
 
         // Link object file into shared library
-        try self.linkSharedLibrary(obj_path, lib_file, final_triple);
+        try self.linkSharedLibrary(obj_path, lib_file, target);
 
         // Clean up object file
         std.fs.cwd().deleteFile(obj_path) catch {};
     }
 
-    fn linkSharedLibrary(self: *CodeGen, obj_path: []const u8, output_path: []const u8, target_triple: []const u8) CodeGenError!void {
+    fn linkSharedLibrary(self: *CodeGen, obj_path: []const u8, output_path: []const u8, target: std.Target) CodeGenError!void {
         // Use lld directly without external process calls
-        const is_darwin = std.mem.indexOf(u8, target_triple, "darwin") != null;
-        const is_windows = std.mem.indexOf(u8, target_triple, "windows") != null;
-
         var args = std.ArrayList([*:0]const u8).init(self.allocator);
         defer args.deinit();
 
@@ -1058,40 +989,36 @@ pub const CodeGen = struct {
             self.allocator.free(std.mem.span(arg));
         };
 
-        // Build arguments for lld
-        const linker_name = if (is_darwin) "ld64.lld" else if (is_windows) "lld-link" else "ld.lld";
-        try args.append(try self.allocator.dupeZ(u8, linker_name));
+        switch (target.os.tag) {
+            .macos => {
+                // Mach-O shared library (dylib) arguments
+                try args.append(try self.allocator.dupeZ(u8, "ld64.lld"));
+                try args.append(try self.allocator.dupeZ(u8, "-arch"));
+                switch (target.cpu.arch) {
+                    .aarch64 => {
+                        try args.append(try self.allocator.dupeZ(u8, "arm64"));
+                    },
+                    else => std.debug.panic("Unhandled arch on macos", .{}),
+                }
 
-        if (is_darwin) {
-            // Mach-O shared library (dylib) arguments
-            try args.append(try self.allocator.dupeZ(u8, "-arch"));
-            // Extract architecture from target_triple (e.g., "arm64-apple-darwin" -> "arm64")
-            var arch_end: usize = 0;
-            while (arch_end < target_triple.len and target_triple[arch_end] != '-') : (arch_end += 1) {}
-            var arch = target_triple[0..arch_end];
-            if (std.mem.eql(u8, arch, "aarch64")) {
-                arch = "arm64";
-            }
-            try args.append(try self.allocator.dupeZ(u8, arch));
-            try args.append(try self.allocator.dupeZ(u8, "-platform_version"));
-            try args.append(try self.allocator.dupeZ(u8, "macos"));
-            try args.append(try self.allocator.dupeZ(u8, "10.15"));
-            try args.append(try self.allocator.dupeZ(u8, "10.15"));
-            try args.append(try self.allocator.dupeZ(u8, "-dylib"));
-        } else if (is_windows) {
-            // COFF/PE DLL arguments
-            try args.append(try self.allocator.dupeZ(u8, "/dll"));
-        } else {
-            // ELF shared library (.so) arguments
-            try args.append(try self.allocator.dupeZ(u8, "--shared"));
-        }
-
-        // Add output file
-        if (is_windows) {
-            try args.append(try std.fmt.allocPrintZ(self.allocator, "/out:{s}", .{output_path}));
-        } else {
-            try args.append(try self.allocator.dupeZ(u8, "-o"));
-            try args.append(try self.allocator.dupeZ(u8, output_path));
+                try args.append(try self.allocator.dupeZ(u8, "-platform_version"));
+                try args.append(try self.allocator.dupeZ(u8, "macos"));
+                try args.append(try self.allocator.dupeZ(u8, "10.15"));
+                try args.append(try self.allocator.dupeZ(u8, "10.15"));
+                try args.append(try self.allocator.dupeZ(u8, "-dylib"));
+                try args.append(try self.allocator.dupeZ(u8, "-o"));
+                try args.append(try self.allocator.dupeZ(u8, output_path));
+            },
+            .windows => {
+                try args.append(try self.allocator.dupeZ(u8, "/dll"));
+                try args.append(try std.fmt.allocPrintZ(self.allocator, "/out:{s}", .{output_path}));
+            },
+            else => {
+                try args.append(try self.allocator.dupeZ(u8, "ld.lld"));
+                try args.append(try self.allocator.dupeZ(u8, "--shared"));
+                try args.append(try self.allocator.dupeZ(u8, "-o"));
+                try args.append(try self.allocator.dupeZ(u8, output_path));
+            },
         }
 
         // Add object file
@@ -1364,56 +1291,6 @@ pub const CodeGen = struct {
         try self.createPEExecutable(obj_data, output_path); // Simplified for now
     }
 
-    pub fn generateObjectFile(self: *CodeGen, output_path: []const u8, target_triple: ?[]const u8) CodeGenError!void {
-        // Use provided target triple or default to host triple
-        const final_triple = if (target_triple) |triple| blk: {
-            break :blk triple;
-        } else blk: {
-            const default_triple = LLVM.LLVMGetDefaultTargetTriple();
-            defer LLVM.LLVMDisposeMessage(default_triple);
-
-            // Normalize the target triple for known platforms
-            const triple_str = std.mem.span(default_triple);
-            const normalized_triple = if (std.mem.startsWith(u8, triple_str, "arm64-apple-darwin"))
-                "arm64-apple-darwin"
-            else if (std.mem.startsWith(u8, triple_str, "x86_64-apple-darwin"))
-                "x86_64-apple-darwin"
-            else if (std.mem.startsWith(u8, triple_str, "x86_64-pc-linux"))
-                "x86_64-pc-linux-gnu"
-            else
-                triple_str;
-
-            break :blk normalized_triple;
-        };
-
-        std.debug.print("Target triple: {s}\n", .{final_triple});
-
-        const triple_z = try self.allocator.dupeZ(u8, final_triple);
-        defer self.allocator.free(triple_z);
-
-        var target: LLVM.LLVMTargetRef = null;
-        var error_message: [*:0]u8 = undefined;
-
-        if (LLVM.LLVMGetTargetFromTriple(triple_z.ptr, &target, &error_message) != 0) {
-            defer LLVM.LLVMDisposeMessage(error_message);
-            std.debug.print("Error getting target: {s}\n", .{error_message});
-            std.debug.print("Tried target triple: {s}\n", .{final_triple});
-            return error.TargetError;
-        }
-
-        const target_machine = LLVM.LLVMCreateTargetMachine(target.?, triple_z.ptr, "generic", "", @intFromEnum(LLVM.LLVMOptLevel.default), @intFromEnum(LLVM.LLVMRelocMode.pic), @intFromEnum(LLVM.LLVMCodeModel.default));
-        defer LLVM.LLVMDisposeTargetMachine(target_machine);
-
-        const output_path_z = try self.allocator.dupeZ(u8, output_path);
-        defer self.allocator.free(output_path_z);
-
-        if (LLVM.LLVMTargetMachineEmitToFile(target_machine, self.module, output_path_z.ptr, @intFromEnum(LLVM.LLVMCodeGenFileType.object), &error_message) != 0) {
-            defer LLVM.LLVMDisposeMessage(error_message);
-            std.debug.print("Error generating object file: {s}\n", .{error_message});
-            return error.CodeGenError;
-        }
-    }
-
     pub fn printIR(self: *CodeGen) void {
         if (self.verbose) {
             const ir_string = LLVM.LLVMPrintModuleToString(self.module);
@@ -1617,28 +1494,23 @@ pub const CodeGen = struct {
             std.debug.print("🔧 Generating CUDA LLVM IR wrapper for function: {s}\n", .{func.name});
         }
 
-        // Extract target triple for CUDA compilation
-        const target_triple = "x86_64-unknown-linux-gnu"; // Default for cross-compilation
-
         // Check if we should use CUDA stubs and extract them if needed
         if (self.cuda_stub_mgr) |*stub_mgr| {
-            if (cuda_stub_manager.CudaStubManager.shouldUseStubs(target_triple)) {
-                stub_mgr.extractAndCompile(target_triple) catch |err| {
-                    if (self.verbose) {
-                        std.debug.print("⚠️  Warning: Failed to extract CUDA stub files: {}\n", .{err});
-                        std.debug.print("   Proceeding with CUDA LLVM IR generation only\n", .{});
-                    }
-                    // Continue without stub files - just generate the IR
-                };
-
+            stub_mgr.extractAndCompile() catch |err| {
                 if (self.verbose) {
-                    std.debug.print("✅ CUDA stub files extracted and ready\n", .{});
-                    if (stub_mgr.getIncludePath()) |include_path| {
-                        std.debug.print("   Include path: {s}\n", .{include_path});
-                    }
-                    if (stub_mgr.getLibPath()) |lib_path| {
-                        std.debug.print("   Library path: {s}\n", .{lib_path});
-                    }
+                    std.debug.print("⚠️  Warning: Failed to extract CUDA stub files: {}\n", .{err});
+                    std.debug.print("   Proceeding with CUDA LLVM IR generation only\n", .{});
+                }
+                // Continue without stub files - just generate the IR
+            };
+
+            if (self.verbose) {
+                std.debug.print("✅ CUDA stub files extracted and ready\n", .{});
+                if (stub_mgr.getIncludePath()) |include_path| {
+                    std.debug.print("   Include path: {s}\n", .{include_path});
+                }
+                if (stub_mgr.getLibPath()) |lib_path| {
+                    std.debug.print("   Library path: {s}\n", .{lib_path});
                 }
             }
         }
@@ -2362,4 +2234,41 @@ fn generateEntryPoint(module: LLVM.LLVMModuleRef, context: LLVM.LLVMContextRef, 
     _ = LLVM.LLVMBuildUnreachable(builder);
 
     return entry_func;
+}
+
+fn getLLVMTarget(allocator: std.mem.Allocator, target: std.Target) !struct { target: LLVM.LLVMTargetRef, machine: LLVM.LLVMTargetMachineRef } {
+    var target_llvm: LLVM.LLVMTargetRef = null;
+    var error_message: [*c]u8 = undefined;
+    const triple = try targetToTriple(allocator, target);
+    defer allocator.free(triple);
+    if (LLVM.LLVMGetTargetFromTriple(triple.ptr, &target_llvm, &error_message) != 0) {
+        defer LLVM.LLVMDisposeMessage(error_message);
+        std.debug.print("Error getting target: {s}\n", .{error_message});
+        std.debug.print("Tried target triple: {s}\n", .{triple});
+        return error.TargetError;
+    }
+    // Create target machine optimized for shared libraries
+    const machine = LLVM.LLVMCreateTargetMachine(target_llvm.?, triple.ptr, "generic", "", LLVM.LLVMCodeGenLevelDefault, LLVM.LLVMRelocPIC, // Position Independent Code for shared libraries
+        LLVM.LLVMCodeModelDefault);
+    return .{ .target = target_llvm, .machine = machine };
+}
+
+/// Helper function to convert std.Target to target triple string
+fn targetToTriple(allocator: std.mem.Allocator, target: std.Target) ![]u8 {
+    const arch_str = switch (target.cpu.arch) {
+        .x86_64 => "x86_64",
+        .aarch64 => "aarch64",
+        .arm => "arm",
+        .riscv64 => "riscv64",
+        else => @tagName(target.cpu.arch),
+    };
+
+    const os_str = switch (target.os.tag) {
+        .macos => "apple-darwin",
+        .linux => "unknown-linux-gnu",
+        .windows => "pc-windows-msvc",
+        else => @tagName(target.os.tag),
+    };
+
+    return try std.fmt.allocPrint(allocator, "{s}-{s}", .{ arch_str, os_str });
 }

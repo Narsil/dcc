@@ -2,66 +2,69 @@
 //! an executable. This is the main entry point for the toy compiler.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const typechecker = @import("typechecker.zig");
 const codegen = @import("codegen.zig");
 
-/// Target information parsed from target triplet
-const TargetInfo = struct {
-    arch: []const u8,
-    os: []const u8,
-    abi: ?[]const u8,
+/// Helper function to parse target triple string to std.Target
+fn parseTargetFromTriple(triple: []const u8) !std.Target {
+    var parts = std.mem.splitSequence(u8, triple, "-");
 
-    fn parseFromTriple(allocator: std.mem.Allocator, triple: []const u8) !TargetInfo {
-        var parts = std.mem.splitSequence(u8, triple, "-");
+    const arch_str = parts.next() orelse return error.InvalidTargetTriple;
+    const vendor_or_os = parts.next() orelse return error.InvalidTargetTriple;
 
-        const arch = parts.next() orelse return error.InvalidTargetTriple;
-        const vendor_or_os = parts.next() orelse return error.InvalidTargetTriple;
+    // Parse architecture
+    const arch = if (std.mem.eql(u8, arch_str, "x86_64"))
+        std.Target.Cpu.Arch.x86_64
+    else if (std.mem.eql(u8, arch_str, "aarch64") or std.mem.eql(u8, arch_str, "arm64"))
+        std.Target.Cpu.Arch.aarch64
+    else if (std.mem.eql(u8, arch_str, "arm"))
+        std.Target.Cpu.Arch.arm
+    else if (std.mem.eql(u8, arch_str, "riscv64"))
+        std.Target.Cpu.Arch.riscv64
+    else
+        return error.InvalidTargetTriple;
 
-        // Handle different triplet formats:
-        // arm64-apple-darwin, x86_64-pc-linux-gnu, x86_64-linux-gnu, etc.
-        var os: []const u8 = undefined;
-        var abi: ?[]const u8 = null;
-
-        if (std.mem.eql(u8, vendor_or_os, "apple")) {
-            os = parts.next() orelse return error.InvalidTargetTriple;
-        } else if (std.mem.eql(u8, vendor_or_os, "pc")) {
-            os = parts.next() orelse return error.InvalidTargetTriple;
-            abi = parts.next(); // Optional ABI like "gnu"
+    // Parse OS
+    var os_tag: std.Target.Os.Tag = undefined;
+    if (std.mem.eql(u8, vendor_or_os, "apple")) {
+        const os_part = parts.next() orelse return error.InvalidTargetTriple;
+        if (std.mem.eql(u8, os_part, "darwin") or std.mem.eql(u8, os_part, "macos")) {
+            os_tag = .macos;
         } else {
-            // Assume vendor_or_os is actually the OS (like x86_64-linux-gnu)
-            os = vendor_or_os;
-            abi = parts.next(); // Optional ABI
+            return error.InvalidTargetTriple;
         }
-
-        return TargetInfo{
-            .arch = try allocator.dupe(u8, arch),
-            .os = try allocator.dupe(u8, os),
-            .abi = if (abi) |a| try allocator.dupe(u8, a) else null,
-        };
-    }
-
-    fn deinit(self: *const TargetInfo, allocator: std.mem.Allocator) void {
-        allocator.free(self.arch);
-        allocator.free(self.os);
-        if (self.abi) |abi| {
-            allocator.free(abi);
-        }
-    }
-
-    fn getOsTag(self: *const TargetInfo) std.Target.Os.Tag {
-        if (std.mem.eql(u8, self.os, "darwin") or std.mem.eql(u8, self.os, "macos")) {
-            return .macos;
-        } else if (std.mem.eql(u8, self.os, "linux")) {
-            return .linux;
-        } else if (std.mem.eql(u8, self.os, "windows")) {
-            return .windows;
+    } else if (std.mem.eql(u8, vendor_or_os, "pc")) {
+        const os_part = parts.next() orelse return error.InvalidTargetTriple;
+        if (std.mem.eql(u8, os_part, "windows")) {
+            os_tag = .windows;
+        } else if (std.mem.eql(u8, os_part, "linux")) {
+            os_tag = .linux;
         } else {
-            return .other;
+            return error.InvalidTargetTriple;
         }
+    } else if (std.mem.eql(u8, vendor_or_os, "unknown")) {
+        const os_part = parts.next() orelse return error.InvalidTargetTriple;
+        if (std.mem.eql(u8, os_part, "linux")) {
+            os_tag = .linux;
+        } else {
+            return error.InvalidTargetTriple;
+        }
+    } else if (std.mem.eql(u8, vendor_or_os, "linux")) {
+        os_tag = .linux;
+    } else {
+        return error.InvalidTargetTriple;
     }
-};
+
+    // Create a simple target based on parsed components
+    var target = builtin.target;
+    target.os = std.Target.Os{ .tag = os_tag, .version_range = target.os.version_range };
+    target.cpu = std.Target.Cpu.baseline(arch, target.os);
+    target.abi = std.Target.Abi.default(arch, target.os);
+    return target;
+}
 
 fn hasMainFunction(ast: parser.ASTNode) bool {
     switch (ast) {
@@ -129,35 +132,24 @@ pub fn main() !void {
     }
 
     // Parse target information if provided
-    var target_info: ?TargetInfo = null;
-    defer if (target_info) |*info| info.deinit(allocator);
-
-    var allocated_triplet: bool = false;
-    const final_triple = if (target_triple) |triple| blk: {
-        target_info = TargetInfo.parseFromTriple(allocator, triple) catch |err| {
+    const target = if (target_triple) |triple| blk: {
+        const parsed_target = parseTargetFromTriple(triple) catch |err| {
             std.debug.print("Error: Invalid target triplet '{s}': {}\n", .{ triple, err });
             return;
         };
         if (verbose) {
-            std.debug.print("Cross-compiling for target: {s} ({s}-{s})\n", .{ triple, target_info.?.arch, target_info.?.os });
+            std.debug.print("Cross-compiling for target: {s} ({s}-{s})\n", .{ triple, @tagName(parsed_target.cpu.arch), @tagName(parsed_target.os.tag) });
         }
-        break :blk triple;
+        break :blk parsed_target;
     } else blk: {
-        const triplet = try codegen.CodeGen.default_triplet(allocator);
-        target_info = TargetInfo.parseFromTriple(allocator, triplet) catch |err| {
-            std.debug.print("Error: Invalid default target triplet '{s}': {}\n", .{ triplet, err });
-            return;
-        };
         if (verbose) {
-            std.debug.print("Defaulting to target: {s} ({s}-{s})\n", .{ triplet, target_info.?.arch, target_info.?.os });
+            std.debug.print("Defaulting to target: {s}-{s}\n", .{ @tagName(builtin.target.cpu.arch), @tagName(builtin.target.os.tag) });
         }
-        allocated_triplet = true;
-        break :blk triplet;
+        break :blk builtin.target;
     };
 
     // Wrap compilation in catch block to handle normal errors gracefully
-    const result = compile(allocator, source_file, final_triple, verbose, gpu_triplet);
-    if (allocated_triplet) allocator.free(final_triple);
+    const result = compile(allocator, source_file, target, verbose, gpu_triplet);
     if (result) |_| {
         // Compilation successful
     } else |err| {
@@ -241,6 +233,10 @@ pub fn main() !void {
                 std.debug.print("Error: Invalid GPU triplet format\n", .{});
                 std.process.exit(1);
             },
+            codegen.CodeGenError.InvalidTargetTriple => {
+                std.debug.print("Error: Invalid target triplet format\n", .{});
+                std.process.exit(1);
+            },
             codegen.CodeGenError.CudaFunctionNotFound => {
                 std.debug.print("Error: CUDA function not found in module\n", .{});
                 std.process.exit(1);
@@ -283,7 +279,7 @@ pub fn main() !void {
     }
 }
 
-fn compile(allocator: std.mem.Allocator, source_file: []const u8, target_triple: []const u8, verbose: bool, gpu_triplet: ?[]const u8) !void {
+fn compile(allocator: std.mem.Allocator, source_file: []const u8, target: std.Target, verbose: bool, gpu_triplet: ?[]const u8) !void {
     if (verbose) {
         std.debug.print("Compiling: {s}\n", .{source_file});
     }
@@ -335,25 +331,25 @@ fn compile(allocator: std.mem.Allocator, source_file: []const u8, target_triple:
         std.debug.print("CodeGen\n", .{});
     }
 
-    var code_gen = try codegen.CodeGen.init(allocator, "toy_program", verbose, gpu_triplet);
+    var code_gen = try codegen.CodeGen.init(allocator, "toy_program", verbose, target, gpu_triplet);
     defer code_gen.deinit();
 
     // Extract output name from source file (remove .toy extension)
     const basename = std.fs.path.basename(source_file);
-    const output_name = if (std.mem.endsWith(u8, basename, ".toy")) 
-        basename[0..basename.len - 4] 
-    else 
+    const output_name = if (std.mem.endsWith(u8, basename, ".toy"))
+        basename[0 .. basename.len - 4]
+    else
         basename;
 
     // Choose compilation mode based on presence of main function
     if (has_main) {
         try code_gen.generateWithMode(ast, .executable);
         // Generate executable binary
-        try code_gen.generateExecutable(output_name, target_triple);
+        try code_gen.generateExecutable(output_name, target);
     } else {
         try code_gen.generateWithMode(ast, .library);
         // Generate shared library
-        try code_gen.generateSharedLibrary(output_name, target_triple);
+        try code_gen.generateSharedLibrary(output_name, target);
     }
 
     if (verbose) {

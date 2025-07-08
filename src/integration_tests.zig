@@ -772,6 +772,27 @@ test "compile library.toy and verify it works" {
     std.debug.print("dcc compilation of examples/library.toy successful\n", .{});
 }
 
+test "gpu function compilation failure on macOS target" {
+    const allocator = std.testing.allocator;
+
+    const gpu_source =
+        \\fn gpu_vector_add(a: [8]i32, b: [8]i32) void {
+        \\    a[i] = a[i] + b[i];
+        \\}
+        \\
+        \\fn main() i32 {
+        \\    let x: [8]i32 = [8]i32{1i32};
+        \\    let y: [8]i32 = [8]i32{2i32};
+        \\    gpu_vector_add(x, y);
+        \\    return x[0];
+        \\}
+    ;
+
+    try assertMacOsGpuCompileFailure(allocator, gpu_source, "test_macos_gpu_failure.toy");
+
+    std.debug.print("macOS GPU compilation failure test passed\n", .{});
+}
+
 fn assertCompiles(allocator: std.mem.Allocator, source: []const u8, filename: []const u8) !void {
     const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
     {
@@ -972,5 +993,45 @@ fn assertCompileFailure(
     if (expected_substr.len > 0 and std.mem.indexOf(u8, out.stderr, expected_substr) == null) {
         std.debug.print("Expected substring '{s}' not found in stderr: {s}\n", .{ expected_substr, out.stderr });
         return error.MissingError;
+    }
+}
+
+// Assert that GPU compilation fails on macOS with the expected error message
+fn assertMacOsGpuCompileFailure(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    filename: []const u8,
+) !void {
+    const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
+
+    // Write the temporary source file
+    {
+        const file = try std.fs.cwd().createFile(filename, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(source);
+    }
+    defer std.fs.cwd().deleteFile(filename) catch {};
+
+    const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ dcc_path, filename, "--target", "arm64-apple-darwin", "--gpu", "nvidia-ptx-sm50" } });
+    defer allocator.free(out.stdout);
+    defer allocator.free(out.stderr);
+
+    // Expect non-zero exit status
+    switch (out.term) {
+        .Exited => |code| {
+            if (code == 0) {
+                std.debug.print("Expected macOS GPU compilation to fail\n", .{});
+                std.debug.print("stdout: {s}\n", .{out.stdout});
+                std.debug.print("stderr: {s}\n", .{out.stderr});
+                return error.UnexpectedSuccess;
+            }
+        },
+        else => return error.UnexpectedTermination,
+    }
+
+    // Check that the error message contains the expected macOS GPU error text
+    if (!std.mem.containsAtLeast(u8, out.stderr, 1, "NVIDIA GPU compilation is not supported on macOS targets")) {
+        std.debug.print("Expected macOS GPU error message not found in stderr:\n{s}\n", .{out.stderr});
+        return error.MissingMacOsGpuError;
     }
 }

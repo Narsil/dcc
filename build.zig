@@ -1,43 +1,56 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-// Copy CUDA stub files from environment to src directory during build
-fn copyCudaStubFiles(b: *std.Build) void {
+// Create a build step to copy CUDA stub files from environment to src directory
+fn createCudaStubCopyStep(b: *std.Build) *std.Build.Step {
     const cuda_include_dir = std.process.getEnvVarOwned(b.allocator, "CUDA_INCLUDE_DIR") catch {
         std.debug.print("🔧 CUDA_INCLUDE_DIR not found, skipping CUDA stub file copying\n", .{});
-        return;
+        // Return a no-op step if CUDA is not available
+        const noop_step = b.step("cuda-stub-noop", "No-op step for missing CUDA");
+        return noop_step;
     };
     defer b.allocator.free(cuda_include_dir);
 
     const cuda_lib_dir = std.process.getEnvVarOwned(b.allocator, "CUDA_LIB_DIR") catch {
         std.debug.print("🔧 CUDA_LIB_DIR not found, skipping CUDA stub file copying\n", .{});
-        return;
+        // Return a no-op step if CUDA is not available
+        const noop_step = b.step("cuda-stub-noop", "No-op step for missing CUDA");
+        return noop_step;
     };
     defer b.allocator.free(cuda_lib_dir);
 
     // Create destination directories
-    std.fs.cwd().makePath("src/cuda_stub/include") catch {};
-    std.fs.cwd().makePath("src/cuda_stub/lib") catch {};
+    const mkdir_step = b.addSystemCommand(&.{ "mkdir", "-p", "src/cuda_stub/include", "src/cuda_stub/lib" });
 
     // Copy CUDA header
-    const src_header = std.fmt.allocPrint(b.allocator, "{s}/cuda.h", .{cuda_include_dir}) catch return;
+    const src_header = std.fmt.allocPrint(b.allocator, "{s}/cuda.h", .{cuda_include_dir}) catch {
+        const noop_step = b.step("cuda-stub-noop", "No-op step for CUDA header copy failure");
+        return noop_step;
+    };
     defer b.allocator.free(src_header);
 
-    std.fs.cwd().copyFile(src_header, std.fs.cwd(), "src/cuda_stub/include/cuda.h", .{}) catch |err| {
-        std.debug.print("⚠️  Failed to copy CUDA header: {}\n", .{err});
-        return;
-    };
-
     // Copy CUDA stub library
-    const src_lib = std.fmt.allocPrint(b.allocator, "{s}/stubs/libcuda.so", .{cuda_lib_dir}) catch return;
+    const src_lib = std.fmt.allocPrint(b.allocator, "{s}/stubs/libcuda.so", .{cuda_lib_dir}) catch {
+        const noop_step = b.step("cuda-stub-noop", "No-op step for CUDA lib copy failure");
+        return noop_step;
+    };
     defer b.allocator.free(src_lib);
 
-    std.fs.cwd().copyFile(src_lib, std.fs.cwd(), "src/cuda_stub/lib/libcuda.so", .{}) catch |err| {
-        std.debug.print("⚠️  Failed to copy CUDA stub library: {}\n", .{err});
-        return;
+    // Create a combined step that removes read-only files first, then copies
+    const combined_copy_step = b.addSystemCommand(&.{ "sh", "-c" });
+    const combined_cmd = std.fmt.allocPrint(b.allocator, "rm -f src/cuda_stub/include/cuda.h src/cuda_stub/lib/libcuda.so && cp '{s}' src/cuda_stub/include/cuda.h && cp '{s}' src/cuda_stub/lib/libcuda.so", .{ src_header, src_lib }) catch {
+        const noop_step = b.step("cuda-stub-noop", "No-op step for combined copy failure");
+        return noop_step;
     };
+    defer b.allocator.free(combined_cmd);
+    combined_copy_step.addArg(combined_cmd);
+    combined_copy_step.step.dependOn(&mkdir_step.step);
 
-    std.debug.print("✅ CUDA stub files copied to src/cuda_stub/ during build\n", .{});
+    // Create a final step that depends on the combined copy
+    const final_step = b.step("cuda-stub-copy", "Copy CUDA stub files");
+    final_step.dependOn(&combined_copy_step.step);
+
+    return final_step;
 }
 
 // Add this function to your build.zig file
@@ -223,8 +236,8 @@ fn createLinking(b: *std.Build, exe: *std.Build.Step.Compile, llvm_include_dir: 
 // declaratively construct a build graph that will be executed by an external
 // runner.
 pub fn build(b: *std.Build) !void {
-    // Copy CUDA stub files at build time
-    copyCudaStubFiles(b);
+    // Create CUDA stub copy step (but don't run it immediately)
+    const cuda_stub_copy_step = createCudaStubCopyStep(b);
 
     // Standard target options allows the person running `zig build` to choose
     // what target to build for. Here we do not override the defaults, which
@@ -253,6 +266,9 @@ pub fn build(b: *std.Build) !void {
         .name = "dcc",
         .root_module = exe_mod,
     });
+
+    // Make the executable depend on CUDA stub copying step
+    exe.step.dependOn(cuda_stub_copy_step);
 
     // Link with LLVM and LLD libraries (statically)
     exe.linkLibC();
