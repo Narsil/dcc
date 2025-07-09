@@ -16,7 +16,7 @@ pub const LLVM = @cImport({
     @cInclude("llvm-c/Object.h");
 });
 
-pub const CodeGenError = error{ InvalidTopLevelNode, InvalidStatement, InvalidExpression, InvalidCallee, UndefinedVariable, UndefinedFunction, TargetError, CodeGenError, MainFunctionNotFound, MissingMainFunction, LinkingFailed, GpuCompilationNotImplemented, InvalidGpuTriplet, InvalidTargetTriple, InvalidCharacter, Overflow, CudaFunctionNotFound, CudaStubInitFailed, UnsupportedOperation } || std.mem.Allocator.Error;
+pub const CodeGenError = error{ InvalidTopLevelNode, InvalidStatement, InvalidExpression, InvalidCallee, UndefinedVariable, UndefinedFunction, TargetError, CodeGenError, MainFunctionNotFound, MissingMainFunction, LinkingFailed, GpuCompilationNotImplemented, InvalidGpuTriplet, InvalidTargetTriple, InvalidCharacter, Overflow, CudaFunctionNotFound, CudaStubInitFailed, UnsupportedOperation, InvalidArguments, UnsupportedNamespaceFunction, UnsupportedWriteData, UnsupportedTensorElementType } || std.mem.Allocator.Error;
 
 const VarInfo = struct {
     alloca: LLVM.LLVMValueRef,
@@ -724,12 +724,27 @@ pub const CodeGen = struct {
                 };
             },
             .call_expression => |call| {
-                const callee_name = switch (call.callee.*) {
-                    .identifier => |ident| ident.name,
-                    else => return error.InvalidCallee,
-                };
+                // Handle namespace function calls like io.file()
+                switch (call.callee.*) {
+                    .namespace_access => |ns| {
+                        if (std.mem.eql(u8, ns.namespace, "io") and std.mem.eql(u8, ns.member, "file")) {
+                            // io.file("filename") - open a file
+                            if (call.arguments.len != 1) {
+                                return error.InvalidArguments;
+                            }
+                            
+                            // Get the filename argument
+                            const filename_arg = try self.generateExpression(call.arguments[0]);
+                            
+                            // Generate file open syscall
+                            return try self.generateFileOpen(filename_arg);
+                        }
+                        return error.UnsupportedNamespaceFunction;
+                    },
+                    .identifier => |ident| {
+                        const callee_name = ident.name;
 
-                // Check if this is a GPU function call with optimized memory management
+                        // Check if this is a GPU function call with optimized memory management
                 if (self.gpu_memory_tracker != null and
                     self.gpu_memory_ops != null and
                     std.mem.startsWith(u8, callee_name, "gpu_"))
@@ -780,8 +795,11 @@ pub const CodeGen = struct {
                     }
 
                     return result;
-                } else {
-                    return error.UndefinedFunction;
+                        } else {
+                            return error.UndefinedFunction;
+                        }
+                    },
+                    else => return error.InvalidCallee,
                 }
             },
             .tensor_literal => |tensor_lit| {
@@ -1049,21 +1067,41 @@ pub const CodeGen = struct {
                 // Get the data to write
                 const data = try self.generateExpression(write.data.*);
                 
-                // For now, we'll use a simple printf for stdout/stderr
-                // In a real implementation, we'd use write() system call
-                const handle_val = if (LLVM.LLVMIsConstant(handle) == 1)
-                    LLVM.LLVMConstIntGetZExtValue(handle)
-                else
-                    return error.InvalidExpression;
+                // Determine the type of data being written
+                const data_type = switch (write.data.*) {
+                    .string_literal => parser.Type.u8, // String is array of u8
+                    .identifier => |ident| blk: {
+                        if (self.variables.get(ident.name)) |var_info| {
+                            break :blk var_info.ty;
+                        }
+                        return error.UndefinedVariable;
+                    },
+                    else => return error.UnsupportedWriteData,
+                };
                 
-                if (handle_val == 1 or handle_val == 2) { // stdout or stderr
-                    // For strings, we need to get the length
-                    // Since our strings are null-terminated, we'll compute strlen
-                    const strlen_result = try self.computeStrlen(data);
-                    
-                    // Generate the write syscall
-                    try self.generateWriteSyscall(handle, data, strlen_result);
-                }
+                // Calculate the size to write
+                const size = if (data_type == .tensor) blk: {
+                    // For tensors, calculate total bytes
+                    const tensor_type = data_type.tensor;
+                    const element_size: u64 = switch (tensor_type.element_type.*) {
+                        .f32 => 4,
+                        .f64 => 8,
+                        .i32, .u32 => 4,
+                        .i64, .u64 => 8,
+                        .i16, .u16 => 2,
+                        .i8, .u8 => 1,
+                        else => return error.UnsupportedTensorElementType,
+                    };
+                    const total_elements = tensor_type.total_elements();
+                    const total_bytes = total_elements * element_size;
+                    break :blk LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), total_bytes, 0);
+                } else blk: {
+                    // For strings, compute strlen
+                    break :blk try self.computeStrlen(data);
+                };
+                
+                // Generate the write syscall
+                try self.generateWriteSyscall(handle, data, size);
                 
                 // Return void (0)
                 return LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 0, 0);
@@ -1177,6 +1215,106 @@ pub const CodeGen = struct {
         const args = [_]LLVM.LLVMValueRef{ fd, buf, count };
         const write_func_type = LLVM.LLVMGlobalGetValueType(write_func);
         _ = LLVM.LLVMBuildCall2(self.builder, write_func_type, write_func, @constCast(&args[0]), args.len, "write_result");
+    }
+
+    fn generateFileOpen(self: *CodeGen, filename: LLVM.LLVMValueRef) CodeGenError!LLVM.LLVMValueRef {
+        // Generate platform-specific open syscall
+        const O_WRONLY = 1;
+        const O_CREAT = 0x200; // macOS value, Linux is 0x40
+        const O_TRUNC = 0x400; // macOS value, Linux is 0x200
+        
+        const flags = switch (self.target.os.tag) {
+            .macos => LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), O_WRONLY | O_CREAT | O_TRUNC, 0),
+            .linux => LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), O_WRONLY | 0x40 | 0x200, 0), // Linux values
+            else => return error.UnsupportedOperation,
+        };
+        
+        const mode = LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 0o644, 0); // rw-r--r--
+        
+        // Platform-specific syscall
+        const asm_str = switch (self.target.os.tag) {
+            .macos => switch (self.target.cpu.arch) {
+                .aarch64 => "mov x16, #5\nsvc #0x80", // open syscall on macOS ARM64
+                .x86_64 => "movq $0x2000005, %rax\nsyscall", // open syscall on macOS x86_64
+                else => return error.UnsupportedOperation,
+            },
+            .linux => switch (self.target.cpu.arch) {
+                .x86_64 => "movq $2, %rax\nsyscall", // open syscall on Linux x86_64
+                .aarch64 => "mov x8, #56\nsvc #0", // openat syscall on Linux ARM64 (using AT_FDCWD=-100)
+                else => return error.UnsupportedOperation,
+            },
+            else => return error.UnsupportedOperation,
+        };
+        
+        const constraints = switch (self.target.os.tag) {
+            .macos => switch (self.target.cpu.arch) {
+                .aarch64 => "={x0},{x0},{x1},{x2},~{x16}",
+                .x86_64 => "={rax},{rdi},{rsi},{rdx},~{rax},~{rcx},~{r11}",
+                else => return error.UnsupportedOperation,
+            },
+            .linux => switch (self.target.cpu.arch) {
+                .x86_64 => "={rax},{rdi},{rsi},{rdx},~{rax},~{rcx},~{r11}",
+                .aarch64 => "={x0},{x0},{x1},{x2},~{x8}",
+                else => return error.UnsupportedOperation,
+            },
+            else => return error.UnsupportedOperation,
+        };
+        
+        const i64_type = LLVM.LLVMInt64TypeInContext(self.context);
+        const i32_type = LLVM.LLVMInt32TypeInContext(self.context);
+        
+        // For Linux ARM64, we need to use openat with AT_FDCWD
+        var args_buf: [4]LLVM.LLVMValueRef = undefined;
+        const args_len: usize = if (self.target.os.tag == .linux and self.target.cpu.arch == .aarch64) blk: {
+            const at_fdcwd = LLVM.LLVMConstInt(i64_type, @bitCast(@as(i64, -100)), 0);
+            args_buf[0] = at_fdcwd;
+            args_buf[1] = filename;
+            args_buf[2] = flags;
+            args_buf[3] = mode;
+            break :blk 4;
+        } else blk: {
+            args_buf[0] = filename;
+            args_buf[1] = flags;
+            args_buf[2] = mode;
+            break :blk 3;
+        };
+        const args = args_buf[0..args_len];
+        
+        var param_types: [4]LLVM.LLVMTypeRef = undefined;
+        for (args, 0..) |arg, i| {
+            param_types[i] = LLVM.LLVMTypeOf(arg);
+        }
+        
+        const asm_type = LLVM.LLVMFunctionType(
+            i64_type,
+            @constCast(&param_types[0]),
+            @intCast(args.len),
+            0
+        );
+        
+        const asm_value = LLVM.LLVMGetInlineAsm(
+            asm_type,
+            @constCast(asm_str.ptr),
+            asm_str.len,
+            @constCast(constraints.ptr),
+            constraints.len,
+            1, // hasSideEffects
+            0, // isAlignStack
+            LLVM.LLVMInlineAsmDialectATT,
+            0  // canThrow
+        );
+        
+        const fd = LLVM.LLVMBuildCall2(
+            self.builder,
+            asm_type,
+            asm_value,
+            @constCast(args.ptr),
+            @intCast(args.len),
+            "fd"
+        );
+        
+        // Convert to i32 for consistency with stdout/stderr
+        return LLVM.LLVMBuildTrunc(self.builder, fd, i32_type, "fd_i32");
     }
 
     fn generatePlatformWriteSyscall(self: *CodeGen, fd: LLVM.LLVMValueRef, buf: LLVM.LLVMValueRef, count: LLVM.LLVMValueRef) CodeGenError!LLVM.LLVMValueRef {

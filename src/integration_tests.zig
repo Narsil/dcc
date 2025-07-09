@@ -49,6 +49,43 @@ test "io stdout - escape chars" {
     std.debug.print("stdout with escaped", .{});
 }
 
+test "io file write - tensor data" {
+    const allocator = std.testing.allocator;
+
+    const test_source =
+        \\pub fn main() i32 {
+        \\    let a: [10]f32 = [10]f32{1f32};
+        \\    write(io.file("test_tensor_out.dat"), a);
+        \\    return 0i32;
+        \\}
+    ;
+
+    try assertCompiles(allocator, test_source, "test_tensor_file_write.toy");
+    try assertReturns(allocator, test_source, 0);
+
+    // Check that the output file was created
+    const file = try std.fs.cwd().openFile("test_tensor_out.dat", .{});
+    defer std.fs.cwd().deleteFile("test_tensor_out.dat") catch {};
+    defer file.close();
+
+    // Read and verify the file contents
+    const stat = try file.stat();
+    try std.testing.expectEqual(@as(u64, 40), stat.size); // 10 * 4 bytes for f32
+
+    var buffer: [40]u8 = undefined;
+    _ = try file.read(&buffer);
+
+    // Verify the data - should be 10 float values of 1.0 (0x3f800000 in IEEE 754)
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        const offset = i * 4;
+        const value = std.mem.readInt(u32, buffer[offset..][0..4], .little);
+        try std.testing.expectEqual(@as(u32, 0x3f800000), value);
+    }
+
+    std.debug.print("Tensor file write test passed\n", .{});
+}
+
 test "type system - used variable compiles" {
     const allocator = std.testing.allocator;
 

@@ -1045,6 +1045,43 @@ pub const Parser = struct {
                         .member = member_lexeme,
                     },
                 };
+
+                // Check for function call on namespace: io.file(...)
+                if (self.match(.left_paren)) {
+                    var args = std.ArrayList(ASTNode).init(self.allocator);
+                    defer args.deinit();
+
+                    if (!self.check(.right_paren)) {
+                        while (true) {
+                            const arg = try self.parseExpression();
+                            try args.append(arg);
+
+                            if (!self.match(.comma)) break;
+                        }
+                    }
+
+                    if (!self.match(.right_paren)) {
+                        // Clean up arguments on error
+                        for (args.items) |*arg| {
+                            self.cleanupASTNodeMut(arg);
+                        }
+                        self.reportError(self.peek().offset, "Expected ')' after arguments");
+                        return error.ParseError;
+                    }
+
+                    // Create a pointer to the namespace_access node
+                    const callee_ptr = try self.allocator.create(ASTNode);
+                    callee_ptr.* = expr;
+
+                    expr = ASTNode{
+                        .call_expression = .{
+                            .offset = token.offset,
+                            .return_type = null,
+                            .callee = callee_ptr,
+                            .arguments = try args.toOwnedSlice(),
+                        },
+                    };
+                }
             }
 
             // Check for tensor indexing: identifier[index]

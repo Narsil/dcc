@@ -32,7 +32,13 @@
       "Bash(./test_io)",
       "Bash(./test_write)",
       "Bash(./hello_macos)",
-      "Bash(./hello)"
+      "Bash(./hello)",
+      "Bash(sed:*)",
+      "Bash(./tensor_write)",
+      "Bash(./tensor_file_write)",
+      "Bash(otool:*)",
+      "Bash(/Users/nicolas/src/dcc/tensor_file_write:*)",
+      "Bash(python3:*)"
     ],
     "deny": []
   }

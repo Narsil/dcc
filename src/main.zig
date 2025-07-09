@@ -39,8 +39,8 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     if (args.len < 2) {
-        std.debug.print("Usage: {s} <source_file> [--target <target_triplet>] [--verbose] [--gpu <gpu_triplet>]\n", .{args[0]});
-        std.debug.print("Example: {s} program.toy --target x86_64-pc-linux-gnu --verbose --gpu nvptx-cuda:sm_50\n", .{args[0]});
+        std.debug.print("Usage: {s} <source_file> [-o <output>] [--target <target_triplet>] [--verbose] [--gpu <gpu_triplet>]\n", .{args[0]});
+        std.debug.print("Example: {s} program.toy -o myprogram --target x86_64-pc-linux-gnu --verbose\n", .{args[0]});
         return;
     }
 
@@ -48,6 +48,7 @@ pub fn main() !void {
     var target_triple: ?[]const u8 = null;
     var verbose: bool = false;
     var gpu_triplet: ?[]const u8 = null;
+    var output_name: ?[]const u8 = null;
 
     // Parse arguments
     var i: usize = 1;
@@ -70,6 +71,13 @@ pub fn main() !void {
                 return;
             }
             gpu_triplet = args[i];
+        } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: {s} requires an output filename\n", .{arg});
+                return;
+            }
+            output_name = args[i];
         } else if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.print("Error: Unknown option: {s}\n", .{arg});
             return;
@@ -124,7 +132,7 @@ pub fn main() !void {
     } else null;
 
     // Wrap compilation in catch block to handle normal errors gracefully
-    const result = compile(allocator, source_file, target, verbose, gpu_target);
+    const result = compile(allocator, source_file, target, verbose, gpu_target, output_name);
     if (result) |_| {
         // Compilation successful
     } else |err| {
@@ -262,7 +270,7 @@ pub fn main() !void {
     }
 }
 
-fn compile(allocator: std.mem.Allocator, source_file: []const u8, target: std.Target, verbose: bool, gpu_target: ?std.Target) anyerror!void {
+fn compile(allocator: std.mem.Allocator, source_file: []const u8, target: std.Target, verbose: bool, gpu_target: ?std.Target, output_name: ?[]const u8) anyerror!void {
     if (verbose) {
         std.debug.print("Compiling: {s}\n", .{source_file});
     }
@@ -320,22 +328,27 @@ fn compile(allocator: std.mem.Allocator, source_file: []const u8, target: std.Ta
     // Pass reduction info from typechecker to codegen
     code_gen.setReductionInfo(type_checker.reduction_info);
 
-    // Extract output name from source file (remove .toy extension)
-    const basename = std.fs.path.basename(source_file);
-    const output_name = if (std.mem.endsWith(u8, basename, ".toy"))
-        basename[0 .. basename.len - 4]
-    else
-        basename;
+    // Determine output filename
+    const final_output_name = if (output_name) |name|
+        name
+    else blk: {
+        // Extract output name from source file (remove .toy extension)
+        const basename = std.fs.path.basename(source_file);
+        break :blk if (std.mem.endsWith(u8, basename, ".toy"))
+            basename[0 .. basename.len - 4]
+        else
+            basename;
+    };
 
     // Choose compilation mode based on presence of main function
     if (has_main) {
         try code_gen.generate(ast, .executable);
         // Generate executable binary
-        try code_gen.generateExecutable(output_name, target);
+        try code_gen.generateExecutable(final_output_name, target);
     } else {
         try code_gen.generate(ast, .library);
         // Generate shared library
-        try code_gen.generateSharedLibrary(output_name, target);
+        try code_gen.generateSharedLibrary(final_output_name, target);
     }
 
     if (verbose) {

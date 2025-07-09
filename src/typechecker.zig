@@ -404,10 +404,10 @@ pub const TypeChecker = struct {
             .write_expression => |write| blk: {
                 // Type check the handle
                 const handle_type = try self.typeCheckExpression(write.handle);
-                // For now, accept void type as IO handle
-                if (handle_type != .void) {
+                // Accept void type (for io.stdout/stderr) or i32 (file descriptors)
+                if (handle_type != .void and handle_type != .i32) {
                     const pos = self.getNodePosition(node.*);
-                    std.debug.print("Error at line {}, column {}: First argument to write must be an IO handle\n", .{ pos.line, pos.column });
+                    std.debug.print("Error at line {}, column {}: First argument to write must be an IO handle (void or i32)\n", .{ pos.line, pos.column });
                     self.printSourceContext(write.offset);
                     return error.TypeMismatch;
                 }
@@ -484,6 +484,35 @@ pub const TypeChecker = struct {
     fn typeCheckFunctionCall(self: *TypeChecker, call: @TypeOf(@as(parser.ASTNode, undefined).call_expression)) TypeCheckError!parser.Type {
         const callee_name = switch (call.callee.*) {
             .identifier => |ident| ident.name,
+            .namespace_access => |ns| {
+                // Handle namespace functions like io.file()
+                if (std.mem.eql(u8, ns.namespace, "io") and std.mem.eql(u8, ns.member, "file")) {
+                    // io.file(filename) returns a file descriptor (i32)
+                    if (call.arguments.len != 1) {
+                        const pos = self.getNodePosition(call.callee.*);
+                        std.debug.print("Error at line {}, column {}: io.file() expects exactly 1 argument\n", .{ pos.line, pos.column });
+                        self.printSourceContext(ns.offset);
+                        return error.InvalidFunctionCall;
+                    }
+                    
+                    // Type check the filename argument (should be string)
+                    _ = try self.typeCheckExpression(&call.arguments[0]);
+                    if (call.arguments[0] != .string_literal) {
+                        const pos = self.getNodePosition(call.arguments[0]);
+                        std.debug.print("Error at line {}, column {}: io.file() expects a string literal argument\n", .{ pos.line, pos.column });
+                        self.printSourceContext(self.getNodeOffset(call.arguments[0]));
+                        return error.InvalidFunctionCall;
+                    }
+                    
+                    // Return i32 (file descriptor)
+                    return parser.Type.i32;
+                }
+                
+                const pos = self.getNodePosition(call.callee.*);
+                std.debug.print("Error at line {}, column {}: Unknown namespace function\n", .{ pos.line, pos.column });
+                self.printSourceContext(ns.offset);
+                return error.InvalidFunctionCall;
+            },
             else => {
                 const pos = self.getNodePosition(call.callee.*);
                 std.debug.print("Error at line {}, column {}: Cannot call non-function\n", .{ pos.line, pos.column });

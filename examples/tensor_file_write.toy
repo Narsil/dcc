@@ -1,0 +1,4 @@
+pub fn main() void {
+    let a: [10]f32 = [10]f32{1f32};
+    write(io.file("out.dat"), a);
+}
