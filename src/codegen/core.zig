@@ -1080,28 +1080,52 @@ pub const CodeGen = struct {
                 };
                 
                 // Calculate the size to write
-                const size = if (data_type == .tensor) blk: {
-                    // For tensors, calculate total bytes
-                    const tensor_type = data_type.tensor;
-                    const element_size: u64 = switch (tensor_type.element_type.*) {
-                        .f32 => 4,
-                        .f64 => 8,
-                        .i32, .u32 => 4,
-                        .i64, .u64 => 8,
-                        .i16, .u16 => 2,
-                        .i8, .u8 => 1,
-                        else => return error.UnsupportedTensorElementType,
-                    };
-                    const total_elements = tensor_type.total_elements();
-                    const total_bytes = total_elements * element_size;
-                    break :blk LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), total_bytes, 0);
-                } else blk: {
-                    // For strings, compute strlen
-                    break :blk try self.computeStrlen(data);
+                const size = switch (data_type) {
+                    .tensor => blk: {
+                        // For tensors, calculate total bytes
+                        const tensor_type = data_type.tensor;
+                        const element_size: u64 = switch (tensor_type.element_type.*) {
+                            .f32 => 4,
+                            .f64 => 8,
+                            .i32, .u32 => 4,
+                            .i64, .u64 => 8,
+                            .i16, .u16 => 2,
+                            .i8, .u8 => 1,
+                            else => return error.UnsupportedTensorElementType,
+                        };
+                        const total_elements = tensor_type.total_elements();
+                        const total_bytes = total_elements * element_size;
+                        break :blk LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), total_bytes, 0);
+                    },
+                    .f32, .f64 => LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), if (data_type == .f32) 4 else 8, 0),
+                    .i32, .u32 => LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), 4, 0),
+                    .i64, .u64 => LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), 8, 0),
+                    .i16, .u16 => LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), 2, 0),
+                    .i8, .u8 => blk: {
+                        // For u8, it could be a string, so compute strlen
+                        break :blk try self.computeStrlen(data);
+                    },
+                    else => return error.UnsupportedWriteData,
+                };
+                
+                // Get a pointer to the data
+                const data_ptr = switch (data_type) {
+                    .tensor => data, // Tensors are already pointers
+                    .u8 => data, // Strings are already pointers
+                    .f32, .f64, .i32, .u32, .i64, .u64, .i16, .u16, .i8 => blk: {
+                        // For scalar values, we need to create an alloca and store the value
+                        const llvm_type = self.toLLVMType(data_type);
+                        const alloca = LLVM.LLVMBuildAlloca(self.builder, llvm_type, "scalar_data");
+                        _ = LLVM.LLVMBuildStore(self.builder, data, alloca);
+                        // Cast to i8* for the write syscall
+                        const i8_ptr_type = LLVM.LLVMPointerType(LLVM.LLVMInt8TypeInContext(self.context), 0);
+                        break :blk LLVM.LLVMBuildBitCast(self.builder, alloca, i8_ptr_type, "data_ptr");
+                    },
+                    else => return error.UnsupportedWriteData,
                 };
                 
                 // Generate the write syscall
-                try self.generateWriteSyscall(handle, data, size);
+                try self.generateWriteSyscall(handle, data_ptr, size);
                 
                 // Return void (0)
                 return LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 0, 0);
