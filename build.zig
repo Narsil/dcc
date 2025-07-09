@@ -326,51 +326,6 @@ pub fn build(b: *std.Build) !void {
     // step when running `zig build`).
     b.installArtifact(exe);
 
-    // Create emit_ptx executable
-    const emit_ptx_mod = b.createModule(.{
-        .root_source_file = b.path("src/emit_ptx.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const emit_ptx_exe = b.addExecutable(.{
-        .name = "emit_ptx",
-        .root_module = emit_ptx_mod,
-    });
-
-    // Link emit_ptx with the same libraries as main dcc
-    try createLinking(b, emit_ptx_exe, llvm_include_dir, llvm_lib_dir, lld_include_dir, lld_lib_dir, false);
-
-    // Add our custom GPU to NVVM wrapper for emit_ptx
-    const mlir_include_dir = try std.process.getEnvVarOwned(b.allocator, "MLIR_INCLUDE_DIR");
-    const mlir_lib_dir = try std.process.getEnvVarOwned(b.allocator, "MLIR_LIB_DIR");
-
-    defer b.allocator.free(mlir_include_dir);
-    defer b.allocator.free(mlir_lib_dir);
-
-    // Add our GPU to NVVM wrapper
-    emit_ptx_exe.addCSourceFile(.{
-        .file = b.path("src/gpu_to_nvvm_wrapper.cpp"),
-        .flags = &.{"-std=c++17"},
-    });
-
-    // Add include path for our wrapper header
-    emit_ptx_exe.addIncludePath(.{ .cwd_relative = "src" });
-
-    // Install emit_ptx executable
-    b.installArtifact(emit_ptx_exe);
-
-    // Create run step for emit_ptx
-    const run_emit_ptx_cmd = b.addRunArtifact(emit_ptx_exe);
-    run_emit_ptx_cmd.step.dependOn(b.getInstallStep());
-
-    if (b.args) |args| {
-        run_emit_ptx_cmd.addArgs(args);
-    }
-
-    const run_emit_ptx_step = b.step("emit-ptx", "Run the emit_ptx tool");
-    run_emit_ptx_step.dependOn(&run_emit_ptx_cmd.step);
-
     // This *creates* a Run step in the build graph, to be executed when another
     // step is evaluated that depends on it. The next line below will establish
     // such a dependency.
