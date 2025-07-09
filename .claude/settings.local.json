@@ -27,7 +27,12 @@
       "Bash(./test_reduce_first_dim)",
       "Bash(./test_init_check)",
       "Bash(./test_reduce_basics)",
-      "Bash(awk:*)"
+      "Bash(awk:*)",
+      "Bash(./test_stdout)",
+      "Bash(./test_io)",
+      "Bash(./test_write)",
+      "Bash(./hello_macos)",
+      "Bash(./hello)"
     ],
     "deny": []
   }

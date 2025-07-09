@@ -96,7 +96,7 @@ pub fn linkExecutable(self: *CodeGen, obj_path: []const u8, output_path: []const
     // Add object file
     try args.append(try self.allocator.dupeZ(u8, obj_path));
 
-    // No libc needed - using Linux syscall for exit() in cross-compilation
+    // No libc needed - using direct syscalls for IO
 
     // Add CUDA library linking for Linux targets if GPU code is present
     if (target.os.tag == .linux and self.accelerator != null) {

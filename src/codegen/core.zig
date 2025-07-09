@@ -64,9 +64,9 @@ pub const CodeGen = struct {
     gpu_memory_ops: ?gpu_memory_ops.GpuMemoryOps,
     reduction_info: ?std.AutoHashMap(*parser.ASTNode, typechecker.ReductionInfo),
     string_counter: u32,
+    target: std.Target,
 
     pub fn init(allocator: std.mem.Allocator, module_name: []const u8, verbose: bool, target: std.Target, gpu_target: ?std.Target) !CodeGen {
-        _ = target; // Target is passed for completeness but not used in init
         // Initialize LLVM X86 target (for x86_64 support)
         LLVM.LLVMInitializeX86TargetInfo();
         LLVM.LLVMInitializeX86Target();
@@ -113,6 +113,7 @@ pub const CodeGen = struct {
             .gpu_memory_ops = null, // Will be initialized after CUDA functions are declared
             .reduction_info = null,
             .string_counter = 0,
+            .target = target,
         };
     }
 
@@ -996,18 +997,20 @@ pub const CodeGen = struct {
                 return LLVM.LLVMBuildLoad2(self.builder, element_type, acc_alloca, "reduce_result");
             },
             .string_literal => |str| {
-                // Create a global constant for the string
-                const str_type = LLVM.LLVMArrayType(LLVM.LLVMInt8TypeInContext(self.context), @intCast(str.length));
+                // Create a global constant for the string with null terminator
+                const str_type = LLVM.LLVMArrayType(LLVM.LLVMInt8TypeInContext(self.context), @intCast(str.length + 1));
                 
                 // Create array of i8 constants for the string
-                const chars = try self.allocator.alloc(LLVM.LLVMValueRef, str.length);
+                const chars = try self.allocator.alloc(LLVM.LLVMValueRef, str.length + 1);
                 defer self.allocator.free(chars);
                 
                 for (str.value, 0..) |char, i| {
                     chars[i] = LLVM.LLVMConstInt(LLVM.LLVMInt8TypeInContext(self.context), char, 0);
                 }
+                // Add null terminator
+                chars[str.length] = LLVM.LLVMConstInt(LLVM.LLVMInt8TypeInContext(self.context), 0, 0);
                 
-                const str_const = LLVM.LLVMConstArray(LLVM.LLVMInt8TypeInContext(self.context), chars.ptr, @intCast(str.length));
+                const str_const = LLVM.LLVMConstArray(LLVM.LLVMInt8TypeInContext(self.context), chars.ptr, @intCast(str.length + 1));
                 
                 // Create a global variable for the string
                 const global_name = try std.fmt.allocPrintZ(self.allocator, ".str.{}", .{self.getNextStringId()});
@@ -1054,44 +1057,12 @@ pub const CodeGen = struct {
                     return error.InvalidExpression;
                 
                 if (handle_val == 1 or handle_val == 2) { // stdout or stderr
-                    // Declare printf if not already declared
-                    const printf_name = "printf";
-                    var printf_func = LLVM.LLVMGetNamedFunction(self.module, printf_name);
-                    if (printf_func == null) {
-                        const char_ptr_type = LLVM.LLVMPointerType(LLVM.LLVMInt8TypeInContext(self.context), 0);
-                        var param_types = [_]LLVM.LLVMTypeRef{char_ptr_type};
-                        const printf_type = LLVM.LLVMFunctionType(
-                            LLVM.LLVMInt32TypeInContext(self.context),
-                            &param_types,
-                            1,
-                            1, // variadic
-                        );
-                        printf_func = LLVM.LLVMAddFunction(self.module, printf_name, printf_type);
-                    }
+                    // For strings, we need to get the length
+                    // Since our strings are null-terminated, we'll compute strlen
+                    const strlen_result = try self.computeStrlen(data);
                     
-                    // Create format string "%s"
-                    const format_str_type = LLVM.LLVMArrayType(LLVM.LLVMInt8TypeInContext(self.context), 3);
-                    const format_chars = [_]LLVM.LLVMValueRef{
-                        LLVM.LLVMConstInt(LLVM.LLVMInt8TypeInContext(self.context), '%', 0),
-                        LLVM.LLVMConstInt(LLVM.LLVMInt8TypeInContext(self.context), 's', 0),
-                        LLVM.LLVMConstInt(LLVM.LLVMInt8TypeInContext(self.context), 0, 0),
-                    };
-                    const format_const = LLVM.LLVMConstArray(LLVM.LLVMInt8TypeInContext(self.context), @constCast(&format_chars[0]), format_chars.len);
-                    
-                    const format_global = LLVM.LLVMAddGlobal(self.module, format_str_type, ".printf_format");
-                    LLVM.LLVMSetInitializer(format_global, format_const);
-                    LLVM.LLVMSetGlobalConstant(format_global, 1);
-                    LLVM.LLVMSetLinkage(format_global, LLVM.LLVMPrivateLinkage);
-                    
-                    const format_indices = [_]LLVM.LLVMValueRef{
-                        LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 0, 0),
-                        LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 0, 0),
-                    };
-                    const format_ptr = LLVM.LLVMBuildInBoundsGEP2(self.builder, format_str_type, format_global, @constCast(&format_indices[0]), format_indices.len, "format_ptr");
-                    
-                    // Call printf
-                    const args = [_]LLVM.LLVMValueRef{ format_ptr, data };
-                    _ = LLVM.LLVMBuildCall2(self.builder, LLVM.LLVMGetElementType(LLVM.LLVMTypeOf(printf_func.?)), printf_func.?, @constCast(&args[0]), args.len, "");
+                    // Generate the write syscall
+                    try self.generateWriteSyscall(handle, data, strlen_result);
                 }
                 
                 // Return void (0)
@@ -1114,6 +1085,160 @@ pub const CodeGen = struct {
             },
             else => return error.InvalidExpression,
         }
+    }
+
+    fn computeStrlen(self: *CodeGen, str_ptr: LLVM.LLVMValueRef) CodeGenError!LLVM.LLVMValueRef {
+        // Create basic blocks for strlen computation
+        const current_func = LLVM.LLVMGetBasicBlockParent(LLVM.LLVMGetInsertBlock(self.builder));
+        const entry_block = LLVM.LLVMAppendBasicBlockInContext(self.context, current_func, "strlen_entry");
+        const loop_block = LLVM.LLVMAppendBasicBlockInContext(self.context, current_func, "strlen_loop");
+        const done_block = LLVM.LLVMAppendBasicBlockInContext(self.context, current_func, "strlen_done");
+        
+        // Branch to entry
+        _ = LLVM.LLVMBuildBr(self.builder, entry_block);
+        LLVM.LLVMPositionBuilderAtEnd(self.builder, entry_block);
+        
+        // Initialize counter
+        const i64_type = LLVM.LLVMInt64TypeInContext(self.context);
+        const counter_alloca = LLVM.LLVMBuildAlloca(self.builder, i64_type, "strlen_counter");
+        _ = LLVM.LLVMBuildStore(self.builder, LLVM.LLVMConstInt(i64_type, 0, 0), counter_alloca);
+        
+        _ = LLVM.LLVMBuildBr(self.builder, loop_block);
+        LLVM.LLVMPositionBuilderAtEnd(self.builder, loop_block);
+        
+        // Load current counter
+        const counter = LLVM.LLVMBuildLoad2(self.builder, i64_type, counter_alloca, "counter");
+        
+        // Get current character
+        const indices = [_]LLVM.LLVMValueRef{counter};
+        const char_ptr = LLVM.LLVMBuildGEP2(self.builder, LLVM.LLVMInt8TypeInContext(self.context), str_ptr, @constCast(&indices[0]), 1, "char_ptr");
+        const current_char = LLVM.LLVMBuildLoad2(self.builder, LLVM.LLVMInt8TypeInContext(self.context), char_ptr, "current_char");
+        
+        // Check if null
+        const is_null = LLVM.LLVMBuildICmp(self.builder, LLVM.LLVMIntEQ, current_char, LLVM.LLVMConstInt(LLVM.LLVMInt8TypeInContext(self.context), 0, 0), "is_null");
+        
+        const next_block = LLVM.LLVMAppendBasicBlockInContext(self.context, current_func, "strlen_next");
+        _ = LLVM.LLVMBuildCondBr(self.builder, is_null, done_block, next_block);
+        
+        LLVM.LLVMPositionBuilderAtEnd(self.builder, next_block);
+        // Increment counter
+        const next_counter = LLVM.LLVMBuildAdd(self.builder, counter, LLVM.LLVMConstInt(i64_type, 1, 0), "next_counter");
+        _ = LLVM.LLVMBuildStore(self.builder, next_counter, counter_alloca);
+        _ = LLVM.LLVMBuildBr(self.builder, loop_block);
+        
+        LLVM.LLVMPositionBuilderAtEnd(self.builder, done_block);
+        return LLVM.LLVMBuildLoad2(self.builder, i64_type, counter_alloca, "string_length");
+    }
+
+    fn generateWriteSyscall(self: *CodeGen, fd: LLVM.LLVMValueRef, buf: LLVM.LLVMValueRef, count: LLVM.LLVMValueRef) CodeGenError!void {
+        const i64_type = LLVM.LLVMInt64TypeInContext(self.context);
+        
+        // We need to generate platform-specific syscalls
+        // For now, let's create a simple write function that we'll implement
+        const write_func_name = "__dcc_write";
+        var write_func = LLVM.LLVMGetNamedFunction(self.module, write_func_name);
+        
+        if (write_func == null) {
+            // Declare our internal write function
+            const param_types = [_]LLVM.LLVMTypeRef{
+                i64_type, // fd
+                LLVM.LLVMPointerType(LLVM.LLVMInt8TypeInContext(self.context), 0), // buf
+                i64_type, // count
+            };
+            const write_func_type = LLVM.LLVMFunctionType(
+                i64_type, // return type (bytes written)
+                @constCast(&param_types[0]),
+                param_types.len,
+                0, // not variadic
+            );
+            write_func = LLVM.LLVMAddFunction(self.module, write_func_name, write_func_type);
+            
+            // Generate the function body
+            const entry_block = LLVM.LLVMAppendBasicBlockInContext(self.context, write_func, "entry");
+            const current_block = LLVM.LLVMGetInsertBlock(self.builder);
+            
+            LLVM.LLVMPositionBuilderAtEnd(self.builder, entry_block);
+            
+            // Get parameters
+            const fd_param = LLVM.LLVMGetParam(write_func, 0);
+            const buf_param = LLVM.LLVMGetParam(write_func, 1);
+            const count_param = LLVM.LLVMGetParam(write_func, 2);
+            
+            // Generate platform-specific syscall
+            const result = try self.generatePlatformWriteSyscall(fd_param, buf_param, count_param);
+            
+            _ = LLVM.LLVMBuildRet(self.builder, result);
+            
+            // Restore builder position
+            LLVM.LLVMPositionBuilderAtEnd(self.builder, current_block);
+        }
+        
+        // Call our write function
+        const args = [_]LLVM.LLVMValueRef{ fd, buf, count };
+        const write_func_type = LLVM.LLVMGlobalGetValueType(write_func);
+        _ = LLVM.LLVMBuildCall2(self.builder, write_func_type, write_func, @constCast(&args[0]), args.len, "write_result");
+    }
+
+    fn generatePlatformWriteSyscall(self: *CodeGen, fd: LLVM.LLVMValueRef, buf: LLVM.LLVMValueRef, count: LLVM.LLVMValueRef) CodeGenError!LLVM.LLVMValueRef {
+        // Generate platform-specific write syscall using inline assembly
+        const i64_type = LLVM.LLVMInt64TypeInContext(self.context);
+        
+        // Platform-specific syscall implementation
+        const asm_str = switch (self.target.os.tag) {
+            .macos => switch (self.target.cpu.arch) {
+                .aarch64 => "mov x16, #4\nsvc #0x80", // macOS ARM64
+                .x86_64 => "movq $$0x2000004, %rax\nsyscall", // macOS x86_64 (AT&T syntax)
+                else => return error.UnsupportedOperation,
+            },
+            .linux => switch (self.target.cpu.arch) {
+                .x86_64 => "movq $$1, %rax\nsyscall", // Linux x86_64 (AT&T syntax)
+                .aarch64 => "mov x8, #64\nsvc #0", // Linux ARM64
+                else => return error.UnsupportedOperation,
+            },
+            else => return error.UnsupportedOperation,
+        };
+        
+        const constraints = switch (self.target.os.tag) {
+            .macos => switch (self.target.cpu.arch) {
+                .aarch64 => "={x0},{x0},{x1},{x2},~{x16},~{memory}",
+                .x86_64 => "={rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}",
+                else => unreachable,
+            },
+            .linux => switch (self.target.cpu.arch) {
+                .x86_64 => "={rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}",
+                .aarch64 => "={x0},{x0},{x1},{x2},~{x8},~{memory}",
+                else => unreachable,
+            },
+            else => unreachable,
+        };
+        
+        // Create inline assembly type - just takes the 3 arguments
+        var asm_param_types = [_]LLVM.LLVMTypeRef{ 
+            i64_type, // fd
+            LLVM.LLVMPointerType(LLVM.LLVMInt8TypeInContext(self.context), 0), // buf
+            i64_type  // count
+        };
+        const asm_type = LLVM.LLVMFunctionType(
+            i64_type, // return type (bytes written)
+            &asm_param_types,
+            3,
+            0,
+        );
+        
+        const asm_value = LLVM.LLVMGetInlineAsm(
+            asm_type,
+            @as([*c]const u8, @ptrCast(asm_str)),
+            asm_str.len,
+            @as([*c]const u8, @ptrCast(constraints)),
+            constraints.len,
+            1, // hasSideEffects
+            0, // isAlignStack
+            LLVM.LLVMInlineAsmDialectATT,
+            0, // canThrow
+        );
+        
+        const args = [_]LLVM.LLVMValueRef{ fd, buf, count };
+        return LLVM.LLVMBuildCall2(self.builder, asm_type, asm_value, @constCast(&args[0]), args.len, "syscall_result");
     }
 
     /// Generate an optimized GPU function call with explicit memory management

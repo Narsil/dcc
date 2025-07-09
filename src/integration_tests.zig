@@ -1163,7 +1163,7 @@ fn assertCompiles(allocator: std.mem.Allocator, source: []const u8, filename: []
             }
         },
         else => {
-            std.debug.print("Integer types test terminated abnormally\n", .{});
+            std.debug.print("Compilation failed:\n{s}\n{s}\n", .{ out.stdout, out.stderr });
             return error.CompilationFailed;
         },
     }
@@ -1182,6 +1182,10 @@ fn assertReturns(allocator: std.mem.Allocator, filename: []const u8, expected: i
     defer allocator.free(binary_path);
 
     const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{binary_path} });
+    defer {
+        allocator.free(out.stdout);
+        allocator.free(out.stderr);
+    }
     switch (out.term) {
         .Exited => |term| {
             if (term != expected) {

@@ -1,0 +1,3 @@
+pub fn main() void{
+    write(io.stdout, "Hello World ! !!");
+}
