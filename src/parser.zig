@@ -167,6 +167,7 @@ pub const ASTNode = union(enum) {
         parameters: []Parameter,
         return_type: Type,
         body: []ASTNode,
+        is_public: bool,
     },
     parameter: struct {
         offset: usize,
@@ -467,8 +468,19 @@ pub const Parser = struct {
             return try self.parseVariableDeclaration();
         }
 
+        // Check for pub fn or just fn
+        var is_public = false;
+        if (self.match(.pub_)) {
+            is_public = true;
+            if (!self.match(.fn_)) {
+                self.reportError(self.peek().offset, "Expected 'fn' after 'pub'");
+                return error.ParseError;
+            }
+            return try self.parseFunctionDeclaration(is_public);
+        }
+
         if (self.match(.fn_)) {
-            return try self.parseFunctionDeclaration();
+            return try self.parseFunctionDeclaration(false);
         }
 
         if (self.match(.return_)) {
@@ -524,7 +536,7 @@ pub const Parser = struct {
         }
     }
 
-    fn parseFunctionDeclaration(self: *Parser) ParseError!ASTNode {
+    fn parseFunctionDeclaration(self: *Parser, is_public: bool) ParseError!ASTNode {
         const name = try self.consume(.identifier, "Expected function name");
 
         if (!self.match(.left_paren)) {
@@ -581,6 +593,7 @@ pub const Parser = struct {
                 .parameters = try params.toOwnedSlice(),
                 .return_type = return_type,
                 .body = try body.toOwnedSlice(),
+                .is_public = is_public,
             },
         };
     }

@@ -11,6 +11,7 @@ pub const TokenType = enum {
     fn_,
     return_,
     reduce,
+    pub_,
 
     // Operators
     plus,
@@ -47,6 +48,7 @@ pub const TokenType = enum {
             .fn_ => 2,
             .return_ => 6,
             .reduce => 6,
+            .pub_ => 3,
             .number, .identifier, .type, .eof, .invalid => 0, // Variable length
         };
     }
@@ -232,6 +234,7 @@ pub const Lexer = struct {
         if (std.mem.eql(u8, text, "fn")) return .fn_;
         if (std.mem.eql(u8, text, "return")) return .return_;
         if (std.mem.eql(u8, text, "reduce")) return .reduce;
+        if (std.mem.eql(u8, text, "pub")) return .pub_;
 
         // Check if it's a type identifier
         if (self.isTypeIdentifier(text)) return .type;

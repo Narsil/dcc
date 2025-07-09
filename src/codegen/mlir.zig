@@ -1084,6 +1084,7 @@ test "MLIRCodeGen - generate GPU function" {
         .parameters = &[_]parser.Parameter{},
         .return_type = .void,
         .body = &[_]parser.ASTNode{},
+        .is_public = false,
     };
 
     // Should generate without crashing

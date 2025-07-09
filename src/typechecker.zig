@@ -19,11 +19,17 @@ pub const TypeCheckError = error{
     InvalidUnaryOperation,
     InvalidVariableType,
     InvalidMainFunctionReturnType,
+    UnusedVariable,
+    UnusedFunction,
+    MainMustBePublic,
 } || std.mem.Allocator.Error;
 
-pub const FunctionSignature = struct {
+pub const FunctionInfo = struct {
     params: []parser.Parameter,
     return_type: parser.Type,
+    is_public: bool,
+    declaration_offset: usize,
+    used: bool,
 };
 
 pub const ReductionInfo = struct {
@@ -32,12 +38,18 @@ pub const ReductionInfo = struct {
     operator: parser.BinaryOperator,
 };
 
+pub const VariableInfo = struct {
+    type: parser.Type,
+    declaration_offset: usize,
+    used: bool,
+};
+
 pub const TypeChecker = struct {
     allocator: std.mem.Allocator,
     source: []const u8,
     verbose: bool,
-    variables: std.HashMap([]const u8, parser.Type, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
-    functions: std.HashMap([]const u8, FunctionSignature, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
+    variables: std.HashMap([]const u8, VariableInfo, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
+    functions: std.HashMap([]const u8, FunctionInfo, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
     current_function_return_type: ?parser.Type,
     allocated_types: std.ArrayList(parser.Type),
     reduction_info: std.AutoHashMap(*parser.ASTNode, ReductionInfo),
@@ -47,8 +59,8 @@ pub const TypeChecker = struct {
             .allocator = allocator,
             .source = source,
             .verbose = verbose,
-            .variables = std.HashMap([]const u8, parser.Type, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
-            .functions = std.HashMap([]const u8, FunctionSignature, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
+            .variables = std.HashMap([]const u8, VariableInfo, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
+            .functions = std.HashMap([]const u8, FunctionInfo, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .current_function_return_type = null,
             .allocated_types = std.ArrayList(parser.Type).init(allocator),
             .reduction_info = std.AutoHashMap(*parser.ASTNode, ReductionInfo).init(allocator),
@@ -107,6 +119,27 @@ pub const TypeChecker = struct {
                     }
                     try self.typeCheckStatement(stmt);
                 }
+                
+                // Check that main is public
+                if (self.functions.get("main")) |main_func| {
+                    if (!main_func.is_public) {
+                        const pos = self.getPositionFromOffset(main_func.declaration_offset);
+                        std.debug.print("Error at line {}, column {}: Function 'main' must be declared public\n", .{ pos.line, pos.column });
+                        self.printSourceContext(main_func.declaration_offset);
+                        return error.MainMustBePublic;
+                    }
+                }
+                
+                // Check for unused functions
+                var func_iter = self.functions.iterator();
+                while (func_iter.next()) |entry| {
+                    if (!entry.value_ptr.used and !entry.value_ptr.is_public) {
+                        const pos = self.getPositionFromOffset(entry.value_ptr.declaration_offset);
+                        std.debug.print("Error at line {}, column {}: Function '{s}' is declared but never used\n", .{ pos.line, pos.column, entry.key_ptr.* });
+                        self.printSourceContext(entry.value_ptr.declaration_offset);
+                        return error.UnusedFunction;
+                    }
+                }
             },
             else => return error.TypeMismatch,
         }
@@ -114,12 +147,16 @@ pub const TypeChecker = struct {
 
     fn collectFunctionSignature(self: *TypeChecker, func: @TypeOf(@as(parser.ASTNode, undefined).function_declaration)) TypeCheckError!void {
         const name = try self.allocator.dupe(u8, func.name);
+        const is_main = std.mem.eql(u8, func.name, "main");
         try self.functions.put(name, .{
             .params = func.parameters,
             .return_type = func.return_type,
+            .is_public = func.is_public,
+            .declaration_offset = func.offset,
+            .used = is_main or func.is_public, // main and public functions are considered used
         });
         if (self.verbose) {
-            std.debug.print("DEBUG: Collected function signature '{s}' -> return type {}\n", .{ func.name, func.return_type });
+            std.debug.print("DEBUG: Collected function signature '{s}' -> return type {}, public: {}\n", .{ func.name, func.return_type, func.is_public });
         }
     }
 
@@ -150,7 +187,7 @@ pub const TypeChecker = struct {
         // Create new scope for function parameters and body
         const old_variables = self.variables;
         const old_return_type = self.current_function_return_type;
-        self.variables = std.HashMap([]const u8, parser.Type, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(self.allocator);
+        self.variables = std.HashMap([]const u8, VariableInfo, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(self.allocator);
         self.current_function_return_type = func.return_type;
 
         if (self.verbose) {
@@ -160,7 +197,11 @@ pub const TypeChecker = struct {
         // Add parameters to scope
         for (func.parameters) |param| {
             const name = try self.allocator.dupe(u8, param.name);
-            try self.variables.put(name, param.type);
+            try self.variables.put(name, .{
+                .type = param.type,
+                .declaration_offset = func.offset, // Use function offset since parameters don't have individual offsets
+                .used = true, // Parameters are considered used by default
+            });
         }
 
         // Type check function body, skipping nested function declarations
@@ -202,6 +243,17 @@ pub const TypeChecker = struct {
             }
         }
 
+        // Check for unused variables before restoring scope
+        var unused_iter = self.variables.iterator();
+        while (unused_iter.next()) |entry| {
+            if (!entry.value_ptr.used) {
+                const pos = self.getPositionFromOffset(entry.value_ptr.declaration_offset);
+                std.debug.print("Error at line {}, column {}: Variable '{s}' is declared but never used\n", .{ pos.line, pos.column, entry.key_ptr.* });
+                self.printSourceContext(entry.value_ptr.declaration_offset);
+                return error.UnusedVariable;
+            }
+        }
+
         // Restore old scope
         var var_iter = self.variables.iterator();
         while (var_iter.next()) |entry| {
@@ -235,7 +287,11 @@ pub const TypeChecker = struct {
 
         // Add variable to scope
         const name = try self.allocator.dupe(u8, var_decl.name);
-        try self.variables.put(name, var_decl.type);
+        try self.variables.put(name, .{
+            .type = var_decl.type,
+            .declaration_offset = var_decl.offset,
+            .used = false,
+        });
     }
 
     fn typeCheckReturnStatement(self: *TypeChecker, ret: @TypeOf(@as(parser.ASTNode, undefined).return_statement)) TypeCheckError!void {
@@ -294,7 +350,17 @@ pub const TypeChecker = struct {
                 return parser.Type.i64;
             },
             .number_literal => |num| num.type,
-            .identifier => |ident| self.variables.get(ident.name) orelse return error.UndefinedVariable,
+            .identifier => |ident| blk: {
+                if (self.variables.getPtr(ident.name)) |var_info| {
+                    var_info.used = true;
+                    break :blk var_info.type;
+                } else {
+                    const pos = self.getNodePosition(node.*);
+                    std.debug.print("Error at line {}, column {}: Undefined variable '{s}'\n", .{ pos.line, pos.column, ident.name });
+                    self.printSourceContext(self.getNodeOffset(node.*));
+                    return error.UndefinedVariable;
+                }
+            },
             .binary_expression => |bin_expr| try self.typeCheckBinaryOperation(bin_expr.operator, try self.typeCheckExpression(bin_expr.left), try self.typeCheckExpression(bin_expr.right), bin_expr),
             .unary_expression => |unary_expr| try self.typeCheckUnaryOperation(unary_expr.operator, try self.typeCheckExpression(unary_expr.operand), unary_expr),
             .call_expression => |*call| {
@@ -363,7 +429,9 @@ pub const TypeChecker = struct {
             },
         };
 
-        if (self.functions.get(callee_name)) |func_info| {
+        if (self.functions.getPtr(callee_name)) |func_info| {
+            // Mark function as used
+            func_info.used = true;
             // Check argument count
             if (call.arguments.len != func_info.params.len) {
                 const pos = self.getNodePosition(call.callee.*);
@@ -496,7 +564,7 @@ pub const TypeChecker = struct {
             if (self.verbose) {
                 std.debug.print("DEBUG: Checking implicit index '{s}' for conflicts\n", .{index_name});
             }
-            if (self.variables.contains(index_name)) {
+            if (self.variables.get(index_name) != null) {
                 const pos = self.getNodePosition(tensor_index.tensor.*);
                 std.debug.print("Error at line {}, column {}: Implicit index '{s}' conflicts with variable in scope\n", .{ pos.line, pos.column, index_name });
                 self.printSourceContext(self.getNodeOffset(tensor_index.tensor.*));

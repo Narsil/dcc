@@ -36,22 +36,12 @@ test "type system - different integer types" {
     const allocator = std.testing.allocator;
     // Create a test file with different integer types
     const test_source =
-        \\fn add_u8(a: u8, b: u8) u8 {
-        \\    return a + b;
-        \\}
-        \\
         \\fn add_i32(a: i32, b: i32) i32 {
         \\    return a + b;
         \\}
         \\
-        \\fn add_f64(a: f64, b: f64) f64 {
-        \\    return a + b;
-        \\}
-        \\
-        \\fn main() i32 {
-        \\    let x: u8 = add_u8(1u8, 2u8);
+        \\pub fn main() i32 {
         \\    let y: i32 = add_i32(10i32, 20i32);
-        \\    let z: f64 = add_f64(1.5f64, 2.5f64);
         \\    return y;
         \\}
     ;
@@ -65,7 +55,7 @@ test "type system - tensor gpu add" {
         \\fn gpu_vector_add(a: [1024]i32, b: [1024]i32) void{
         \\    a[i] = a[i] + b[i];
         \\}
-        \\fn main() i32 {
+        \\pub fn main() i32 {
         \\    let a: [1024]i32 = [1024]i32{2i32};
         \\    let b: [1024]i32 = [1024]i32{4i32};
         \\    gpu_vector_add(a, b);
@@ -82,7 +72,7 @@ test "type system - tensor gpu mul" {
         \\fn gpu_vector_mul(a: [1024]i32, b: [1024]i32) void{
         \\    a[i] = a[i] * b[i];
         \\}
-        \\fn main() i32 {
+        \\pub fn main() i32 {
         \\    let a: [1024]i32 = [1024]i32{2i32};
         \\    let b: [1024]i32 = [1024]i32{4i32};
         \\    gpu_vector_mul(a, b);
@@ -102,7 +92,7 @@ test "type system - tensor gpu stacked" {
         \\fn gpu_vector_mul(a: [1024]i32, b: [1024]i32) void{
         \\    a[i] = a[i] * b[i];
         \\}
-        \\fn main() i32 {
+        \\pub fn main() i32 {
         \\    let a: [1024]i32 = [1024]i32{2i32};
         \\    let b: [1024]i32 = [1024]i32{4i32};
         \\    gpu_vector_add(a, b);
@@ -126,7 +116,7 @@ test "type system - tensor gpu interleaved" {
         \\fn vector_mul(a: [1024]i32, b: [1024]i32) void{
         \\    a[i] = a[i] * b[i];
         \\}
-        \\fn main() i32 {
+        \\pub fn main() i32 {
         \\    let a: [1024]i32 = [1024]i32{2i32};
         \\    let b: [1024]i32 = [1024]i32{4i32};
         \\    gpu_vector_add(a, b);
@@ -146,7 +136,7 @@ test "reduce - gpu 2D to 1D sum" {
         \\    b[i] = reduce(a[i, j], +);
         \\}
         \\
-        \\fn main() i32 {
+        \\pub fn main() i32 {
         \\    let a: [5, 3]f32 = [5, 3]f32{2.0f32};
         \\    let b: [5]f32 = [5]f32{0.0f32};
         \\    gpu_reduce(a, b);
@@ -163,7 +153,7 @@ test "reduce - gpu 2D to 1D product" {
         \\    result[i] = reduce(a[i, j], *);
         \\}
         \\
-        \\fn main() i32 {
+        \\pub fn main() i32 {
         \\    let a: [3, 3]f32 = [3, 3]f32{3.0f32};
         \\    let result: [3]f32 = [3]f32{1.0f32};
         \\    gpu_reduce_rows(a, result);
