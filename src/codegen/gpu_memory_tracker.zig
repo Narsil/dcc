@@ -1,6 +1,12 @@
 const std = @import("std");
-const llvm_types = @import("llvm_types.zig");
-const LLVM = llvm_types.LLVM;
+pub const LLVM = @cImport({
+    @cInclude("llvm-c/Core.h");
+    @cInclude("llvm-c/TargetMachine.h");
+    @cInclude("llvm-c/Target.h");
+    @cInclude("llvm-c/Support.h");
+    @cInclude("llvm-c/BitReader.h");
+    @cInclude("llvm-c/Object.h");
+});
 
 /// Tracks the location of variables (CPU or GPU) to optimize memory transfers
 pub const GpuMemoryTracker = struct {
@@ -15,9 +21,9 @@ pub const GpuMemoryTracker = struct {
     pub const VarInfo = struct {
         location: Location,
         gpu_ptr: ?LLVM.LLVMValueRef, // GPU pointer if allocated
-        cpu_ptr: LLVM.LLVMValueRef,   // CPU pointer (always exists)
-        size: u64,                    // Size in bytes
-        last_modified: Location,       // Where was it last modified
+        cpu_ptr: LLVM.LLVMValueRef, // CPU pointer (always exists)
+        size: u64, // Size in bytes
+        last_modified: Location, // Where was it last modified
     };
 
     allocator: std.mem.Allocator,
@@ -162,3 +168,4 @@ pub const GpuMemoryTracker = struct {
         std.debug.print("================================\n", .{});
     }
 };
+

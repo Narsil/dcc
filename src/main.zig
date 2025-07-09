@@ -6,13 +6,7 @@ const builtin = @import("builtin");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const typechecker = @import("typechecker.zig");
-const codegen = @import("codegen.zig");
-
-/// Helper function to convert std.Target to target triple string using Zig's built-in functionality
-fn targetToTriple(allocator: std.mem.Allocator, target: std.Target) ![]u8 {
-    const query = std.Target.Query.fromTarget(target);
-    return query.zigTriple(allocator);
-}
+const codegen = @import("codegen/core.zig");
 
 /// Helper function to parse target triple string to std.Target using Zig's built-in parsing
 fn parseTargetFromTriple(triple: []const u8) !std.Target {
@@ -109,7 +103,7 @@ pub fn main() !void {
             std.debug.print("NVIDIA GPUs are not available on macOS. GPU compilation is only supported on Linux targets.\n", .{});
             return error.GpuNotSupportedOnMacOS;
         }
-        
+
         var iter = std.mem.splitScalar(u8, gpu, ':');
         const arch_os_abi = iter.next() orelse return error.InvalidGpuTriplet;
         const cpu_features = iter.next() orelse {
@@ -318,7 +312,7 @@ fn compile(allocator: std.mem.Allocator, source_file: []const u8, target: std.Ta
 
     var code_gen = try codegen.CodeGen.init(allocator, "toy_program", verbose, target, gpu_target);
     defer code_gen.deinit();
-    
+
     // Pass reduction info from typechecker to codegen
     code_gen.setReductionInfo(type_checker.reduction_info);
 
@@ -331,11 +325,11 @@ fn compile(allocator: std.mem.Allocator, source_file: []const u8, target: std.Ta
 
     // Choose compilation mode based on presence of main function
     if (has_main) {
-        try code_gen.generateWithMode(ast, .executable);
+        try code_gen.generate(ast, .executable);
         // Generate executable binary
         try code_gen.generateExecutable(output_name, target);
     } else {
-        try code_gen.generateWithMode(ast, .library);
+        try code_gen.generate(ast, .library);
         // Generate shared library
         try code_gen.generateSharedLibrary(output_name, target);
     }
@@ -347,4 +341,8 @@ fn compile(allocator: std.mem.Allocator, source_file: []const u8, target: std.Ta
     if (verbose) {
         std.debug.print("Compilation complete!\n", .{});
     }
+}
+
+test {
+    @import("std").testing.refAllDecls(@This());
 }

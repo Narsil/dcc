@@ -1,7 +1,7 @@
 const std = @import("std");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
-const mlir_codegen = @import("mlir_codegen.zig");
+const mlir_codegen = @import("codegen/mlir.zig");
 
 // MLIR C API bindings
 const MLIR = @cImport({
@@ -152,17 +152,14 @@ fn generatePTXFromPipeline(allocator: std.mem.Allocator, args: Args) ![]const u8
     const cuda_target = blk: {
         const cpu_name = try std.fmt.allocPrint(allocator, "sm_{d}", .{args.sm_version});
         defer allocator.free(cpu_name);
-        
-        const query = std.Target.Query.parse(.{ 
-            .arch_os_abi = "nvptx64-cuda",
-            .cpu_features = cpu_name
-        }) catch |err| {
+
+        const query = std.Target.Query.parse(.{ .arch_os_abi = "nvptx64-cuda", .cpu_features = cpu_name }) catch |err| {
             if (args.verbose) {
                 std.debug.print("❌ Failed to parse CUDA target: {}\n", .{err});
             }
             return EmitPtxError.PipelineError;
         };
-        
+
         break :blk std.zig.system.resolveTargetQuery(query) catch |err| {
             if (args.verbose) {
                 std.debug.print("❌ Failed to resolve CUDA target: {}\n", .{err});
@@ -202,7 +199,7 @@ fn generatePTXFromPipeline(allocator: std.mem.Allocator, args: Args) ![]const u8
         }
         return EmitPtxError.PipelineError;
     };
-    
+
     return ptx_content;
 }
 
@@ -432,19 +429,19 @@ fn extractKernelFunction(allocator: std.mem.Allocator, input_content: []const u8
         // Search for GPU functions
         const func_start = std.mem.indexOf(u8, input_content[search_pos..], "llvm.func @gpu_") orelse break;
         const actual_start = search_pos + func_start;
-        
+
         // Find the end of this function
         const func_end = std.mem.indexOf(u8, input_content[actual_start..], "  }") orelse {
             std.debug.print("Error: Could not find end of GPU function\n", .{});
             return EmitPtxError.PipelineError;
         };
-        
+
         // Extract the function
         const function = input_content[actual_start .. actual_start + func_end + 3];
-        
+
         // Clean up the function (remove gpu.kernel attributes)
         var cleaned_func = try allocator.dupe(u8, function);
-        
+
         // Remove the gpu.kernel attribute as it's not needed in standalone module
         const kernel_with_attrs = std.mem.replacementSize(u8, cleaned_func, "gpu.kernel, ", "");
         if (kernel_with_attrs < cleaned_func.len) {
@@ -453,7 +450,7 @@ fn extractKernelFunction(allocator: std.mem.Allocator, input_content: []const u8
             allocator.free(cleaned_func);
             cleaned_func = temp;
         }
-        
+
         // Also remove if it's at the end
         const kernel_with_attrs2 = std.mem.replacementSize(u8, cleaned_func, ", gpu.kernel", "");
         if (kernel_with_attrs2 < cleaned_func.len) {
@@ -462,22 +459,22 @@ fn extractKernelFunction(allocator: std.mem.Allocator, input_content: []const u8
             allocator.free(cleaned_func);
             cleaned_func = temp;
         }
-        
+
         try functions.append(cleaned_func);
-        
+
         // Move search position forward
         search_pos = actual_start + func_end + 3;
     }
-    
+
     if (functions.items.len == 0) {
         std.debug.print("Error: No GPU kernel functions found in MLIR\n", .{});
         return EmitPtxError.PipelineError;
     }
-    
+
     // Combine all functions into a single module
     var combined_functions = std.ArrayList(u8).init(allocator);
     defer combined_functions.deinit();
-    
+
     for (functions.items) |func| {
         try combined_functions.appendSlice(func);
         try combined_functions.appendSlice("\n");

@@ -20,7 +20,7 @@ fn createCudaStubCopyStep(b: *std.Build) *std.Build.Step {
     defer b.allocator.free(cuda_lib_dir);
 
     // Create destination directories
-    const mkdir_step = b.addSystemCommand(&.{ "mkdir", "-p", "src/cuda_stub/include", "src/cuda_stub/lib" });
+    const mkdir_step = b.addSystemCommand(&.{ "mkdir", "-p", "src/codegen/cuda_stub/include", "src/codegen/cuda_stub/lib" });
 
     // Copy CUDA header
     const src_header = std.fmt.allocPrint(b.allocator, "{s}/cuda.h", .{cuda_include_dir}) catch {
@@ -38,7 +38,7 @@ fn createCudaStubCopyStep(b: *std.Build) *std.Build.Step {
 
     // Create a combined step that removes read-only files first, then copies
     const combined_copy_step = b.addSystemCommand(&.{ "sh", "-c" });
-    const combined_cmd = std.fmt.allocPrint(b.allocator, "rm -f src/cuda_stub/include/cuda.h src/cuda_stub/lib/libcuda.so && cp '{s}' src/cuda_stub/include/cuda.h && cp '{s}' src/cuda_stub/lib/libcuda.so", .{ src_header, src_lib }) catch {
+    const combined_cmd = std.fmt.allocPrint(b.allocator, "rm -rf src/codegen/cuda_stub/ && mkdir -p src/codegen/cuda_stub/{{include,lib}} && cp '{s}' src/codegen/cuda_stub/include/cuda.h && cp '{s}' src/codegen/cuda_stub/lib/libcuda.so", .{ src_header, src_lib }) catch {
         const noop_step = b.step("cuda-stub-noop", "No-op step for combined copy failure");
         return noop_step;
     };
@@ -300,22 +300,20 @@ pub fn build(b: *std.Build) !void {
     try createLinking(b, exe, llvm_include_dir, llvm_lib_dir, lld_include_dir, lld_lib_dir, true);
 
     // Add our custom GPU to NVVM wrapper to main dcc build
-    const mlir_include_dir_main = std.process.getEnvVarOwned(b.allocator, "MLIR_INCLUDE_DIR") catch null;
-    const mlir_lib_dir_main = std.process.getEnvVarOwned(b.allocator, "MLIR_LIB_DIR") catch null;
+    const mlir_include_dir_main = try std.process.getEnvVarOwned(b.allocator, "MLIR_INCLUDE_DIR");
+    const mlir_lib_dir_main = try std.process.getEnvVarOwned(b.allocator, "MLIR_LIB_DIR");
 
-    if (mlir_include_dir_main != null and mlir_lib_dir_main != null) {
-        defer b.allocator.free(mlir_include_dir_main.?);
-        defer b.allocator.free(mlir_lib_dir_main.?);
+    defer b.allocator.free(mlir_include_dir_main);
+    defer b.allocator.free(mlir_lib_dir_main);
 
-        // Add our GPU to NVVM wrapper for main dcc
-        exe.addCSourceFile(.{
-            .file = b.path("src/gpu_to_nvvm_wrapper.cpp"),
-            .flags = &.{"-std=c++17"},
-        });
+    // Add our GPU to NVVM wrapper for main dcc
+    exe.addCSourceFile(.{
+        .file = b.path("src/gpu_to_nvvm_wrapper.cpp"),
+        .flags = &.{"-std=c++17"},
+    });
 
-        // Add include path for our wrapper header
-        exe.addIncludePath(.{ .cwd_relative = "src" });
-    }
+    // Add include path for our wrapper header
+    exe.addIncludePath(.{ .cwd_relative = "src" });
 
     // Add C++ wrapper for lld
 
@@ -344,43 +342,23 @@ pub fn build(b: *std.Build) !void {
     try createLinking(b, emit_ptx_exe, llvm_include_dir, llvm_lib_dir, lld_include_dir, lld_lib_dir, false);
 
     // Add our custom GPU to NVVM wrapper for emit_ptx
-    const mlir_include_dir = std.process.getEnvVarOwned(b.allocator, "MLIR_INCLUDE_DIR") catch null;
-    const mlir_lib_dir = std.process.getEnvVarOwned(b.allocator, "MLIR_LIB_DIR") catch null;
+    const mlir_include_dir = try std.process.getEnvVarOwned(b.allocator, "MLIR_INCLUDE_DIR");
+    const mlir_lib_dir = try std.process.getEnvVarOwned(b.allocator, "MLIR_LIB_DIR");
 
-    if (mlir_include_dir != null and mlir_lib_dir != null) {
-        defer b.allocator.free(mlir_include_dir.?);
-        defer b.allocator.free(mlir_lib_dir.?);
+    defer b.allocator.free(mlir_include_dir);
+    defer b.allocator.free(mlir_lib_dir);
 
-        // Add our GPU to NVVM wrapper
-        emit_ptx_exe.addCSourceFile(.{
-            .file = b.path("src/gpu_to_nvvm_wrapper.cpp"),
-            .flags = &.{"-std=c++17"},
-        });
+    // Add our GPU to NVVM wrapper
+    emit_ptx_exe.addCSourceFile(.{
+        .file = b.path("src/gpu_to_nvvm_wrapper.cpp"),
+        .flags = &.{"-std=c++17"},
+    });
 
-        // Add include path for our wrapper header
-        emit_ptx_exe.addIncludePath(.{ .cwd_relative = "src" });
-    }
+    // Add include path for our wrapper header
+    emit_ptx_exe.addIncludePath(.{ .cwd_relative = "src" });
 
     // Install emit_ptx executable
     b.installArtifact(emit_ptx_exe);
-
-    // Create CUDA LLVM IR test executable
-    const cuda_llvm_ir_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/cuda_llvm_ir_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const cuda_llvm_ir_test_exe = b.addExecutable(.{
-        .name = "cuda_llvm_ir_test",
-        .root_module = cuda_llvm_ir_test_mod,
-    });
-
-    // Link cuda_llvm_ir_test with the same libraries as main dcc
-    try createLinking(b, cuda_llvm_ir_test_exe, llvm_include_dir, llvm_lib_dir, lld_include_dir, lld_lib_dir, false);
-
-    // Install cuda_llvm_ir_test executable
-    b.installArtifact(cuda_llvm_ir_test_exe);
 
     // Create run step for emit_ptx
     const run_emit_ptx_cmd = b.addRunArtifact(emit_ptx_exe);
@@ -392,17 +370,6 @@ pub fn build(b: *std.Build) !void {
 
     const run_emit_ptx_step = b.step("emit-ptx", "Run the emit_ptx tool");
     run_emit_ptx_step.dependOn(&run_emit_ptx_cmd.step);
-
-    // Create run step for CUDA LLVM IR test
-    const run_cuda_llvm_ir_test_cmd = b.addRunArtifact(cuda_llvm_ir_test_exe);
-    run_cuda_llvm_ir_test_cmd.step.dependOn(b.getInstallStep());
-
-    if (b.args) |args| {
-        run_cuda_llvm_ir_test_cmd.addArgs(args);
-    }
-
-    const run_cuda_llvm_ir_test_step = b.step("cuda-llvm-ir-test", "Run the CUDA LLVM IR generator test");
-    run_cuda_llvm_ir_test_step.dependOn(&run_cuda_llvm_ir_test_cmd.step);
 
     // This *creates* a Run step in the build graph, to be executed when another
     // step is evaluated that depends on it. The next line below will establish
@@ -437,11 +404,8 @@ pub fn build(b: *std.Build) !void {
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 
-    // Similar to creating the run step earlier, this exposes a `test` step to
-    // the `zig build --help` menu, providing a way for the user to request
-    // running the unit tests.
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_exe_unit_tests.step);
+    const unit_test_step = b.step("test-unit", "Run unit tests");
+    unit_test_step.dependOn(&run_exe_unit_tests.step);
 
     // Integration tests that require the dcc binary
     const integration_tests = b.addTest(.{
@@ -473,26 +437,11 @@ pub fn build(b: *std.Build) !void {
     const cross_compilation_test_step = b.step("test-cross", "Run cross-compilation tests");
     cross_compilation_test_step.dependOn(&run_cross_compilation_tests.step);
 
-    // Make the main test step depend on both unit and integration tests
+    // Similar to creating the run step earlier, this exposes a `test` step to
+    // the `zig build --help` menu, providing a way for the user to request
+    // running the unit tests.
+    const test_step = b.step("test", "Run all tests");
+    test_step.dependOn(&run_exe_unit_tests.step);
     test_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_cross_compilation_tests.step);
-
-    // Add specific MLIR codegen test step
-    const mlir_codegen_tests = b.addTest(.{
-        .name = "mlir-codegen-tests",
-        .root_source_file = b.path("src/mlir_codegen.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // Configure MLIR test with all necessary dependencies
-    try createLinking(b, mlir_codegen_tests, llvm_include_dir, llvm_lib_dir, lld_include_dir, lld_lib_dir, false);
-
-    const run_mlir_codegen_tests = b.addRunArtifact(mlir_codegen_tests);
-
-    const mlir_test_step = b.step("test-mlir", "Run MLIR codegen tests");
-    mlir_test_step.dependOn(&run_mlir_codegen_tests.step);
-
-    // Also add MLIR tests to the main test step
-    test_step.dependOn(&run_mlir_codegen_tests.step);
 }

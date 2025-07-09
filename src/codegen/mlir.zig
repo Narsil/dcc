@@ -1,5 +1,5 @@
 const std = @import("std");
-const parser = @import("parser.zig");
+const parser = @import("../parser.zig");
 
 // MLIR C API bindings
 const MLIR = @cImport({
@@ -185,7 +185,7 @@ pub const MLIRCodeGen = struct {
 
         // Generate constants based on the actual dimensions
         try writer.writeAll("    %c0 = arith.constant 0 : index\n");
-        
+
         // For reduce operations, generate constant for target dimension
         const bounds_dim = if (operation_info.is_reduce and operation_info.target_param < param_info.len)
             param_info[operation_info.target_param].dimension
@@ -193,7 +193,7 @@ pub const MLIRCodeGen = struct {
             param_info[0].dimension
         else
             1;
-            
+
         try writer.print("    %c{d} = arith.constant {d} : index\n", .{ bounds_dim, bounds_dim });
         try writer.writeAll("    \n");
 
@@ -266,7 +266,7 @@ pub const MLIRCodeGen = struct {
 
         // Generate constants based on the actual dimensions
         try writer.writeAll("    %c0 = arith.constant 0 : index\n");
-        
+
         // For reduce operations, generate constant for target dimension
         const bounds_dim = if (operation_info.is_reduce and operation_info.target_param < param_info.len)
             param_info[operation_info.target_param].dimension
@@ -274,7 +274,7 @@ pub const MLIRCodeGen = struct {
             param_info[0].dimension
         else
             1;
-            
+
         try writer.print("    %c{d} = arith.constant {d} : index\n", .{ bounds_dim, bounds_dim });
         try writer.writeAll("    \n");
 
@@ -368,12 +368,12 @@ pub const MLIRCodeGen = struct {
                 // Check if the value is a reduce expression
                 if (pa.value.* == .reduce_expression) {
                     const reduce_expr = pa.value.*.reduce_expression;
-                    
+
                     // For reduce operations, we need to identify which parameter is being reduced
                     // For now, assume first parameter is source, second is target
                     const source_params = try self.allocator.alloc(usize, 1);
                     source_params[0] = 0; // Source tensor to reduce
-                    
+
                     return OperationInfo{
                         .operation = reduce_expr.operator,
                         .target_param = 1, // Target is second parameter
@@ -476,53 +476,54 @@ pub const MLIRCodeGen = struct {
             }
         }
     }
-    
+
     /// Generate MLIR code for reduce operations
     fn generateReduceOperationMLIR(self: *MLIRCodeGen, writer: anytype, param_info: []ParameterInfo, operation_info: OperationInfo) !void {
         _ = self;
-        
+
         // For GPU reduce, we need to:
         // 1. Each thread handles one element of the output (dimension 0)
         // 2. Each thread loops over the reduction dimension (dimension 1)
-        
+
         const source_param = operation_info.source_params[0];
         const target_param = operation_info.target_param;
-        
+
         if (source_param >= param_info.len or target_param >= param_info.len) {
             try writer.writeAll("      // Invalid parameter indices for reduce\n");
             return;
         }
-        
+
         const source_info = param_info[source_param];
         const target_info = param_info[target_param];
         const element_type = target_info.mlir_type;
-        
+
         // For 2D to 1D reduction, source should be 2D tensor type
         // We need to extract the second dimension for the reduction loop
         const reduction_dim = if (source_info.tensor_shape) |shape|
             if (shape.len > 1) shape[1] else 1
-        else 1;
-        
+        else
+            1;
+
         try writer.writeAll("      // Reduce operation\n");
-        
+
         // Initialize accumulator based on operation type
         const init_value = switch (operation_info.operation) {
             .add => if (std.mem.eql(u8, element_type, "f32")) "0.0" else if (std.mem.eql(u8, element_type, "f64")) "0.0" else "0",
             .multiply => if (std.mem.eql(u8, element_type, "f32")) "1.0" else if (std.mem.eql(u8, element_type, "f64")) "1.0" else "1",
             else => "0", // Default for unsupported operations
         };
-        
+
         try writer.print("      %init = arith.constant {s} : {s}\n", .{ init_value, element_type });
         try writer.print("      %c1_reduce = arith.constant 1 : index\n", .{});
         try writer.print("      %c{d}_reduce = arith.constant {d} : index\n", .{ reduction_dim, reduction_dim });
-        
+
         // Create the reduction loop
         try writer.writeAll("      %reduced = scf.for %j = %c0 to %c");
         try writer.print("{d}_reduce", .{reduction_dim});
         try writer.writeAll(" step %c1_reduce iter_args(%acc = %init) -> (");
         try writer.print("{s}", .{element_type});
         try writer.writeAll(") {\n");
-        
+
         // Load element from multi-dimensional source tensor
         if (source_info.tensor_shape) |shape| {
             if (shape.len > 1) {
@@ -545,18 +546,18 @@ pub const MLIRCodeGen = struct {
             try writer.writeAll("        %idx = arith.addi %idx1, %j : index\n");
             try writer.print("        %elem = memref.load %arg{d}[%idx] : memref<{d}x{s}>\n", .{ source_param, source_info.dimension, element_type });
         }
-        
+
         // Perform the reduction operation
         const op_name = switch (operation_info.operation) {
             .add => if (std.mem.eql(u8, element_type, "f32") or std.mem.eql(u8, element_type, "f64")) "arith.addf" else "arith.addi",
             .multiply => if (std.mem.eql(u8, element_type, "f32") or std.mem.eql(u8, element_type, "f64")) "arith.mulf" else "arith.muli",
             else => "arith.addi", // Default
         };
-        
+
         try writer.print("        %new_acc = {s} %acc, %elem : {s}\n", .{ op_name, element_type });
         try writer.print("        scf.yield %new_acc : {s}\n", .{element_type});
         try writer.writeAll("      }\n");
-        
+
         // Store the reduced value
         try writer.print("      memref.store %reduced, %arg{d}[%global_id] : memref<{d}x{s}>\n", .{ target_param, target_info.dimension, element_type });
     }
@@ -753,7 +754,7 @@ pub const MLIRCodeGen = struct {
     /// Extract kernel function for standalone compilation
     fn extractKernelFunction(self: *MLIRCodeGen, input_content: []const u8, function_name: []const u8) ![]const u8 {
         _ = function_name; // We'll extract ALL GPU functions, not just one
-        
+
         // Find all GPU kernel functions (they start with "llvm.func @gpu_")
         var functions = std.ArrayList([]const u8).init(self.allocator);
         defer functions.deinit();
@@ -766,19 +767,19 @@ pub const MLIRCodeGen = struct {
             // Search for GPU functions
             const func_start = std.mem.indexOf(u8, input_content[search_pos..], "llvm.func @gpu_") orelse break;
             const actual_start = search_pos + func_start;
-            
+
             // Find the end of this function
             const func_end = std.mem.indexOf(u8, input_content[actual_start..], "  }") orelse {
                 std.debug.print("Error: Could not find end of GPU function\n", .{});
                 return MLIRCodeGenError.PipelineError;
             };
-            
+
             // Extract the function
             const function = input_content[actual_start .. actual_start + func_end + 3];
-            
+
             // Clean up the function (remove gpu.kernel attributes)
             var cleaned_func = try self.allocator.dupe(u8, function);
-            
+
             // Remove the gpu.kernel attribute as it's not needed in standalone module
             const kernel_with_attrs = std.mem.replacementSize(u8, cleaned_func, "gpu.kernel, ", "");
             if (kernel_with_attrs < cleaned_func.len) {
@@ -787,7 +788,7 @@ pub const MLIRCodeGen = struct {
                 self.allocator.free(cleaned_func);
                 cleaned_func = temp;
             }
-            
+
             // Also remove if it's at the end
             const kernel_with_attrs2 = std.mem.replacementSize(u8, cleaned_func, ", gpu.kernel", "");
             if (kernel_with_attrs2 < cleaned_func.len) {
@@ -796,26 +797,26 @@ pub const MLIRCodeGen = struct {
                 self.allocator.free(cleaned_func);
                 cleaned_func = temp;
             }
-            
+
             try functions.append(cleaned_func);
-            
+
             // Move search position forward
             search_pos = actual_start + func_end + 3;
         }
-        
+
         if (functions.items.len == 0) {
             std.debug.print("Error: No GPU kernel functions found in MLIR\n", .{});
             return MLIRCodeGenError.PipelineError;
         }
-        
+
         if (self.verbose) {
             std.debug.print("Found {} GPU kernel functions to extract\n", .{functions.items.len});
         }
-        
+
         // Combine all functions into a single module
         var combined_functions = std.ArrayList(u8).init(self.allocator);
         defer combined_functions.deinit();
-        
+
         for (functions.items) |func| {
             try combined_functions.appendSlice(func);
             try combined_functions.appendSlice("\n");

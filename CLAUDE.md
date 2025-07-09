@@ -40,7 +40,7 @@ zig build run -- test.toy --verbose
    - Validates types and tensor dimensions
    - Tracks implicit indices and reduction operations
    - Stores reduction info for codegen
-4. **Code Generator** (`src/codegen.zig`): 
+4. **Code Generator** (`src/codegen/core.zig`): 
    - Generates LLVM IR
    - Handles multi-dimensional tensor indexing
    - Implements reduction operations with nested loops

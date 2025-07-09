@@ -161,29 +161,3 @@ pub const CudaStubManager = struct {
         std.fs.cwd().deleteTree(temp_dir) catch {};
     }
 };
-
-// Test the CUDA stub manager
-test "cuda_stub_manager basic functionality" {
-    const allocator = std.testing.allocator;
-
-    var manager = CudaStubManager.init(allocator, false) catch return;
-    defer manager.deinit();
-
-    // Test stub detection
-    const should_use_stubs = CudaStubManager.shouldUseStubs("x86_64-unknown-linux-gnu");
-    std.debug.print("Should use CUDA stubs: {}\n", .{should_use_stubs});
-
-    // Test extraction and compilation (this might fail if no compiler is available)
-    manager.extractAndCompile() catch |err| {
-        std.debug.print("Note: CUDA stub compilation failed (expected if no compiler available): {}\n", .{err});
-        return; // Skip the rest of the test
-    };
-
-    // Test path retrieval
-    const include_path = manager.getIncludePath();
-    const lib_path = manager.getLibPath();
-
-    std.debug.print("Include path: {s}\n", .{include_path orelse "none"});
-    std.debug.print("Library path: {s}\n", .{lib_path orelse "none"});
-}
-

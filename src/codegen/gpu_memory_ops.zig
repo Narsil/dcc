@@ -1,6 +1,14 @@
 const std = @import("std");
-const llvm_types = @import("llvm_types.zig");
-const LLVM = llvm_types.LLVM;
+const parser = @import("../parser.zig");
+const gpu_tracker = @import("gpu_memory_tracker.zig");
+pub const LLVM = @cImport({
+    @cInclude("llvm-c/Core.h");
+    @cInclude("llvm-c/TargetMachine.h");
+    @cInclude("llvm-c/Target.h");
+    @cInclude("llvm-c/Support.h");
+    @cInclude("llvm-c/BitReader.h");
+    @cInclude("llvm-c/Object.h");
+});
 
 /// Helper functions for GPU memory operations
 pub const GpuMemoryOps = struct {
@@ -33,17 +41,17 @@ pub const GpuMemoryOps = struct {
     /// Allocate GPU memory for a tensor
     pub fn allocateGpuMemory(self: *GpuMemoryOps, size_bytes: LLVM.LLVMValueRef, name: []const u8) LLVM.LLVMValueRef {
         const ptr_type = LLVM.LLVMPointerType(LLVM.LLVMInt8TypeInContext(self.context), 0);
-        
+
         // Allocate space for GPU pointer
         const alloc_name = std.fmt.allocPrintZ(std.heap.page_allocator, "{s}_gpu_ptr", .{name}) catch "gpu_ptr";
         defer std.heap.page_allocator.free(alloc_name);
         const gpu_ptr = LLVM.LLVMBuildAlloca(self.builder, ptr_type, alloc_name.ptr);
-        
+
         // Call cuMemAlloc_v2
         const cuMemAlloc_type = LLVM.LLVMGlobalGetValueType(self.cuMemAlloc_func);
         var alloc_args = [_]LLVM.LLVMValueRef{ gpu_ptr, size_bytes };
         _ = LLVM.LLVMBuildCall2(self.builder, cuMemAlloc_type, self.cuMemAlloc_func, &alloc_args, 2, "");
-        
+
         // Load and return the allocated pointer
         const load_name = std.fmt.allocPrintZ(std.heap.page_allocator, "{s}_gpu_ptr_val", .{name}) catch "gpu_ptr_val";
         defer std.heap.page_allocator.free(load_name);
@@ -83,9 +91,9 @@ pub const GpuMemoryOps = struct {
         self: *GpuMemoryOps,
         allocator: std.mem.Allocator,
         func_name: []const u8,
-        parameters: []const @import("parser.zig").FunctionParameter,
+        parameters: []const parser.FunctionParameter,
         arguments: []LLVM.LLVMValueRef,
-        tracker: *@import("gpu_memory_tracker.zig").GpuMemoryTracker,
+        tracker: *.GpuMemoryTracker,
     ) ![]LLVM.LLVMValueRef {
         const gpu_ptrs = try allocator.alloc(LLVM.LLVMValueRef, arguments.len);
         const ptr_type = LLVM.LLVMPointerType(LLVM.LLVMInt8TypeInContext(self.context), 0);
@@ -137,13 +145,13 @@ pub const GpuMemoryOps = struct {
         self: *GpuMemoryOps,
         allocator: std.mem.Allocator,
         func_name: []const u8,
-        parameters: []const @import("parser.zig").FunctionParameter,
+        parameters: []const parser.FunctionParameter,
         arguments: []LLVM.LLVMValueRef,
         gpu_ptrs: []LLVM.LLVMValueRef,
-        tracker: *@import("gpu_memory_tracker.zig").GpuMemoryTracker,
+        tracker: *gpu_tracker.GpuMemoryTracker,
         needs_sync: bool,
     ) !void {
-        
+
         // Mark all tensor parameters as modified on GPU
         for (parameters, 0..) |param, i| {
             if (param.type == .tensor) {
@@ -156,15 +164,15 @@ pub const GpuMemoryOps = struct {
         // Only sync if needed (e.g., before CPU access)
         if (needs_sync) {
             self.synchronize();
-            
+
             // Copy back data that needs to be on CPU
             const ptr_type = LLVM.LLVMPointerType(LLVM.LLVMInt8TypeInContext(self.context), 0);
-            
+
             for (parameters, arguments, gpu_ptrs, 0..) |param, arg, gpu_ptr, i| {
                 if (param.type == .tensor) {
                     const var_name = std.fmt.allocPrint(allocator, "{s}_arg{}", .{ func_name, i }) catch "unknown";
                     defer allocator.free(var_name);
-                    
+
                     if (tracker.needsTransferToCpu(var_name)) {
                         const elem_size: u32 = switch (param.type.tensor.element_type.*) {
                             .f32, .i32 => 4,
@@ -173,10 +181,10 @@ pub const GpuMemoryOps = struct {
                         };
                         const size_t_type = LLVM.LLVMInt64TypeInContext(self.context);
                         const tensor_size = LLVM.LLVMConstInt(size_t_type, param.type.tensor.shape[0] * elem_size, 0);
-                        
+
                         const host_ptr = LLVM.LLVMBuildBitCast(self.builder, arg, ptr_type, "host_ptr");
                         self.copyDeviceToHost(host_ptr, gpu_ptr, tensor_size);
-                        
+
                         try tracker.markCopiedToCpu(var_name);
                     }
                 }

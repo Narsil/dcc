@@ -264,7 +264,7 @@ dcc/
 │   ├── lexer.zig         # Lexical analysis
 │   ├── parser.zig        # Syntax analysis and AST
 │   ├── typechecker.zig   # Type checking
-│   ├── codegen.zig       # LLVM code generation
+│   ├── codegen/       # LLVM code generation
 │   └── integration_tests.zig # Test suite
 ├── build.zig             # Build configuration
 ├── build.zig.zon         # Dependencies
