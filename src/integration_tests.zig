@@ -17,7 +17,7 @@ test "type system - unused variable error" {
     std.debug.print("Unused variable error test passed\n", .{});
 }
 
-test "io - stdout" {
+test "io stdout - simple" {
     const allocator = std.testing.allocator;
 
     const test_source =
@@ -28,9 +28,25 @@ test "io - stdout" {
     ;
 
     try assertCompiles(allocator, test_source, "test_stdout.toy");
-    try assertReturns(allocator, "test_stdout.toy", 0);
+    try assertExpectStdout(allocator, "test_stdout.toy", "Hello world!", 0);
 
-    std.debug.print("Unused variable error test passed\n", .{});
+    std.debug.print("stdout\n", .{});
+}
+
+test "io stdout - escape chars" {
+    const allocator = std.testing.allocator;
+
+    const test_source =
+        \\pub fn main() i32 {
+        \\    write(io.stdout, "Hello word!\n");
+        \\    return 0i32;
+        \\}
+    ;
+
+    try assertCompiles(allocator, test_source, "test_stdout_escape.toy");
+    try assertExpectStdout(allocator, "test_stdout_escape.toy", "Hello world!\n", 0);
+
+    std.debug.print("stdout with escaped", .{});
 }
 
 test "type system - used variable compiles" {
@@ -1170,6 +1186,10 @@ fn assertCompiles(allocator: std.mem.Allocator, source: []const u8, filename: []
 }
 
 fn assertReturns(allocator: std.mem.Allocator, filename: []const u8, expected: i32) !void {
+    return assertExpectStdout(allocator, filename, null, expected);
+}
+
+fn assertExpectStdout(allocator: std.mem.Allocator, filename: []const u8, expected_out: ?[]const u8, expected: i32) !void {
     // Extract output name from source file (remove .toy extension)
     const basename = std.fs.path.basename(filename);
     const output_name = if (std.mem.endsWith(u8, basename, ".toy"))
@@ -1194,6 +1214,11 @@ fn assertReturns(allocator: std.mem.Allocator, filename: []const u8, expected: i
                 std.debug.print("stderr: {s}\n", .{out.stderr});
                 return error.UnexpectedExitCode;
             } else {
+                if (expected_out) |eout| {
+                    if (std.mem.indexOf(u8, out.stdout, eout) == 0) {
+                        std.debug.print("Missing output {s} in full output:\n{s}", .{ eout, out.stdout });
+                    }
+                }
                 std.debug.print("Compiled {s} produced correct exit code: {}\n", .{ filename, out.term.Exited });
             }
         },

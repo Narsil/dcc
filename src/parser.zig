@@ -993,7 +993,10 @@ pub const Parser = struct {
                 }
             }
 
-            const final_string = processed[0..write_pos];
+            // Reallocate to exact size to avoid mismatch during free
+            const final_string = try self.allocator.alloc(u8, write_pos);
+            @memcpy(final_string, processed[0..write_pos]);
+            self.allocator.free(processed);
 
             return ASTNode{
                 .string_literal = .{

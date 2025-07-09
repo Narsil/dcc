@@ -84,9 +84,49 @@ Error handling tests are crucial - the compiler should provide clear error messa
 
 5. **Cross-compilation**: Use `--target` flag with triples like `x86_64-pc-linux-gnu` or `arm64-apple-darwin`.
 
+## IO System
+
+DCC implements IO through explicit `write` and `read` keywords that compile to direct syscalls:
+
+**Write Operations**: `write(io.stdout, "Hello")` compiles to platform-specific syscalls without libc dependency.
+
+**Standard Handles**: 
+- `io.stdout` (fd 1)
+- `io.stderr` (fd 2)  
+- `io.stdin` (fd 0)
+
+**Cross-Platform Support**: Direct syscalls for Linux/macOS on x86_64/ARM64. See `docs/syscall-implementation.md` for details.
+
+## Documentation
+
+The `docs/` folder contains detailed documentation:
+
+- **`io-design.md`**: Complete IO system design philosophy, `write`/`read` keywords, future plans
+- **`syscall-implementation.md`**: How DCC implements syscalls without libc, platform details, adding new syscalls
+
+## Recent Implementations
+
+### IO System (write keyword)
+- Added `write` and `read` keywords to lexer/parser
+- Implemented `io.stdout`, `io.stderr`, `io.stdin` as namespace access
+- Direct syscall generation for all supported platforms
+- No libc dependency - true fat binary compilation
+- String literals with proper null termination
+- Platform-specific inline assembly (AT&T syntax)
+
+### Key Implementation Files
+- `src/lexer.zig`: Added `write`/`read` tokens
+- `src/parser.zig`: Added AST nodes for write_expression, namespace_access, string_literal
+- `src/codegen/core.zig`: 
+  - `generateWriteSyscall()`: Main write implementation
+  - `generatePlatformWriteSyscall()`: Platform-specific inline assembly
+  - `computeStrlen()`: Compile-time string length calculation
+- `src/codegen/linking.zig`: Removed all libc linking
+
 ## Debugging Tips
 
 - Use `--verbose` flag to see generated LLVM IR
 - Add debug prints in typechecker with `if (self.verbose)`
 - Check `generated_mlir.mlir` for MLIR output
 - Run specific test: `zig build test 2>&1 | grep -A5 "test_name"`
+- For syscall issues, check inline assembly syntax (AT&T for x86_64)
