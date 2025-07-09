@@ -369,6 +369,69 @@ pub const TypeChecker = struct {
                 return return_type;
             },
             .reduce_expression => |reduce| try self.typeCheckReduceExpression(reduce),
+            .string_literal => |str| blk: {
+                // String literals are typed as [n]u8
+                const tensor_type = try self.allocator.create(parser.Type);
+                tensor_type.* = parser.Type{ .u8 = {} };
+                
+                const shape = try self.allocator.alloc(u32, 1);
+                shape[0] = str.length;
+                
+                const result_type = parser.Type{
+                    .tensor = parser.Type.TensorType{
+                        .shape = shape,
+                        .element_type = tensor_type,
+                    },
+                };
+                try self.allocated_types.append(result_type);
+                break :blk result_type;
+            },
+            .namespace_access => |ns| blk: {
+                // For now, we'll treat io.stdout, io.stderr, io.stdin as special IO handles
+                if (std.mem.eql(u8, ns.namespace, "io")) {
+                    if (std.mem.eql(u8, ns.member, "stdout") or 
+                        std.mem.eql(u8, ns.member, "stderr") or 
+                        std.mem.eql(u8, ns.member, "stdin")) {
+                        // Return a special IO handle type (for now, treat as void pointer)
+                        break :blk parser.Type{ .void = {} };
+                    }
+                }
+                const pos = self.getNodePosition(node.*);
+                std.debug.print("Error at line {}, column {}: Unknown namespace member '{s}.{s}'\n", .{ pos.line, pos.column, ns.namespace, ns.member });
+                self.printSourceContext(ns.offset);
+                return error.UndefinedVariable;
+            },
+            .write_expression => |write| blk: {
+                // Type check the handle
+                const handle_type = try self.typeCheckExpression(write.handle);
+                // For now, accept void type as IO handle
+                if (handle_type != .void) {
+                    const pos = self.getNodePosition(node.*);
+                    std.debug.print("Error at line {}, column {}: First argument to write must be an IO handle\n", .{ pos.line, pos.column });
+                    self.printSourceContext(write.offset);
+                    return error.TypeMismatch;
+                }
+                
+                // Type check the data - for now, accept any type
+                _ = try self.typeCheckExpression(write.data);
+                
+                // write returns void
+                break :blk parser.Type{ .void = {} };
+            },
+            .read_expression => |read| blk: {
+                // Type check the handle
+                const handle_type = try self.typeCheckExpression(read.handle);
+                // For now, accept void type as IO handle
+                if (handle_type != .void) {
+                    const pos = self.getNodePosition(node.*);
+                    std.debug.print("Error at line {}, column {}: First argument to read must be an IO handle\n", .{ pos.line, pos.column });
+                    self.printSourceContext(read.offset);
+                    return error.TypeMismatch;
+                }
+                
+                // Return the requested type
+                break :blk read.read_type;
+            },
             else => return error.InvalidExpression,
         };
         if (self.verbose) {
@@ -511,6 +574,10 @@ pub const TypeChecker = struct {
             .tensor_slice => |n| n.offset,
             .parallel_assignment => |n| n.offset,
             .reduce_expression => |n| n.offset,
+            .string_literal => |n| n.offset,
+            .namespace_access => |n| n.offset,
+            .write_expression => |n| n.offset,
+            .read_expression => |n| n.offset,
         };
         const pos = lexer.Lexer.offsetToLineColumn(self.source, offset);
         return .{ .line = @as(usize, pos.line), .column = @as(usize, pos.column) };
@@ -903,6 +970,10 @@ pub const TypeChecker = struct {
             .tensor_slice => |n| n.offset,
             .parallel_assignment => |n| n.offset,
             .reduce_expression => |n| n.offset,
+            .string_literal => |n| n.offset,
+            .namespace_access => |n| n.offset,
+            .write_expression => |n| n.offset,
+            .read_expression => |n| n.offset,
         };
     }
 

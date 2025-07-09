@@ -26,7 +26,8 @@
       "Bash(cat:*)",
       "Bash(./test_reduce_first_dim)",
       "Bash(./test_init_check)",
-      "Bash(./test_reduce_basics)"
+      "Bash(./test_reduce_basics)",
+      "Bash(awk:*)"
     ],
     "deny": []
   }

@@ -244,6 +244,30 @@ pub const ASTNode = union(enum) {
         tensor_expr: *ASTNode, // The tensor expression to reduce
         operator: BinaryOperator, // The reduction operator (+, *, etc.)
     },
+    // String literal: "Hello, World!\n"
+    string_literal: struct {
+        offset: usize,
+        value: []const u8, // The string content (without quotes)
+        length: u32, // Number of bytes in the string
+    },
+    // Namespace access: io.stdout
+    namespace_access: struct {
+        offset: usize,
+        namespace: []const u8, // e.g., "io"
+        member: []const u8, // e.g., "stdout"
+    },
+    // Write expression: write(handle, data)
+    write_expression: struct {
+        offset: usize,
+        handle: *ASTNode, // IO handle (e.g., io.stdout)
+        data: *ASTNode, // Data to write
+    },
+    // Read expression: read(handle, type)
+    read_expression: struct {
+        offset: usize,
+        handle: *ASTNode, // IO handle (e.g., io.stdin)
+        read_type: Type, // Type to read as
+    },
 };
 
 pub const Parameter = struct {
@@ -357,7 +381,20 @@ pub const Parser = struct {
                 self.cleanupASTNode(reduce.tensor_expr);
                 self.allocator.destroy(reduce.tensor_expr);
             },
-            .identifier, .number_literal, .parameter, .tensor_literal, .implicit_tensor_index, .tensor_slice, .parallel_assignment => {},
+            .write_expression => |write| {
+                self.cleanupASTNode(write.handle);
+                self.allocator.destroy(write.handle);
+                self.cleanupASTNode(write.data);
+                self.allocator.destroy(write.data);
+            },
+            .read_expression => |read| {
+                self.cleanupASTNode(read.handle);
+                self.allocator.destroy(read.handle);
+            },
+            .string_literal => |str| {
+                self.allocator.free(str.value);
+            },
+            .identifier, .number_literal, .parameter, .tensor_literal, .implicit_tensor_index, .tensor_slice, .parallel_assignment, .namespace_access => {},
         }
     }
 
@@ -413,7 +450,20 @@ pub const Parser = struct {
                 self.cleanupASTNode(reduce.tensor_expr);
                 self.allocator.destroy(reduce.tensor_expr);
             },
-            .identifier, .number_literal, .parameter, .tensor_literal, .implicit_tensor_index, .tensor_slice, .parallel_assignment => {},
+            .write_expression => |write| {
+                self.cleanupASTNode(write.handle);
+                self.allocator.destroy(write.handle);
+                self.cleanupASTNode(write.data);
+                self.allocator.destroy(write.data);
+            },
+            .read_expression => |read| {
+                self.cleanupASTNode(read.handle);
+                self.allocator.destroy(read.handle);
+            },
+            .string_literal => |str| {
+                self.allocator.free(str.value);
+            },
+            .identifier, .number_literal, .parameter, .tensor_literal, .implicit_tensor_index, .tensor_slice, .parallel_assignment, .namespace_access => {},
         }
     }
 
@@ -448,6 +498,10 @@ pub const Parser = struct {
                         .tensor_slice => |n| n.offset,
                         .parallel_assignment => |n| n.offset,
                         .reduce_expression => |n| n.offset,
+                        .string_literal => |n| n.offset,
+                        .namespace_access => |n| n.offset,
+                        .write_expression => |n| n.offset,
+                        .read_expression => |n| n.offset,
                     };
                     break :blk off;
                 } else 0,
@@ -525,6 +579,10 @@ pub const Parser = struct {
                     .tensor_slice => |n| n.offset,
                     .parallel_assignment => |n| n.offset,
                     .reduce_expression => |n| n.offset,
+                    .string_literal => |n| n.offset,
+                    .namespace_access => |n| n.offset,
+                    .write_expression => |n| n.offset,
+                    .read_expression => |n| n.offset,
                 };
                 return ASTNode{
                     .expression_statement = .{
@@ -828,6 +886,10 @@ pub const Parser = struct {
                 .tensor_slice => |n| n.offset,
                 .parallel_assignment => |n| n.offset,
                 .reduce_expression => |n| n.offset,
+                .string_literal => |n| n.offset,
+                .namespace_access => |n| n.offset,
+                .write_expression => |n| n.offset,
+                .read_expression => |n| n.offset,
             };
             expr = ASTNode{
                 .call_expression = .{
@@ -878,8 +940,80 @@ pub const Parser = struct {
             };
         }
 
+        if (self.match(.string_literal)) {
+            const token = self.previous();
+            // Extract string content without quotes
+            const lexeme = self.source[token.offset + 1 .. token.offset + token.getLength() - 1];
+
+            // Process escape sequences
+            var processed = try self.allocator.alloc(u8, lexeme.len);
+            var write_pos: usize = 0;
+            var read_pos: usize = 0;
+
+            while (read_pos < lexeme.len) {
+                if (lexeme[read_pos] == '\\' and read_pos + 1 < lexeme.len) {
+                    // Handle escape sequences
+                    switch (lexeme[read_pos + 1]) {
+                        'n' => {
+                            processed[write_pos] = '\n';
+                            write_pos += 1;
+                            read_pos += 2;
+                        },
+                        't' => {
+                            processed[write_pos] = '\t';
+                            write_pos += 1;
+                            read_pos += 2;
+                        },
+                        'r' => {
+                            processed[write_pos] = '\r';
+                            write_pos += 1;
+                            read_pos += 2;
+                        },
+                        '\\' => {
+                            processed[write_pos] = '\\';
+                            write_pos += 1;
+                            read_pos += 2;
+                        },
+                        '"' => {
+                            processed[write_pos] = '"';
+                            write_pos += 1;
+                            read_pos += 2;
+                        },
+                        else => {
+                            // Unknown escape, keep as-is
+                            processed[write_pos] = lexeme[read_pos];
+                            write_pos += 1;
+                            read_pos += 1;
+                        },
+                    }
+                } else {
+                    processed[write_pos] = lexeme[read_pos];
+                    write_pos += 1;
+                    read_pos += 1;
+                }
+            }
+
+            const final_string = processed[0..write_pos];
+
+            return ASTNode{
+                .string_literal = .{
+                    .offset = token.offset,
+                    .value = final_string,
+                    .length = @intCast(write_pos),
+                },
+            };
+        }
+
         if (self.match(.reduce)) {
             return try self.parseReduceExpression();
+        }
+
+        if (self.match(.write)) {
+            return try self.parseWriteExpression();
+        }
+
+        if (self.match(.read)) {
+            return try self.parseReadExpression();
         }
 
         if (self.match(.identifier)) {
@@ -891,6 +1025,24 @@ pub const Parser = struct {
                     .name = lexeme,
                 },
             };
+
+            // Check for namespace access: identifier.member
+            if (self.match(.dot)) {
+                if (!self.check(.identifier)) {
+                    self.reportError(self.peek().offset, "Expected member name after '.'");
+                    return error.ParseError;
+                }
+                const member_token = self.advance();
+                const member_lexeme = self.source[member_token.offset .. member_token.offset + member_token.getLength()];
+
+                expr = ASTNode{
+                    .namespace_access = .{
+                        .offset = token.offset,
+                        .namespace = lexeme,
+                        .member = member_lexeme,
+                    },
+                };
+            }
 
             // Check for tensor indexing: identifier[index]
             while (self.check(.left_bracket)) {
@@ -1048,10 +1200,10 @@ pub const Parser = struct {
 
         var numeric_indices = std.ArrayList(ASTNode).init(self.allocator);
         defer numeric_indices.deinit();
-        
+
         var implicit_indices = std.ArrayList([]const u8).init(self.allocator);
         defer implicit_indices.deinit();
-        
+
         var has_implicit = false;
         var has_numeric = false;
 
@@ -1064,7 +1216,7 @@ pub const Parser = struct {
                     self.reportError(self.peek().offset, "Cannot mix numeric and implicit indices");
                     return error.ParseError;
                 }
-                
+
                 const index_token = try self.consume(.number, "Expected index");
                 const index_str = self.source[index_token.offset .. index_token.offset + index_token.getLength()];
 
@@ -1085,7 +1237,7 @@ pub const Parser = struct {
                     self.reportError(self.peek().offset, "Cannot mix numeric and implicit indices");
                     return error.ParseError;
                 }
-                
+
                 const index_token = try self.consume(.identifier, "Expected index");
                 const index_name = self.source[index_token.offset .. index_token.offset + index_token.getLength()];
                 try implicit_indices.append(try self.allocator.dupe(u8, index_name));
@@ -1132,16 +1284,16 @@ pub const Parser = struct {
 
     fn parseReduceExpression(self: *Parser) ParseError!ASTNode {
         const reduce_offset = self.previous().offset; // 'reduce' token offset
-        
+
         // Expect '('
         _ = try self.consume(.left_paren, "Expected '(' after 'reduce'");
-        
+
         // Parse the tensor expression
         const tensor_expr = try self.parseExpression();
-        
+
         // Expect ','
         _ = try self.consume(.comma, "Expected ',' after tensor expression");
-        
+
         // Parse the operator
         var operator: BinaryOperator = undefined;
         if (self.match(.plus)) {
@@ -1157,19 +1309,84 @@ pub const Parser = struct {
             self.reportError(self.peek().offset, "Expected operator (+, *, -, /) for reduce");
             return error.ParseError;
         }
-        
+
         // Expect ')'
         _ = try self.consume(.right_paren, "Expected ')' after reduce operator");
-        
+
         // Create the reduce expression node
         const tensor_expr_ptr = try self.allocator.create(ASTNode);
         tensor_expr_ptr.* = tensor_expr;
-        
+
         return ASTNode{
             .reduce_expression = .{
                 .offset = reduce_offset,
                 .tensor_expr = tensor_expr_ptr,
                 .operator = operator,
+            },
+        };
+    }
+
+    fn parseWriteExpression(self: *Parser) ParseError!ASTNode {
+        const write_offset = self.previous().offset; // 'write' token offset
+
+        // Expect '('
+        _ = try self.consume(.left_paren, "Expected '(' after 'write'");
+
+        // Parse the handle expression (e.g., io.stdout)
+        const handle = try self.parseExpression();
+
+        // Expect ','
+        _ = try self.consume(.comma, "Expected ',' after handle");
+
+        // Parse the data expression
+        const data = try self.parseExpression();
+
+        // Expect ')'
+        _ = try self.consume(.right_paren, "Expected ')' after data");
+
+        // Create the write expression node
+        const handle_ptr = try self.allocator.create(ASTNode);
+        handle_ptr.* = handle;
+
+        const data_ptr = try self.allocator.create(ASTNode);
+        data_ptr.* = data;
+
+        return ASTNode{
+            .write_expression = .{
+                .offset = write_offset,
+                .handle = handle_ptr,
+                .data = data_ptr,
+            },
+        };
+    }
+
+    fn parseReadExpression(self: *Parser) ParseError!ASTNode {
+        const read_offset = self.previous().offset; // 'read' token offset
+
+        // Expect '('
+        _ = try self.consume(.left_paren, "Expected '(' after 'read'");
+
+        // Parse the handle expression (e.g., io.stdin)
+        const handle = try self.parseExpression();
+
+        // Expect ','
+        _ = try self.consume(.comma, "Expected ',' after handle");
+
+        // Parse the type to read as
+        const read_type = try self.parseType();
+
+        // Expect ')'
+        _ = try self.consume(.right_paren, "Expected ')' after type");
+
+        // Create the read expression node
+        const handle_ptr = try self.allocator.create(ASTNode);
+        handle_ptr.* = handle;
+
+        return ASTNode{
+            .read_expression = .{
+                .offset = read_offset,
+                .handle = handle_ptr,
+                .read_type = read_type,
             },
         };
     }
@@ -1368,7 +1585,21 @@ pub fn freeAST(allocator: std.mem.Allocator, node: ASTNode) void {
             freeAST(allocator, reduce.tensor_expr.*);
             allocator.destroy(reduce.tensor_expr);
         },
-        .identifier, .number_literal, .parameter => {},
+        .write_expression => |write| {
+            freeAST(allocator, write.handle.*);
+            freeAST(allocator, write.data.*);
+            allocator.destroy(write.handle);
+            allocator.destroy(write.data);
+        },
+        .read_expression => |read| {
+            freeAST(allocator, read.handle.*);
+            allocator.destroy(read.handle);
+            freeType(allocator, read.read_type);
+        },
+        .string_literal => |str| {
+            allocator.free(str.value);
+        },
+        .identifier, .number_literal, .parameter, .namespace_access => {},
     }
 }
 

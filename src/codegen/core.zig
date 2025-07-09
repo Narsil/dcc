@@ -63,6 +63,7 @@ pub const CodeGen = struct {
     gpu_memory_tracker: ?gpu_memory_tracker.GpuMemoryTracker,
     gpu_memory_ops: ?gpu_memory_ops.GpuMemoryOps,
     reduction_info: ?std.AutoHashMap(*parser.ASTNode, typechecker.ReductionInfo),
+    string_counter: u32,
 
     pub fn init(allocator: std.mem.Allocator, module_name: []const u8, verbose: bool, target: std.Target, gpu_target: ?std.Target) !CodeGen {
         _ = target; // Target is passed for completeness but not used in init
@@ -111,11 +112,18 @@ pub const CodeGen = struct {
             .gpu_memory_tracker = if (accelerator != null) gpu_memory_tracker.GpuMemoryTracker.init(allocator, verbose) else null,
             .gpu_memory_ops = null, // Will be initialized after CUDA functions are declared
             .reduction_info = null,
+            .string_counter = 0,
         };
     }
 
     pub fn setReductionInfo(self: *CodeGen, info: std.AutoHashMap(*parser.ASTNode, typechecker.ReductionInfo)) void {
         self.reduction_info = info;
+    }
+
+    fn getNextStringId(self: *CodeGen) u32 {
+        const id = self.string_counter;
+        self.string_counter += 1;
+        return id;
     }
 
     pub fn deinit(self: *CodeGen) void {
@@ -986,6 +994,123 @@ pub const CodeGen = struct {
 
                 // Return the final accumulator value
                 return LLVM.LLVMBuildLoad2(self.builder, element_type, acc_alloca, "reduce_result");
+            },
+            .string_literal => |str| {
+                // Create a global constant for the string
+                const str_type = LLVM.LLVMArrayType(LLVM.LLVMInt8TypeInContext(self.context), @intCast(str.length));
+                
+                // Create array of i8 constants for the string
+                const chars = try self.allocator.alloc(LLVM.LLVMValueRef, str.length);
+                defer self.allocator.free(chars);
+                
+                for (str.value, 0..) |char, i| {
+                    chars[i] = LLVM.LLVMConstInt(LLVM.LLVMInt8TypeInContext(self.context), char, 0);
+                }
+                
+                const str_const = LLVM.LLVMConstArray(LLVM.LLVMInt8TypeInContext(self.context), chars.ptr, @intCast(str.length));
+                
+                // Create a global variable for the string
+                const global_name = try std.fmt.allocPrintZ(self.allocator, ".str.{}", .{self.getNextStringId()});
+                defer self.allocator.free(global_name);
+                
+                const global = LLVM.LLVMAddGlobal(self.module, str_type, global_name.ptr);
+                LLVM.LLVMSetInitializer(global, str_const);
+                LLVM.LLVMSetGlobalConstant(global, 1);
+                LLVM.LLVMSetLinkage(global, LLVM.LLVMPrivateLinkage);
+                
+                // Return pointer to the first element
+                const indices = [_]LLVM.LLVMValueRef{
+                    LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 0, 0),
+                    LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 0, 0),
+                };
+                return LLVM.LLVMBuildInBoundsGEP2(self.builder, str_type, global, @constCast(&indices[0]), indices.len, "str_ptr");
+            },
+            .namespace_access => |ns| {
+                // Handle io.stdout, io.stderr, io.stdin
+                if (std.mem.eql(u8, ns.namespace, "io")) {
+                    // Return a constant representing the IO handle
+                    if (std.mem.eql(u8, ns.member, "stdout")) {
+                        return LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 1, 0);
+                    } else if (std.mem.eql(u8, ns.member, "stderr")) {
+                        return LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 2, 0);
+                    } else if (std.mem.eql(u8, ns.member, "stdin")) {
+                        return LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 0, 0);
+                    }
+                }
+                return error.UndefinedVariable;
+            },
+            .write_expression => |write| {
+                // Get the handle (file descriptor)
+                const handle = try self.generateExpression(write.handle.*);
+                
+                // Get the data to write
+                const data = try self.generateExpression(write.data.*);
+                
+                // For now, we'll use a simple printf for stdout/stderr
+                // In a real implementation, we'd use write() system call
+                const handle_val = if (LLVM.LLVMIsConstant(handle) == 1)
+                    LLVM.LLVMConstIntGetZExtValue(handle)
+                else
+                    return error.InvalidExpression;
+                
+                if (handle_val == 1 or handle_val == 2) { // stdout or stderr
+                    // Declare printf if not already declared
+                    const printf_name = "printf";
+                    var printf_func = LLVM.LLVMGetNamedFunction(self.module, printf_name);
+                    if (printf_func == null) {
+                        const char_ptr_type = LLVM.LLVMPointerType(LLVM.LLVMInt8TypeInContext(self.context), 0);
+                        var param_types = [_]LLVM.LLVMTypeRef{char_ptr_type};
+                        const printf_type = LLVM.LLVMFunctionType(
+                            LLVM.LLVMInt32TypeInContext(self.context),
+                            &param_types,
+                            1,
+                            1, // variadic
+                        );
+                        printf_func = LLVM.LLVMAddFunction(self.module, printf_name, printf_type);
+                    }
+                    
+                    // Create format string "%s"
+                    const format_str_type = LLVM.LLVMArrayType(LLVM.LLVMInt8TypeInContext(self.context), 3);
+                    const format_chars = [_]LLVM.LLVMValueRef{
+                        LLVM.LLVMConstInt(LLVM.LLVMInt8TypeInContext(self.context), '%', 0),
+                        LLVM.LLVMConstInt(LLVM.LLVMInt8TypeInContext(self.context), 's', 0),
+                        LLVM.LLVMConstInt(LLVM.LLVMInt8TypeInContext(self.context), 0, 0),
+                    };
+                    const format_const = LLVM.LLVMConstArray(LLVM.LLVMInt8TypeInContext(self.context), @constCast(&format_chars[0]), format_chars.len);
+                    
+                    const format_global = LLVM.LLVMAddGlobal(self.module, format_str_type, ".printf_format");
+                    LLVM.LLVMSetInitializer(format_global, format_const);
+                    LLVM.LLVMSetGlobalConstant(format_global, 1);
+                    LLVM.LLVMSetLinkage(format_global, LLVM.LLVMPrivateLinkage);
+                    
+                    const format_indices = [_]LLVM.LLVMValueRef{
+                        LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 0, 0),
+                        LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 0, 0),
+                    };
+                    const format_ptr = LLVM.LLVMBuildInBoundsGEP2(self.builder, format_str_type, format_global, @constCast(&format_indices[0]), format_indices.len, "format_ptr");
+                    
+                    // Call printf
+                    const args = [_]LLVM.LLVMValueRef{ format_ptr, data };
+                    _ = LLVM.LLVMBuildCall2(self.builder, LLVM.LLVMGetElementType(LLVM.LLVMTypeOf(printf_func.?)), printf_func.?, @constCast(&args[0]), args.len, "");
+                }
+                
+                // Return void (0)
+                return LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 0, 0);
+            },
+            .read_expression => |read| {
+                // For now, just return a dummy value
+                // In a real implementation, we'd use read() system call
+                _ = try self.generateExpression(read.handle.*);
+                
+                // Return a zero value of the requested type
+                const llvm_type = self.toLLVMType(read.read_type);
+                if (read.read_type == .tensor) {
+                    // For tensors, allocate and return pointer
+                    const alloca = LLVM.LLVMBuildAlloca(self.builder, llvm_type, "read_tensor");
+                    return alloca;
+                } else {
+                    return LLVM.LLVMConstNull(llvm_type);
+                }
             },
             else => return error.InvalidExpression,
         }

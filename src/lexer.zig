@@ -5,6 +5,7 @@ pub const TokenType = enum {
     number,
     identifier,
     type, // For type identifiers like u32, i64, f32, etc.
+    string_literal,
 
     // Keywords
     let,
@@ -12,6 +13,8 @@ pub const TokenType = enum {
     return_,
     reduce,
     pub_,
+    read,
+    write,
 
     // Operators
     plus,
@@ -30,9 +33,7 @@ pub const TokenType = enum {
     comma,
     semicolon,
     colon, // For type annotations
-
-    // Comparison operators
-    greater_than,
+    dot,
 
     // Special
     eof,
@@ -42,14 +43,16 @@ pub const TokenType = enum {
     /// Returns 0 for variable-length tokens (number, identifier, keywords, type)
     pub fn length(self: TokenType) usize {
         return switch (self) {
-            .plus, .minus, .multiply, .divide, .assign, .colon, .greater_than => 1,
+            .plus, .minus, .multiply, .divide, .assign, .colon, .dot => 1,
             .left_paren, .right_paren, .left_brace, .right_brace, .left_bracket, .right_bracket, .comma, .semicolon => 1,
             .let => 3,
             .fn_ => 2,
             .return_ => 6,
             .reduce => 6,
             .pub_ => 3,
-            .number, .identifier, .type, .eof, .invalid => 0, // Variable length
+            .read => 4,
+            .write => 5,
+            .number, .identifier, .type, .string_literal, .eof, .invalid => 0, // Variable length
         };
     }
 
@@ -139,7 +142,8 @@ pub const Lexer = struct {
             ',' => self.makeToken(.comma, start),
             ';' => self.makeToken(.semicolon, start),
             ':' => self.makeToken(.colon, start),
-            '>' => self.makeToken(.greater_than, start),
+            '.' => self.makeToken(.dot, start),
+            '"' => self.stringLiteral(start),
             else => {
                 if (std.ascii.isDigit(c)) {
                     return self.number(start);
@@ -229,12 +233,55 @@ pub const Lexer = struct {
         };
     }
 
+    fn stringLiteral(self: *Lexer, start: usize) Token {
+        // We've already consumed the opening quote
+        while (!self.isAtEnd() and self.peek() != '"') {
+            if (self.peek() == '\n') {
+                // Unterminated string
+                return Token{
+                    .type = .invalid,
+                    .offset = start,
+                    .length = self.current - start,
+                };
+            }
+            // Handle escape sequences
+            if (self.peek() == '\\') {
+                _ = self.advance(); // consume backslash
+                if (!self.isAtEnd()) {
+                    _ = self.advance(); // consume escaped character
+                }
+            } else {
+                _ = self.advance();
+            }
+        }
+
+        if (self.isAtEnd()) {
+            // Unterminated string
+            return Token{
+                .type = .invalid,
+                .offset = start,
+                .length = self.current - start,
+            };
+        }
+
+        // Consume the closing quote
+        _ = self.advance();
+
+        return Token{
+            .type = .string_literal,
+            .offset = start,
+            .length = self.current - start,
+        };
+    }
+
     fn identifierType(self: *Lexer, text: []const u8) TokenType {
         if (std.mem.eql(u8, text, "let")) return .let;
         if (std.mem.eql(u8, text, "fn")) return .fn_;
         if (std.mem.eql(u8, text, "return")) return .return_;
         if (std.mem.eql(u8, text, "reduce")) return .reduce;
         if (std.mem.eql(u8, text, "pub")) return .pub_;
+        if (std.mem.eql(u8, text, "read")) return .read;
+        if (std.mem.eql(u8, text, "write")) return .write;
 
         // Check if it's a type identifier
         if (self.isTypeIdentifier(text)) return .type;
@@ -339,6 +386,29 @@ test "lexer basic tokens" {
     try std.testing.expect(tokens[5].type == .eof);
 }
 
+test "lexer io tokens" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\write(io.stdout, "Hello, World!\n");
+    ;
+
+    var lexer = Lexer.init(allocator, source);
+    const tokens = try lexer.tokenize();
+    defer allocator.free(tokens);
+
+    try std.testing.expect(tokens.len == 10); // write, (, io, ., stdout, ,, "...", ), ;, eof
+    try std.testing.expect(tokens[0].type == .write);
+    try std.testing.expect(tokens[1].type == .left_paren);
+    try std.testing.expect(tokens[2].type == .identifier); // io
+    try std.testing.expect(tokens[3].type == .dot);
+    try std.testing.expect(tokens[4].type == .identifier); // stdout
+    try std.testing.expect(tokens[5].type == .comma);
+    try std.testing.expect(tokens[6].type == .string_literal);
+    try std.testing.expect(tokens[7].type == .right_paren);
+    try std.testing.expect(tokens[8].type == .semicolon);
+    try std.testing.expect(tokens[9].type == .eof);
+}
+
 test "offset to line column conversion" {
     const source = "hello\nworld\ntest";
 
@@ -382,4 +452,3 @@ test "offset to line column conversion" {
     try std.testing.expect(pos.line == 3);
     try std.testing.expect(pos.column == 4);
 }
-

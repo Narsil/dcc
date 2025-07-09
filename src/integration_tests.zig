@@ -17,6 +17,22 @@ test "type system - unused variable error" {
     std.debug.print("Unused variable error test passed\n", .{});
 }
 
+test "io - stdout" {
+    const allocator = std.testing.allocator;
+
+    const test_source =
+        \\pub fn main() i32 {
+        \\    write(io.stdout, "Hello word!");
+        \\    return 0i32;
+        \\}
+    ;
+
+    try assertCompiles(allocator, test_source, "test_stdout.toy");
+    try assertReturns(allocator, "test_stdout.toy", 0);
+
+    std.debug.print("Unused variable error test passed\n", .{});
+}
+
 test "type system - used variable compiles" {
     const allocator = std.testing.allocator;
 
@@ -1160,6 +1176,7 @@ fn assertReturns(allocator: std.mem.Allocator, filename: []const u8, expected: i
         basename[0 .. basename.len - 4]
     else
         basename;
+    defer std.fs.cwd().deleteFile(output_name) catch {};
 
     const binary_path = try std.fmt.allocPrint(allocator, "./{s}", .{output_name});
     defer allocator.free(binary_path);

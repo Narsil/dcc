@@ -203,6 +203,7 @@ fn assertCrossCompiles(allocator: std.mem.Allocator, source: []const u8, filenam
 
         const local_binary_path = try std.fmt.allocPrint(allocator, "./{s}", .{output_name});
         defer allocator.free(local_binary_path);
+        defer std.fs.cwd().deleteFile(output_name) catch {};
 
         const remote_binary_path = try std.fmt.allocPrint(allocator, "./{s}", .{output_name});
         defer allocator.free(remote_binary_path);
@@ -231,24 +232,31 @@ fn assertCrossCompiles(allocator: std.mem.Allocator, source: []const u8, filenam
                 },
             }
         }
-        const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ "ssh", target.remote, remote_binary_path } });
-        defer allocator.free(out.stdout);
-        defer allocator.free(out.stderr);
-        switch (out.term) {
-            .Exited => |term| {
-                if (term != expected) {
-                    std.debug.print("Expected exit code {}, got {}\n", .{ expected, term });
-                    std.debug.print("stdout: {s}\n", .{out.stdout});
-                    std.debug.print("stderr: {s}\n", .{out.stderr});
+        {
+            const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ "ssh", target.remote, remote_binary_path } });
+            defer allocator.free(out.stdout);
+            defer allocator.free(out.stderr);
+            switch (out.term) {
+                .Exited => |term| {
+                    if (term != expected) {
+                        std.debug.print("Expected exit code {}, got {}\n", .{ expected, term });
+                        std.debug.print("stdout: {s}\n", .{out.stdout});
+                        std.debug.print("stderr: {s}\n", .{out.stderr});
+                        return error.UnexpectedExitCode;
+                    } else {
+                        std.debug.print("Cross-compiled {s} for target {s} produced correct exit code: {}\n", .{ filename, target.target, out.term.Exited });
+                    }
+                },
+                else => {
                     return error.UnexpectedExitCode;
-                } else {
-                    std.debug.print("Cross-compiled {s} for target {s} produced correct exit code: {}\n", .{ filename, target.target, out.term.Exited });
-                }
-            },
-            else => {
-                return error.UnexpectedExitCode;
-            },
+                },
+            }
         }
+        // {
+        //     const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ "ssh", target.remote, "rm", remote_binary_path } });
+        //     defer allocator.free(out.stdout);
+        //     defer allocator.free(out.stderr);
+        // }
     }
 }
 
@@ -289,6 +297,8 @@ fn assertGpuCrossCompiles(allocator: std.mem.Allocator, source: []const u8, file
             basename[0 .. basename.len - 4]
         else
             basename;
+        defer std.fs.cwd().deleteFile(output_name) catch {};
+        std.debug.print("--Should delete {s}\n", .{output_name});
 
         const local_binary_path = try std.fmt.allocPrint(allocator, "./{s}", .{output_name});
         defer allocator.free(local_binary_path);
@@ -300,6 +310,8 @@ fn assertGpuCrossCompiles(allocator: std.mem.Allocator, source: []const u8, file
             const remote = try std.fmt.allocPrint(allocator, "{s}:", .{target.remote});
             defer allocator.free(remote);
             const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ "scp", local_binary_path, remote } });
+            defer allocator.free(out.stdout);
+            defer allocator.free(out.stderr);
             switch (out.term) {
                 .Exited => |term| {
                     if (term != 0) {
@@ -314,21 +326,30 @@ fn assertGpuCrossCompiles(allocator: std.mem.Allocator, source: []const u8, file
                 },
             }
         }
-        const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ "ssh", target.remote, remote_binary_path } });
-        switch (out.term) {
-            .Exited => |term| {
-                if (term != expected) {
-                    std.debug.print("Expected exit code {}, got {}\n", .{ expected, term });
-                    std.debug.print("stdout: {s}\n", .{out.stdout});
-                    std.debug.print("stderr: {s}\n", .{out.stderr});
+        {
+            const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ "ssh", target.remote, remote_binary_path } });
+            defer allocator.free(out.stdout);
+            defer allocator.free(out.stderr);
+            switch (out.term) {
+                .Exited => |term| {
+                    if (term != expected) {
+                        std.debug.print("Expected exit code {}, got {}\n", .{ expected, term });
+                        std.debug.print("stdout: {s}\n", .{out.stdout});
+                        std.debug.print("stderr: {s}\n", .{out.stderr});
+                        return error.UnexpectedExitCode;
+                    } else {
+                        std.debug.print("Cross-compiled {s} for target {s} and gpu {s} produced correct exit code: {}\n", .{ filename, target.target, target.gpu, out.term.Exited });
+                    }
+                },
+                else => {
                     return error.UnexpectedExitCode;
-                } else {
-                    std.debug.print("Cross-compiled {s} for target {s} and gpu {s} produced correct exit code: {}\n", .{ filename, target.target, target.gpu, out.term.Exited });
-                }
-            },
-            else => {
-                return error.UnexpectedExitCode;
-            },
+                },
+            }
         }
+        // {
+        //     const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ "ssh", target.remote, "rm", remote_binary_path } });
+        //     defer allocator.free(out.stdout);
+        //     defer allocator.free(out.stderr);
+        // }
     }
 }
