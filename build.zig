@@ -349,10 +349,12 @@ pub fn build(b: *std.Build) !void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
+    const test_filters = b.option([]const []const u8, "test-filter", "Skip tests that do not match any filter") orelse &[0][]const u8{};
     // Creates a step for unit testing. This only builds the test executable
     // but does not run it.
     const exe_unit_tests = b.addTest(.{
         .root_module = exe_mod,
+        .filters = test_filters,
     });
 
     try createLinking(b, exe_unit_tests, llvm_include_dir, llvm_lib_dir, lld_include_dir, lld_lib_dir, false);
@@ -368,6 +370,7 @@ pub fn build(b: *std.Build) !void {
         .root_source_file = b.path("src/integration_tests.zig"),
         .target = target,
         .optimize = optimize,
+        .filters = test_filters,
     });
 
     // Add integration tests step
@@ -383,6 +386,7 @@ pub fn build(b: *std.Build) !void {
         .root_source_file = b.path("src/cross_compilation_tests.zig"),
         .target = target,
         .optimize = optimize,
+        .filters = test_filters,
     });
 
     // Add cross-compilation tests step
