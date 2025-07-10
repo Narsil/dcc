@@ -97,9 +97,9 @@ test "io file read - float data" {
         \\}
     ;
 
-    try assertCompiles(allocator, test_source, "test_tensor_file_read.toy");
-    try assertExpectStdout(allocator, "test_tensor_file_read.toy", "\x00\x00\x80\x3f", 0);
-    std.debug.print("Tensor file read test passed\n", .{});
+    try assertCompiles(allocator, test_source, "test_tensor_file_read_float.toy");
+    try assertExpectStdout(allocator, "test_tensor_file_read_float.toy", "\x00\x00\x80\x40", 0);
+    std.debug.print("Float reduce test passed\n", .{});
 }
 
 test "type system - used variable compiles" {

@@ -16,7 +16,7 @@ pub const LLVM = @cImport({
     @cInclude("llvm-c/Object.h");
 });
 
-pub const CodeGenError = error{ InvalidTopLevelNode, InvalidStatement, InvalidExpression, InvalidCallee, UndefinedVariable, UndefinedFunction, TargetError, CodeGenError, MainFunctionNotFound, MissingMainFunction, LinkingFailed, GpuCompilationNotImplemented, InvalidGpuTriplet, InvalidTargetTriple, InvalidCharacter, Overflow, CudaFunctionNotFound, CudaStubInitFailed, UnsupportedOperation, InvalidArguments, UnsupportedNamespaceFunction, UnsupportedWriteData, UnsupportedTensorElementType, UnsupportedArchitecture, UnsupportedOS } || std.mem.Allocator.Error;
+pub const CodeGenError = error{ InvalidTopLevelNode, InvalidStatement, InvalidExpression, InvalidCallee, UndefinedVariable, UndefinedFunction, TargetError, CodeGenError, MainFunctionNotFound, MissingMainFunction, LinkingFailed, GpuCompilationNotImplemented, InvalidGpuTriplet, InvalidTargetTriple, InvalidCharacter, Overflow, CudaFunctionNotFound, CudaStubInitFailed, UnsupportedOperation, InvalidArguments, UnsupportedNamespaceFunction, UnsupportedWriteData, UnsupportedTensorElementType, UnsupportedArchitecture, UnsupportedOS, UnsupportedType } || std.mem.Allocator.Error;
 
 const VarInfo = struct {
     alloca: LLVM.LLVMValueRef,
@@ -1001,12 +1001,26 @@ pub const CodeGen = struct {
                 const element_type = self.toLLVMType(tensor_type.element_type.*);
                 const array_type = self.toLLVMType(var_info.ty);
 
-                // Initialize accumulator based on the operator
+                // Initialize accumulator based on the operator and element type
                 var init_value: LLVM.LLVMValueRef = undefined;
-                switch (reduce.operator) {
-                    .add => init_value = LLVM.LLVMConstInt(element_type, 0, 0),
-                    .multiply => init_value = LLVM.LLVMConstInt(element_type, 1, 0),
-                    else => return error.UnsupportedOperation,
+                switch (tensor_type.element_type.*) {
+                    .f32, .f64 => {
+                        // For floating-point types, use LLVMConstReal
+                        switch (reduce.operator) {
+                            .add => init_value = LLVM.LLVMConstReal(element_type, 0.0),
+                            .multiply => init_value = LLVM.LLVMConstReal(element_type, 1.0),
+                            else => return error.UnsupportedOperation,
+                        }
+                    },
+                    .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64 => {
+                        // For integer types, use LLVMConstInt
+                        switch (reduce.operator) {
+                            .add => init_value = LLVM.LLVMConstInt(element_type, 0, 0),
+                            .multiply => init_value = LLVM.LLVMConstInt(element_type, 1, 0),
+                            else => return error.UnsupportedOperation,
+                        }
+                    },
+                    else => return error.UnsupportedType,
                 }
 
                 // For proper multi-dimensional reduction, we need context about which indices are free
@@ -1047,10 +1061,18 @@ pub const CodeGen = struct {
                 const elem_ptr = LLVM.LLVMBuildGEP2(self.builder, array_type, var_info.alloca, &indices[0], 2, "elem_ptr");
                 const elem_value = LLVM.LLVMBuildLoad2(self.builder, element_type, elem_ptr, "elem");
 
-                // Apply reduction operator
-                const new_acc = switch (reduce.operator) {
-                    .add => LLVM.LLVMBuildAdd(self.builder, current_acc, elem_value, "new_acc"),
-                    .multiply => LLVM.LLVMBuildMul(self.builder, current_acc, elem_value, "new_acc"),
+                // Apply reduction operator with correct instruction for type
+                const new_acc = switch (tensor_type.element_type.*) {
+                    .f32, .f64 => switch (reduce.operator) {
+                        .add => LLVM.LLVMBuildFAdd(self.builder, current_acc, elem_value, "new_acc"),
+                        .multiply => LLVM.LLVMBuildFMul(self.builder, current_acc, elem_value, "new_acc"),
+                        else => unreachable,
+                    },
+                    .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64 => switch (reduce.operator) {
+                        .add => LLVM.LLVMBuildAdd(self.builder, current_acc, elem_value, "new_acc"),
+                        .multiply => LLVM.LLVMBuildMul(self.builder, current_acc, elem_value, "new_acc"),
+                        else => unreachable,
+                    },
                     else => unreachable,
                 };
 
