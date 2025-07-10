@@ -21,9 +21,8 @@ test "io stdout - simple" {
     const allocator = std.testing.allocator;
 
     const test_source =
-        \\pub fn main() i32 {
+        \\pub fn main() void {
         \\    write(io.stdout, "Hello word!");
-        \\    return 0i32;
         \\}
     ;
 

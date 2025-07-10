@@ -34,7 +34,6 @@ const gpu_targets = [_]GpuTarget{
 
 test "type system - different integer types" {
     const allocator = std.testing.allocator;
-    // Create a test file with different integer types
     const test_source =
         \\fn add_i32(a: i32, b: i32) i32 {
         \\    return a + b;
@@ -50,7 +49,6 @@ test "type system - different integer types" {
 
 test "type system - tensor gpu add" {
     const allocator = std.testing.allocator;
-    // Create a test file with different integer types
     const test_source =
         \\fn gpu_vector_add(a: [1024]i32, b: [1024]i32) void{
         \\    a[i] = a[i] + b[i];
@@ -67,7 +65,6 @@ test "type system - tensor gpu add" {
 
 test "type system - tensor gpu mul" {
     const allocator = std.testing.allocator;
-    // Create a test file with different integer types
     const test_source =
         \\fn gpu_vector_mul(a: [1024]i32, b: [1024]i32) void{
         \\    a[i] = a[i] * b[i];
@@ -84,7 +81,6 @@ test "type system - tensor gpu mul" {
 
 test "type system - tensor gpu stacked" {
     const allocator = std.testing.allocator;
-    // Create a test file with different integer types
     const test_source =
         \\fn gpu_vector_add(a: [1024]i32, b: [1024]i32) void{
         \\    a[i] = a[i] + b[i];
@@ -105,7 +101,6 @@ test "type system - tensor gpu stacked" {
 
 test "type system - tensor gpu interleaved" {
     const allocator = std.testing.allocator;
-    // Create a test file with different integer types
     const test_source =
         \\fn gpu_vector_add(a: [1024]i32, b: [1024]i32) void{
         \\    a[i] = a[i] + b[i];
@@ -163,7 +158,31 @@ test "reduce - gpu 2D to 1D product" {
     try assertGpuCrossCompiles(allocator, test_source, "test_gpu_reduce_2d_1d_product.toy", 27);
 }
 
+test "write - stdout" {
+    const allocator = std.testing.allocator;
+    const test_source =
+        \\pub fn main() void {
+        \\  write(io.stdout, "Hello world!\n");
+        \\} 
+    ;
+    try assertCrossCompilesStdout(allocator, test_source, "test_cross_stdout.toy", 0, "Hello world!\n");
+}
+
+test "write - file" {
+    const allocator = std.testing.allocator;
+    const test_source =
+        \\pub fn main() void {
+        \\  write(io.file("hello.txt"), "Hello\n");
+        \\} 
+    ;
+    try assertCrossCompiles(allocator, test_source, "test_cross_file.toy", 0);
+    try assertRemoteFile(allocator, "hello.txt", "Hello\n");
+}
+
 fn assertCrossCompiles(allocator: std.mem.Allocator, source: []const u8, filename: []const u8, expected: u32) !void {
+    return assertCrossCompilesStdout(allocator, source, filename, expected, null);
+}
+fn assertCrossCompilesStdout(allocator: std.mem.Allocator, source: []const u8, filename: []const u8, expected: u32, expected_out: ?[]const u8) !void {
     for (targets) |target| {
         const dcc_path = if (builtin.target.os.tag == .windows) "zig-out/bin/dcc.exe" else "zig-out/bin/dcc";
         {
@@ -244,6 +263,9 @@ fn assertCrossCompiles(allocator: std.mem.Allocator, source: []const u8, filenam
                         std.debug.print("stderr: {s}\n", .{out.stderr});
                         return error.UnexpectedExitCode;
                     } else {
+                        if (expected_out) |eout| {
+                            try std.testing.expectEqualStrings(eout, out.stdout);
+                        }
                         std.debug.print("Cross-compiled {s} for target {s} produced correct exit code: {}\n", .{ filename, target.target, out.term.Exited });
                     }
                 },
@@ -351,5 +373,34 @@ fn assertGpuCrossCompiles(allocator: std.mem.Allocator, source: []const u8, file
         //     defer allocator.free(out.stdout);
         //     defer allocator.free(out.stderr);
         // }
+    }
+}
+fn assertRemoteFile(allocator: std.mem.Allocator, filename: []const u8, expected: []const u8) !void {
+    for (targets) |target| {
+        {
+            const remote = try std.fmt.allocPrint(allocator, "{s}:", .{target.remote});
+            defer allocator.free(remote);
+            const out = try process.Child.run(.{ .allocator = allocator, .argv = &.{ "ssh", target.remote, "cat", filename } });
+            defer allocator.free(out.stdout);
+            defer allocator.free(out.stderr);
+            switch (out.term) {
+                .Exited => |term| {
+                    if (term == 255) {
+                        std.debug.print("Skipping host check, host {s} - {s} is unreachable\n", .{ target.remote, target.target });
+                        return;
+                    }
+                    if (term != 0) {
+                        std.debug.print("Failed to SCP\n", .{});
+                        std.debug.print("stdout: {s}\n", .{out.stdout});
+                        std.debug.print("stderr: {s}\n", .{out.stderr});
+                        return error.UnexpectedExitCode;
+                    }
+                    try std.testing.expectEqualStrings(expected, out.stdout);
+                },
+                else => {
+                    return error.UnexpectedExitCode;
+                },
+            }
+        }
     }
 }
