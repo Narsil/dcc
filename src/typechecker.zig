@@ -392,8 +392,8 @@ pub const TypeChecker = struct {
                     if (std.mem.eql(u8, ns.member, "stdout") or 
                         std.mem.eql(u8, ns.member, "stderr") or 
                         std.mem.eql(u8, ns.member, "stdin")) {
-                        // Return a special IO handle type (for now, treat as void pointer)
-                        break :blk parser.Type{ .void = {} };
+                        // Return i64 type for file descriptors (matches syscall expectations)
+                        break :blk parser.Type{ .i64 = {} };
                     }
                 }
                 const pos = self.getNodePosition(node.*);
@@ -404,10 +404,10 @@ pub const TypeChecker = struct {
             .write_expression => |write| blk: {
                 // Type check the handle
                 const handle_type = try self.typeCheckExpression(write.handle);
-                // Accept void type (for io.stdout/stderr) or i32 (file descriptors)
-                if (handle_type != .void and handle_type != .i32) {
+                // Accept i64 type for file descriptors (matches syscall expectations)
+                if (handle_type != .i64 and handle_type != .i32) {
                     const pos = self.getNodePosition(node.*);
-                    std.debug.print("Error at line {}, column {}: First argument to write must be an IO handle (void or i32)\n", .{ pos.line, pos.column });
+                    std.debug.print("Error at line {}, column {}: First argument to write must be an IO handle (i64 or i32)\n", .{ pos.line, pos.column });
                     self.printSourceContext(write.offset);
                     return error.TypeMismatch;
                 }
@@ -487,7 +487,7 @@ pub const TypeChecker = struct {
             .namespace_access => |ns| {
                 // Handle namespace functions like io.file()
                 if (std.mem.eql(u8, ns.namespace, "io") and std.mem.eql(u8, ns.member, "file")) {
-                    // io.file(filename) returns a file descriptor (i32)
+                    // io.file(filename) returns a file descriptor (i64)
                     if (call.arguments.len != 1) {
                         const pos = self.getNodePosition(call.callee.*);
                         std.debug.print("Error at line {}, column {}: io.file() expects exactly 1 argument\n", .{ pos.line, pos.column });
@@ -504,8 +504,8 @@ pub const TypeChecker = struct {
                         return error.InvalidFunctionCall;
                     }
                     
-                    // Return i32 (file descriptor)
-                    return parser.Type.i32;
+                    // Return i64 (file descriptor)
+                    return parser.Type.i64;
                 }
                 
                 const pos = self.getNodePosition(call.callee.*);

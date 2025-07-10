@@ -38,7 +38,9 @@
       "Bash(./tensor_file_write)",
       "Bash(otool:*)",
       "Bash(/Users/nicolas/src/dcc/tensor_file_write:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(./test_io_output)",
+      "Bash(true)"
     ],
     "deny": []
   }

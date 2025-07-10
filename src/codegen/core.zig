@@ -1049,13 +1049,13 @@ pub const CodeGen = struct {
             .namespace_access => |ns| {
                 // Handle io.stdout, io.stderr, io.stdin
                 if (std.mem.eql(u8, ns.namespace, "io")) {
-                    // Return a constant representing the IO handle
+                    // Return a constant representing the IO handle (i64 for syscalls)
                     if (std.mem.eql(u8, ns.member, "stdout")) {
-                        return LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 1, 0);
+                        return LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), 1, 0);
                     } else if (std.mem.eql(u8, ns.member, "stderr")) {
-                        return LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 2, 0);
+                        return LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), 2, 0);
                     } else if (std.mem.eql(u8, ns.member, "stdin")) {
-                        return LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 0, 0);
+                        return LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), 0, 0);
                     }
                 }
                 return error.UndefinedVariable;
@@ -1248,12 +1248,12 @@ pub const CodeGen = struct {
         const O_TRUNC = 0x400; // macOS value, Linux is 0x200
         
         const flags = switch (self.target.os.tag) {
-            .macos => LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), O_WRONLY | O_CREAT | O_TRUNC, 0),
-            .linux => LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), O_WRONLY | 0x40 | 0x200, 0), // Linux values
+            .macos => LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), O_WRONLY | O_CREAT | O_TRUNC, 0),
+            .linux => LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), O_WRONLY | 0x40 | 0x200, 0), // Linux values
             else => return error.UnsupportedOperation,
         };
         
-        const mode = LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 0o644, 0); // rw-r--r--
+        const mode = LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), 0o644, 0); // rw-r--r--
         
         // Platform-specific syscall
         const asm_str = switch (self.target.os.tag) {
@@ -1263,7 +1263,7 @@ pub const CodeGen = struct {
                 else => return error.UnsupportedOperation,
             },
             .linux => switch (self.target.cpu.arch) {
-                .x86_64 => "movq $2, %rax\nsyscall", // open syscall on Linux x86_64
+                .x86_64 => "movq $$2, %rax\nsyscall", // open syscall on Linux x86_64
                 .aarch64 => "mov x8, #56\nsvc #0", // openat syscall on Linux ARM64 (using AT_FDCWD=-100)
                 else => return error.UnsupportedOperation,
             },
@@ -1277,7 +1277,7 @@ pub const CodeGen = struct {
                 else => return error.UnsupportedOperation,
             },
             .linux => switch (self.target.cpu.arch) {
-                .x86_64 => "={rax},{rdi},{rsi},{rdx},~{rax},~{rcx},~{r11}",
+                .x86_64 => "={rax},{rdi},{rsi},{rdx},~{rcx},~{r11}",
                 .aarch64 => "={x0},{x0},{x1},{x2},~{x8}",
                 else => return error.UnsupportedOperation,
             },
@@ -1285,7 +1285,6 @@ pub const CodeGen = struct {
         };
         
         const i64_type = LLVM.LLVMInt64TypeInContext(self.context);
-        const i32_type = LLVM.LLVMInt32TypeInContext(self.context);
         
         // For Linux ARM64, we need to use openat with AT_FDCWD
         var args_buf: [4]LLVM.LLVMValueRef = undefined;
@@ -1337,8 +1336,8 @@ pub const CodeGen = struct {
             "fd"
         );
         
-        // Convert to i32 for consistency with stdout/stderr
-        return LLVM.LLVMBuildTrunc(self.builder, fd, i32_type, "fd_i32");
+        // Return i64 for consistency with syscalls
+        return fd;
     }
 
     fn generatePlatformWriteSyscall(self: *CodeGen, fd: LLVM.LLVMValueRef, buf: LLVM.LLVMValueRef, count: LLVM.LLVMValueRef) CodeGenError!LLVM.LLVMValueRef {
