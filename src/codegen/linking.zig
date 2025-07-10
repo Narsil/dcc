@@ -667,13 +667,26 @@ pub fn generateStartFunction(self: *CodeGen) CodeGenError!void {
     }
     const main_function = main_function_.?;
 
-    // Call main() - main returns i64, need to convert to i32 for exit code
-    const int64_type = LLVM.LLVMInt64TypeInContext(self.context);
-    const main_function_type = LLVM.LLVMFunctionType(int64_type, null, 0, 0);
-    const main_result = LLVM.LLVMBuildCall2(self.builder, main_function_type, main_function, null, 0, "main_result");
-
-    // Convert i64 to i32 for exit code
-    const exit_code = LLVM.LLVMBuildTrunc(self.builder, main_result, i32_type, "exit_code");
+    // Check if main returns void
+    var exit_code: LLVM.LLVMValueRef = undefined;
+    
+    if (self.main_returns_void) {
+        // Call void main function
+        const void_type = LLVM.LLVMVoidTypeInContext(self.context);
+        const main_function_type = LLVM.LLVMFunctionType(void_type, null, 0, 0);
+        _ = LLVM.LLVMBuildCall2(self.builder, main_function_type, main_function, null, 0, "");
+        
+        // Use exit code 0 for void main
+        exit_code = LLVM.LLVMConstInt(i32_type, 0, 0);
+    } else {
+        // Call main that returns i64
+        const int64_type = LLVM.LLVMInt64TypeInContext(self.context);
+        const main_function_type = LLVM.LLVMFunctionType(int64_type, null, 0, 0);
+        const main_result = LLVM.LLVMBuildCall2(self.builder, main_function_type, main_function, null, 0, "main_result");
+        
+        // Convert i64 to i32 for exit code
+        exit_code = LLVM.LLVMBuildTrunc(self.builder, main_result, i32_type, "exit_code");
+    }
 
     // Store the exit code in a global variable for inspection
     const exit_code_global = LLVM.LLVMAddGlobal(self.module, i32_type, "program_exit_code");
@@ -682,6 +695,7 @@ pub fn generateStartFunction(self: *CodeGen) CodeGenError!void {
 
     // --- Exit the process via Linux x86_64 syscall ---
     const void_type = LLVM.LLVMVoidTypeInContext(self.context);
+    const int64_type = LLVM.LLVMInt64TypeInContext(self.context);
     const param_types = [_]LLVM.LLVMTypeRef{int64_type};
     const syscall_asm_ty = LLVM.LLVMFunctionType(void_type, @constCast(&param_types[0]), 1, 0);
     const asm_str = "mov $0, %rdi\n mov $$231, %rax\nsyscall"; // rax=231 (SYS_exit_group), rdi=status

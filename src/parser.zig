@@ -18,6 +18,7 @@ pub const Type = union(enum) {
 
     // Special types
     void,
+    io_handle,
 
     // Tensor types
     tensor: TensorType,
@@ -83,6 +84,7 @@ pub const Type = union(enum) {
         if (std.mem.eql(u8, type_str, "f32")) return Type.f32;
         if (std.mem.eql(u8, type_str, "f64")) return Type.f64;
         if (std.mem.eql(u8, type_str, "void")) return Type.void;
+        if (std.mem.eql(u8, type_str, "io_handle")) return Type.io_handle;
         return null;
     }
 
@@ -99,6 +101,7 @@ pub const Type = union(enum) {
             .f32 => "f32",
             .f64 => "f64",
             .void => "void",
+            .io_handle => "io_handle",
             .tensor => |tensor_type| {
                 // Format as [dim1, dim2, ...]element_type
                 var result = std.ArrayList(u8).init(std.heap.page_allocator);

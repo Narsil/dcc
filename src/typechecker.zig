@@ -392,8 +392,8 @@ pub const TypeChecker = struct {
                     if (std.mem.eql(u8, ns.member, "stdout") or 
                         std.mem.eql(u8, ns.member, "stderr") or 
                         std.mem.eql(u8, ns.member, "stdin")) {
-                        // Return i64 type for file descriptors (matches syscall expectations)
-                        break :blk parser.Type{ .i64 = {} };
+                        // Return io_handle type
+                        break :blk parser.Type{ .io_handle = {} };
                     }
                 }
                 const pos = self.getNodePosition(node.*);
@@ -404,10 +404,10 @@ pub const TypeChecker = struct {
             .write_expression => |write| blk: {
                 // Type check the handle
                 const handle_type = try self.typeCheckExpression(write.handle);
-                // Accept i64 type for file descriptors (matches syscall expectations)
-                if (handle_type != .i64 and handle_type != .i32) {
+                // Accept io_handle type
+                if (handle_type != .io_handle) {
                     const pos = self.getNodePosition(node.*);
-                    std.debug.print("Error at line {}, column {}: First argument to write must be an IO handle (i64 or i32)\n", .{ pos.line, pos.column });
+                    std.debug.print("Error at line {}, column {}: First argument to write must be an IO handle\n", .{ pos.line, pos.column });
                     self.printSourceContext(write.offset);
                     return error.TypeMismatch;
                 }
@@ -421,8 +421,8 @@ pub const TypeChecker = struct {
             .read_expression => |read| blk: {
                 // Type check the handle
                 const handle_type = try self.typeCheckExpression(read.handle);
-                // For now, accept void type as IO handle
-                if (handle_type != .void) {
+                // Accept io_handle type
+                if (handle_type != .io_handle) {
                     const pos = self.getNodePosition(node.*);
                     std.debug.print("Error at line {}, column {}: First argument to read must be an IO handle\n", .{ pos.line, pos.column });
                     self.printSourceContext(read.offset);
@@ -487,10 +487,10 @@ pub const TypeChecker = struct {
             .namespace_access => |ns| {
                 // Handle namespace functions like io.file()
                 if (std.mem.eql(u8, ns.namespace, "io") and std.mem.eql(u8, ns.member, "file")) {
-                    // io.file(filename) returns a file descriptor (i64)
-                    if (call.arguments.len != 1) {
+                    // io.file(filename) or io.file(filename, start, end)
+                    if (call.arguments.len != 1 and call.arguments.len != 3) {
                         const pos = self.getNodePosition(call.callee.*);
-                        std.debug.print("Error at line {}, column {}: io.file() expects exactly 1 argument\n", .{ pos.line, pos.column });
+                        std.debug.print("Error at line {}, column {}: io.file() expects 1 or 3 arguments\n", .{ pos.line, pos.column });
                         self.printSourceContext(ns.offset);
                         return error.InvalidFunctionCall;
                     }
@@ -499,13 +499,33 @@ pub const TypeChecker = struct {
                     _ = try self.typeCheckExpression(&call.arguments[0]);
                     if (call.arguments[0] != .string_literal) {
                         const pos = self.getNodePosition(call.arguments[0]);
-                        std.debug.print("Error at line {}, column {}: io.file() expects a string literal argument\n", .{ pos.line, pos.column });
+                        std.debug.print("Error at line {}, column {}: io.file() expects a string literal as first argument\n", .{ pos.line, pos.column });
                         self.printSourceContext(self.getNodeOffset(call.arguments[0]));
                         return error.InvalidFunctionCall;
                     }
                     
-                    // Return i64 (file descriptor)
-                    return parser.Type.i64;
+                    // If 3 arguments, type check start and end offsets (should be i64)
+                    if (call.arguments.len == 3) {
+                        const start_type = try self.typeCheckExpression(&call.arguments[1]);
+                        const end_type = try self.typeCheckExpression(&call.arguments[2]);
+                        
+                        if (start_type != .i64) {
+                            const pos = self.getNodePosition(call.arguments[1]);
+                            std.debug.print("Error at line {}, column {}: Start offset must be i64\n", .{ pos.line, pos.column });
+                            self.printSourceContext(self.getNodeOffset(call.arguments[1]));
+                            return error.InvalidFunctionCall;
+                        }
+                        
+                        if (end_type != .i64) {
+                            const pos = self.getNodePosition(call.arguments[2]);
+                            std.debug.print("Error at line {}, column {}: End offset must be i64\n", .{ pos.line, pos.column });
+                            self.printSourceContext(self.getNodeOffset(call.arguments[2]));
+                            return error.InvalidFunctionCall;
+                        }
+                    }
+                    
+                    // Return io_handle type
+                    return parser.Type.io_handle;
                 }
                 
                 const pos = self.getNodePosition(call.callee.*);
@@ -573,12 +593,12 @@ pub const TypeChecker = struct {
     fn isNumericType(_: *TypeChecker, t: parser.Type) bool {
         return switch (t) {
             .u8, .u16, .u32, .u64, .i8, .i16, .i32, .i64, .f32, .f64 => true,
-            .void => false,
+            .void, .io_handle => false,
             .tensor => |tensor_type| {
                 // A tensor is numeric if its element type is numeric
                 return switch (tensor_type.element_type.*) {
                     .u8, .u16, .u32, .u64, .i8, .i16, .i32, .i64, .f32, .f64 => true,
-                    .void => false,
+                    .void, .io_handle => false,
                     .tensor => false, // Nested tensors are not considered numeric for operations
                 };
             },
@@ -1048,6 +1068,7 @@ pub const TypeChecker = struct {
             .f32 => std.debug.print("f32", .{}),
             .f64 => std.debug.print("f64", .{}),
             .void => std.debug.print("void", .{}),
+            .io_handle => std.debug.print("io_handle", .{}),
             .tensor => |tensor_type| {
                 std.debug.print("[", .{});
                 for (tensor_type.shape, 0..) |dim, i| {
@@ -1067,6 +1088,7 @@ pub const TypeChecker = struct {
                     .f32 => std.debug.print("f32", .{}),
                     .f64 => std.debug.print("f64", .{}),
                     .void => std.debug.print("void", .{}),
+                    .io_handle => std.debug.print("io_handle", .{}),
                     .tensor => std.debug.print("tensor", .{}),
                 }
             },

@@ -207,7 +207,9 @@ fn assertCrossCompilesStdout(allocator: std.mem.Allocator, source: []const u8, f
                     }
                 },
                 else => {
-                    std.debug.print("Integer types test terminated abnormally\n", .{});
+                    std.debug.print("Compilation failed:", .{});
+                    std.debug.print("stdout: {s}", .{out.stdout});
+                    std.debug.print("stderr: {s}", .{out.stderr});
                     return error.CompilationFailed;
                 },
             }

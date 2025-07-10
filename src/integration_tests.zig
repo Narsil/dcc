@@ -22,7 +22,7 @@ test "io stdout - simple" {
 
     const test_source =
         \\pub fn main() void {
-        \\    write(io.stdout, "Hello word!");
+        \\    write(io.stdout, "Hello world!");
         \\}
     ;
 
@@ -37,7 +37,7 @@ test "io stdout - escape chars" {
 
     const test_source =
         \\pub fn main() i32 {
-        \\    write(io.stdout, "Hello word!\n");
+        \\    write(io.stdout, "Hello world!\n");
         \\    return 0i32;
         \\}
     ;
@@ -65,6 +65,41 @@ test "io file write - tensor data" {
     const expected_data = &[_]u8{ 0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x80, 0x3f };
     try assertFileContains(allocator, "test_tensor_out.dat", expected_data);
     std.debug.print("Tensor file write test passed\n", .{});
+}
+
+test "io file read - tensor data" {
+    const allocator = std.testing.allocator;
+
+    const test_source =
+        \\pub fn main() void {
+        \\    let a: [4]f32 = [4]f32{1f32};
+        \\    write(io.file("test_tensor_out.dat"), a);
+        \\    let b: [4]f32 = read(io.file("test_tensor_out.dat", 0i64, 16i64), [4]f32);
+        \\    write(io.stdout, b[0]);
+        \\}
+    ;
+
+    try assertCompiles(allocator, test_source, "test_tensor_file_read.toy");
+    try assertExpectStdout(allocator, "test_tensor_file_read.toy", "\x00\x00\x80\x3f", 0);
+    std.debug.print("Tensor file read test passed\n", .{});
+}
+
+test "io file read - float data" {
+    const allocator = std.testing.allocator;
+
+    const test_source =
+        \\pub fn main() void {
+        \\    let a: [4]f32 = [4]f32{1f32};
+        \\    write(io.file("test_tensor_out.dat"), a);
+        \\    let b: [4]f32 = read(io.file("test_tensor_out.dat", 0i64, 16i64), [4]f32);
+        \\    let c: f32 = reduce(b[i], +);
+        \\    write(io.stdout, c);
+        \\}
+    ;
+
+    try assertCompiles(allocator, test_source, "test_tensor_file_read.toy");
+    try assertExpectStdout(allocator, "test_tensor_file_read.toy", "\x00\x00\x80\x3f", 0);
+    std.debug.print("Tensor file read test passed\n", .{});
 }
 
 test "type system - used variable compiles" {
@@ -1257,9 +1292,7 @@ fn assertExpectStdout(allocator: std.mem.Allocator, filename: []const u8, expect
                 return error.UnexpectedExitCode;
             } else {
                 if (expected_out) |eout| {
-                    if (std.mem.indexOf(u8, out.stdout, eout) == 0) {
-                        std.debug.print("Missing output {s} in full output:\n{s}", .{ eout, out.stdout });
-                    }
+                    try std.testing.expectEqualStrings(eout, out.stdout);
                 }
                 std.debug.print("Compiled {s} produced correct exit code: {}\n", .{ filename, out.term.Exited });
             }

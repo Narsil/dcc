@@ -40,7 +40,12 @@
       "Bash(/Users/nicolas/src/dcc/tensor_file_write:*)",
       "Bash(python3:*)",
       "Bash(./test_io_output)",
-      "Bash(true)"
+      "Bash(true)",
+      "Bash(./test_void_main)",
+      "Bash(lldb:*)",
+      "Bash(./verify_exit_code)",
+      "Bash(./test_write_tensor)",
+      "Bash(od:*)"
     ],
     "deny": []
   }

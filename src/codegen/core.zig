@@ -16,7 +16,7 @@ pub const LLVM = @cImport({
     @cInclude("llvm-c/Object.h");
 });
 
-pub const CodeGenError = error{ InvalidTopLevelNode, InvalidStatement, InvalidExpression, InvalidCallee, UndefinedVariable, UndefinedFunction, TargetError, CodeGenError, MainFunctionNotFound, MissingMainFunction, LinkingFailed, GpuCompilationNotImplemented, InvalidGpuTriplet, InvalidTargetTriple, InvalidCharacter, Overflow, CudaFunctionNotFound, CudaStubInitFailed, UnsupportedOperation, InvalidArguments, UnsupportedNamespaceFunction, UnsupportedWriteData, UnsupportedTensorElementType } || std.mem.Allocator.Error;
+pub const CodeGenError = error{ InvalidTopLevelNode, InvalidStatement, InvalidExpression, InvalidCallee, UndefinedVariable, UndefinedFunction, TargetError, CodeGenError, MainFunctionNotFound, MissingMainFunction, LinkingFailed, GpuCompilationNotImplemented, InvalidGpuTriplet, InvalidTargetTriple, InvalidCharacter, Overflow, CudaFunctionNotFound, CudaStubInitFailed, UnsupportedOperation, InvalidArguments, UnsupportedNamespaceFunction, UnsupportedWriteData, UnsupportedTensorElementType, UnsupportedArchitecture, UnsupportedOS } || std.mem.Allocator.Error;
 
 const VarInfo = struct {
     alloca: LLVM.LLVMValueRef,
@@ -65,6 +65,7 @@ pub const CodeGen = struct {
     reduction_info: ?std.AutoHashMap(*parser.ASTNode, typechecker.ReductionInfo),
     string_counter: u32,
     target: std.Target,
+    main_returns_void: bool,
 
     pub fn init(allocator: std.mem.Allocator, module_name: []const u8, verbose: bool, target: std.Target, gpu_target: ?std.Target) !CodeGen {
         // Initialize LLVM X86 target (for x86_64 support)
@@ -114,6 +115,7 @@ pub const CodeGen = struct {
             .reduction_info = null,
             .string_counter = 0,
             .target = target,
+            .main_returns_void = false,
         };
     }
 
@@ -172,6 +174,7 @@ pub const CodeGen = struct {
             .f32 => LLVM.LLVMFloatTypeInContext(self.context),
             .f64 => LLVM.LLVMDoubleTypeInContext(self.context),
             .void => LLVM.LLVMVoidTypeInContext(self.context),
+            .io_handle => LLVM.LLVMInt64TypeInContext(self.context), // IO handles are represented as i64 file descriptors
             .tensor => |tensor_type| {
                 // For now, create a simple array type
                 // In a full implementation, we'd want to handle multi-dimensional arrays properly
@@ -342,6 +345,11 @@ pub const CodeGen = struct {
 
         try self.functions.put(try self.allocator.dupe(u8, func.name), llvm_function);
 
+        // Track if main returns void
+        if (std.mem.eql(u8, func.name, "main") and func.return_type == .void) {
+            self.main_returns_void = true;
+        }
+
         if (self.verbose) {
             std.debug.print("🔧 Declared function signature: {s}\n", .{func.name});
         }
@@ -430,7 +438,14 @@ pub const CodeGen = struct {
         if (terminator == null) {
             // No terminator found, add appropriate return based on function type
             if (func.return_type == .void) {
-                _ = LLVM.LLVMBuildRetVoid(self.builder);
+                // For void main on platforms without _start, generate exit syscall
+                if (is_main and self.target.os.tag != .linux) {
+                    const exit_code = LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), 0, 0);
+                    try self.generateExitSyscall(exit_code);
+                    _ = LLVM.LLVMBuildUnreachable(self.builder);
+                } else {
+                    _ = LLVM.LLVMBuildRetVoid(self.builder);
+                }
             } else {
                 // For non-void functions without explicit return, this is an error
                 // that should have been caught by the type checker, but add a default return
@@ -458,9 +473,20 @@ pub const CodeGen = struct {
 
         const alloca = LLVM.LLVMBuildAlloca(self.builder, var_type, name_z.ptr);
         LLVM.LLVMSetAlignment(alloca, 16); // 16-byte alignment for x86-64 System V ABI
-        const value = try self.generateExpression(var_decl.value.*);
-        const store_inst = LLVM.LLVMBuildStore(self.builder, value, alloca);
-        LLVM.LLVMSetAlignment(store_inst, 16); // Match alloca alignment
+        
+        // Check if the value is a read expression, which returns a pointer to allocated memory
+        if (var_decl.value.* == .read_expression) {
+            // Read expression returns a pointer to the read data
+            const read_ptr = try self.generateExpression(var_decl.value.*);
+            // Load the value from the pointer
+            const loaded_value = LLVM.LLVMBuildLoad2(self.builder, var_type, read_ptr, "read_load");
+            const store_inst = LLVM.LLVMBuildStore(self.builder, loaded_value, alloca);
+            LLVM.LLVMSetAlignment(store_inst, 16);
+        } else {
+            const value = try self.generateExpression(var_decl.value.*);
+            const store_inst = LLVM.LLVMBuildStore(self.builder, value, alloca);
+            LLVM.LLVMSetAlignment(store_inst, 16); // Match alloca alignment
+        }
 
         try self.variables.put(try self.allocator.dupe(u8, var_decl.name), VarInfo{ .alloca = alloca, .ty = var_decl.type });
     }
@@ -497,7 +523,14 @@ pub const CodeGen = struct {
                 try gpu.freeAllocatedGpuMemory(self);
                 try gpu.injectCudaCleanupBeforeReturn(self);
             }
-            _ = LLVM.LLVMBuildRetVoid(self.builder);
+            // For void main on platforms without _start, generate exit syscall
+            if (is_main and self.target.os.tag != .linux) {
+                const exit_code = LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), 0, 0);
+                try self.generateExitSyscall(exit_code);
+                _ = LLVM.LLVMBuildUnreachable(self.builder);
+            } else {
+                _ = LLVM.LLVMBuildRetVoid(self.builder);
+            }
         }
     }
 
@@ -728,16 +761,39 @@ pub const CodeGen = struct {
                 switch (call.callee.*) {
                     .namespace_access => |ns| {
                         if (std.mem.eql(u8, ns.namespace, "io") and std.mem.eql(u8, ns.member, "file")) {
-                            // io.file("filename") - open a file
-                            if (call.arguments.len != 1) {
+                            // io.file("filename") or io.file("filename", start, end)
+                            if (call.arguments.len == 0 or call.arguments.len > 3) {
                                 return error.InvalidArguments;
                             }
                             
                             // Get the filename argument
                             const filename_arg = try self.generateExpression(call.arguments[0]);
                             
-                            // Generate file open syscall
-                            return try self.generateFileOpen(filename_arg);
+                            // For write operations, open the file for writing
+                            if (call.arguments.len == 1) {
+                                return try self.generateFileOpenForWrite(filename_arg);
+                            }
+                            
+                            // For read operations with byte range, return a file handle struct
+                            // containing fd, start, and end offsets
+                            const start_offset = try self.generateExpression(call.arguments[1]);
+                            const end_offset = try self.generateExpression(call.arguments[2]);
+                            
+                            // Create a struct to hold file info {fd, start, end}
+                            const i64_type = LLVM.LLVMInt64TypeInContext(self.context);
+                            const field_types = [_]LLVM.LLVMTypeRef{ i64_type, i64_type, i64_type };
+                            const file_info_type = LLVM.LLVMStructTypeInContext(self.context, @constCast(&field_types[0]), 3, 0);
+                            
+                            // Open the file
+                            const fd = try self.generateFileOpen(filename_arg);
+                            
+                            // Create the struct
+                            var file_info = LLVM.LLVMGetUndef(file_info_type);
+                            file_info = LLVM.LLVMBuildInsertValue(self.builder, file_info, fd, 0, "set_fd");
+                            file_info = LLVM.LLVMBuildInsertValue(self.builder, file_info, start_offset, 1, "set_start");
+                            file_info = LLVM.LLVMBuildInsertValue(self.builder, file_info, end_offset, 2, "set_end");
+                            
+                            return file_info;
                         }
                         return error.UnsupportedNamespaceFunction;
                     },
@@ -1076,6 +1132,26 @@ pub const CodeGen = struct {
                         }
                         return error.UndefinedVariable;
                     },
+                    .tensor_slice => |slice| blk: {
+                        // For tensor slices like b[0], get the element type
+                        const tensor_value = try self.generateExpression(slice.tensor.*);
+                        _ = tensor_value;
+                        
+                        // Get the tensor type from the identifier
+                        if (slice.tensor.* == .identifier) {
+                            if (self.variables.get(slice.tensor.identifier.name)) |var_info| {
+                                if (var_info.ty == .tensor) {
+                                    // Return the element type of the tensor
+                                    break :blk var_info.ty.tensor.element_type.*;
+                                }
+                            }
+                        }
+                        return error.UnsupportedWriteData;
+                    },
+                    .number_literal => |num| blk: {
+                        // Determine type from the number literal
+                        break :blk num.type;
+                    },
                     else => return error.UnsupportedWriteData,
                 };
                 
@@ -1131,19 +1207,96 @@ pub const CodeGen = struct {
                 return LLVM.LLVMConstInt(LLVM.LLVMInt32TypeInContext(self.context), 0, 0);
             },
             .read_expression => |read| {
-                // For now, just return a dummy value
-                // In a real implementation, we'd use read() system call
-                _ = try self.generateExpression(read.handle.*);
+                // Generate the handle expression
+                const handle = try self.generateExpression(read.handle.*);
                 
-                // Return a zero value of the requested type
+                // Allocate memory for the result
                 const llvm_type = self.toLLVMType(read.read_type);
-                if (read.read_type == .tensor) {
-                    // For tensors, allocate and return pointer
-                    const alloca = LLVM.LLVMBuildAlloca(self.builder, llvm_type, "read_tensor");
-                    return alloca;
+                const result_alloca = LLVM.LLVMBuildAlloca(self.builder, llvm_type, "read_result");
+                
+                // Calculate the size in bytes for the requested type
+                const i64_type = LLVM.LLVMInt64TypeInContext(self.context);
+                const size_bytes = switch (read.read_type) {
+                    .tensor => blk: {
+                        const tensor_type = read.read_type.tensor;
+                        const element_size: u64 = switch (tensor_type.element_type.*) {
+                            .f32 => 4,
+                            .f64 => 8,
+                            .i32, .u32 => 4,
+                            .i64, .u64 => 8,
+                            .i16, .u16 => 2,
+                            .i8, .u8 => 1,
+                            else => return error.UnsupportedTensorElementType,
+                        };
+                        const total_elements = tensor_type.total_elements();
+                        const total_bytes = total_elements * element_size;
+                        break :blk LLVM.LLVMConstInt(i64_type, total_bytes, 0);
+                    },
+                    .f32 => LLVM.LLVMConstInt(i64_type, 4, 0),
+                    .f64 => LLVM.LLVMConstInt(i64_type, 8, 0),
+                    .i32, .u32 => LLVM.LLVMConstInt(i64_type, 4, 0),
+                    .i64, .u64 => LLVM.LLVMConstInt(i64_type, 8, 0),
+                    .i16, .u16 => LLVM.LLVMConstInt(i64_type, 2, 0),
+                    .i8, .u8 => LLVM.LLVMConstInt(i64_type, 1, 0),
+                    else => return error.UnsupportedWriteData,
+                };
+                
+                // Check if handle is a file info struct (fd, start, end)
+                const handle_type = LLVM.LLVMTypeOf(handle);
+                if (LLVM.LLVMGetTypeKind(handle_type) == LLVM.LLVMStructTypeKind and
+                    LLVM.LLVMCountStructElementTypes(handle_type) == 3) {
+                    // Extract fd, start, and end from the struct
+                    const fd = LLVM.LLVMBuildExtractValue(self.builder, handle, 0, "extract_fd");
+                    const start_offset = LLVM.LLVMBuildExtractValue(self.builder, handle, 1, "extract_start");
+                    const end_offset = LLVM.LLVMBuildExtractValue(self.builder, handle, 2, "extract_end");
+                    
+                    // Calculate expected size from byte range
+                    const expected_size = LLVM.LLVMBuildSub(self.builder, end_offset, start_offset, "expected_size");
+                    
+                    // Validate that the expected size matches the type size
+                    const size_match = LLVM.LLVMBuildICmp(self.builder, LLVM.LLVMIntEQ, expected_size, size_bytes, "size_match");
+                    
+                    // Create basic blocks for size validation
+                    const current_func = LLVM.LLVMGetBasicBlockParent(LLVM.LLVMGetInsertBlock(self.builder));
+                    const valid_block = LLVM.LLVMAppendBasicBlockInContext(self.context, current_func, "size_valid");
+                    const invalid_block = LLVM.LLVMAppendBasicBlockInContext(self.context, current_func, "size_invalid");
+                    const continue_block = LLVM.LLVMAppendBasicBlockInContext(self.context, current_func, "read_continue");
+                    
+                    _ = LLVM.LLVMBuildCondBr(self.builder, size_match, valid_block, invalid_block);
+                    
+                    // Invalid size block - print error and exit
+                    LLVM.LLVMPositionBuilderAtEnd(self.builder, invalid_block);
+                    // TODO: Better error handling - for now just exit with error code
+                    const exit_code = LLVM.LLVMConstInt(i64_type, 1, 0);
+                    try self.generateExitSyscall(exit_code);
+                    _ = LLVM.LLVMBuildUnreachable(self.builder);
+                    
+                    // Valid size block - perform the read
+                    LLVM.LLVMPositionBuilderAtEnd(self.builder, valid_block);
+                    
+                    // Generate lseek to set file position
+                    try self.generateLseekSyscall(fd, start_offset);
+                    
+                    // Cast result pointer to i8* for read syscall
+                    const i8_ptr_type = LLVM.LLVMPointerType(LLVM.LLVMInt8TypeInContext(self.context), 0);
+                    const buffer_ptr = LLVM.LLVMBuildBitCast(self.builder, result_alloca, i8_ptr_type, "buffer_ptr");
+                    
+                    // Generate read syscall
+                    try self.generateReadSyscall(fd, buffer_ptr, size_bytes);
+                    
+                    _ = LLVM.LLVMBuildBr(self.builder, continue_block);
+                    
+                    // Continue block
+                    LLVM.LLVMPositionBuilderAtEnd(self.builder, continue_block);
                 } else {
-                    return LLVM.LLVMConstNull(llvm_type);
+                    // Simple file descriptor - read from current position
+                    const i8_ptr_type = LLVM.LLVMPointerType(LLVM.LLVMInt8TypeInContext(self.context), 0);
+                    const buffer_ptr = LLVM.LLVMBuildBitCast(self.builder, result_alloca, i8_ptr_type, "buffer_ptr");
+                    try self.generateReadSyscall(handle, buffer_ptr, size_bytes);
                 }
+                
+                // Return the pointer to the allocated memory
+                return result_alloca;
             },
             else => return error.InvalidExpression,
         }
@@ -1242,14 +1395,27 @@ pub const CodeGen = struct {
     }
 
     fn generateFileOpen(self: *CodeGen, filename: LLVM.LLVMValueRef) CodeGenError!LLVM.LLVMValueRef {
+        return self.generateFileOpenWithMode(filename, false);
+    }
+    
+    fn generateFileOpenForWrite(self: *CodeGen, filename: LLVM.LLVMValueRef) CodeGenError!LLVM.LLVMValueRef {
+        return self.generateFileOpenWithMode(filename, true);
+    }
+    
+    fn generateFileOpenWithMode(self: *CodeGen, filename: LLVM.LLVMValueRef, for_write: bool) CodeGenError!LLVM.LLVMValueRef {
         // Generate platform-specific open syscall
+        const O_RDONLY = 0;
         const O_WRONLY = 1;
         const O_CREAT = 0x200; // macOS value, Linux is 0x40
         const O_TRUNC = 0x400; // macOS value, Linux is 0x200
         
-        const flags = switch (self.target.os.tag) {
+        const flags = if (for_write) switch (self.target.os.tag) {
             .macos => LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), O_WRONLY | O_CREAT | O_TRUNC, 0),
             .linux => LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), O_WRONLY | 0x40 | 0x200, 0), // Linux values
+            else => return error.UnsupportedOperation,
+        } else switch (self.target.os.tag) {
+            .macos => LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), O_RDONLY, 0),
+            .linux => LLVM.LLVMConstInt(LLVM.LLVMInt64TypeInContext(self.context), O_RDONLY, 0),
             else => return error.UnsupportedOperation,
         };
         
@@ -1400,6 +1566,184 @@ pub const CodeGen = struct {
         
         const args = [_]LLVM.LLVMValueRef{ fd, buf, count };
         return LLVM.LLVMBuildCall2(self.builder, asm_type, asm_value, @constCast(&args[0]), args.len, "syscall_result");
+    }
+
+    fn generateExitSyscall(self: *CodeGen, exit_code: LLVM.LLVMValueRef) CodeGenError!void {
+        // Generate platform-specific exit syscall using inline assembly
+        const target = self.target;
+        
+        // Platform-specific syscall implementation
+        const asm_str = switch (target.os.tag) {
+            .macos => switch (target.cpu.arch) {
+                .aarch64 => "mov x16, #1\nmov x0, $0\nsvc #0x80", // macOS ARM64
+                .x86_64 => "movq $$0x2000001, %rax\nmovq $0, %rdi\nsyscall", // macOS x86_64 (AT&T syntax)
+                else => return error.UnsupportedArchitecture,
+            },
+            .linux => switch (target.cpu.arch) {
+                .x86_64 => "movq $$60, %rax\nmovq $0, %rdi\nsyscall", // Linux x86_64 exit syscall (AT&T syntax)
+                .aarch64 => "mov x8, #93\nmov x0, $0\nsvc #0", // Linux ARM64 exit syscall
+                else => return error.UnsupportedArchitecture,
+            },
+            else => return error.UnsupportedOS,
+        };
+
+        const constraints = switch (target.os.tag) {
+            .macos => switch (target.cpu.arch) {
+                .aarch64 => "r", // register operand
+                .x86_64 => "r", // register operand
+                else => return error.UnsupportedArchitecture,
+            },
+            .linux => switch (target.cpu.arch) {
+                .x86_64 => "r", // register operand
+                .aarch64 => "r", // register operand
+                else => return error.UnsupportedArchitecture,
+            },
+            else => return error.UnsupportedOS,
+        };
+
+        // Create inline assembly type - exit doesn't return
+        const void_type = LLVM.LLVMVoidTypeInContext(self.context);
+        const i64_type = LLVM.LLVMInt64TypeInContext(self.context);
+        const param_types = [_]LLVM.LLVMTypeRef{i64_type};
+        const asm_type = LLVM.LLVMFunctionType(void_type, @constCast(&param_types[0]), 1, 0);
+        
+        const asm_value = LLVM.LLVMGetInlineAsm(
+            asm_type,
+            @as([*c]const u8, @ptrCast(asm_str)),
+            asm_str.len,
+            @as([*c]const u8, @ptrCast(constraints)),
+            constraints.len,
+            1, // hasSideEffects
+            0, // isAlignStack
+            LLVM.LLVMInlineAsmDialectATT,
+            0, // canThrow
+        );
+        
+        const args = [_]LLVM.LLVMValueRef{ exit_code };
+        _ = LLVM.LLVMBuildCall2(self.builder, asm_type, asm_value, @constCast(&args[0]), args.len, "");
+    }
+
+    fn generateReadSyscall(self: *CodeGen, fd: LLVM.LLVMValueRef, buf: LLVM.LLVMValueRef, count: LLVM.LLVMValueRef) CodeGenError!void {
+        const i64_type = LLVM.LLVMInt64TypeInContext(self.context);
+        
+        // Platform-specific syscall implementation
+        const asm_str = switch (self.target.os.tag) {
+            .macos => switch (self.target.cpu.arch) {
+                .aarch64 => "mov x16, #3\nsvc #0x80", // macOS ARM64 read syscall
+                .x86_64 => "movq $$0x2000003, %rax\nsyscall", // macOS x86_64 read syscall (AT&T syntax)
+                else => return error.UnsupportedArchitecture,
+            },
+            .linux => switch (self.target.cpu.arch) {
+                .x86_64 => "movq $$0, %rax\nsyscall", // Linux x86_64 read syscall (AT&T syntax)
+                .aarch64 => "mov x8, #63\nsvc #0", // Linux ARM64 read syscall
+                else => return error.UnsupportedArchitecture,
+            },
+            else => return error.UnsupportedOS,
+        };
+        
+        const constraints = switch (self.target.os.tag) {
+            .macos => switch (self.target.cpu.arch) {
+                .aarch64 => "={x0},{x0},{x1},{x2},~{x16},~{memory}",
+                .x86_64 => "={rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}",
+                else => unreachable,
+            },
+            .linux => switch (self.target.cpu.arch) {
+                .x86_64 => "={rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}",
+                .aarch64 => "={x0},{x0},{x1},{x2},~{x8},~{memory}",
+                else => unreachable,
+            },
+            else => unreachable,
+        };
+        
+        // Create inline assembly type
+        var asm_param_types = [_]LLVM.LLVMTypeRef{ 
+            i64_type, // fd
+            LLVM.LLVMPointerType(LLVM.LLVMInt8TypeInContext(self.context), 0), // buf
+            i64_type  // count
+        };
+        const asm_type = LLVM.LLVMFunctionType(
+            i64_type, // return type (bytes read)
+            &asm_param_types,
+            3,
+            0,
+        );
+        
+        const asm_value = LLVM.LLVMGetInlineAsm(
+            asm_type,
+            @as([*c]const u8, @ptrCast(asm_str)),
+            asm_str.len,
+            @as([*c]const u8, @ptrCast(constraints)),
+            constraints.len,
+            1, // hasSideEffects
+            0, // isAlignStack
+            LLVM.LLVMInlineAsmDialectATT,
+            0, // canThrow
+        );
+        
+        const args = [_]LLVM.LLVMValueRef{ fd, buf, count };
+        _ = LLVM.LLVMBuildCall2(self.builder, asm_type, asm_value, @constCast(&args[0]), args.len, "read_result");
+    }
+
+    fn generateLseekSyscall(self: *CodeGen, fd: LLVM.LLVMValueRef, offset: LLVM.LLVMValueRef) CodeGenError!void {
+        const i64_type = LLVM.LLVMInt64TypeInContext(self.context);
+        const SEEK_SET = LLVM.LLVMConstInt(i64_type, 0, 0); // SEEK_SET = 0
+        
+        // Platform-specific syscall implementation
+        const asm_str = switch (self.target.os.tag) {
+            .macos => switch (self.target.cpu.arch) {
+                .aarch64 => "mov x16, #199\nsvc #0x80", // macOS ARM64 lseek syscall
+                .x86_64 => "movq $$0x20000C7, %rax\nsyscall", // macOS x86_64 lseek syscall (AT&T syntax)
+                else => return error.UnsupportedArchitecture,
+            },
+            .linux => switch (self.target.cpu.arch) {
+                .x86_64 => "movq $$8, %rax\nsyscall", // Linux x86_64 lseek syscall (AT&T syntax)
+                .aarch64 => "mov x8, #62\nsvc #0", // Linux ARM64 lseek syscall
+                else => return error.UnsupportedArchitecture,
+            },
+            else => return error.UnsupportedOS,
+        };
+        
+        const constraints = switch (self.target.os.tag) {
+            .macos => switch (self.target.cpu.arch) {
+                .aarch64 => "={x0},{x0},{x1},{x2},~{x16}",
+                .x86_64 => "={rax},{rdi},{rsi},{rdx},~{rcx},~{r11}",
+                else => unreachable,
+            },
+            .linux => switch (self.target.cpu.arch) {
+                .x86_64 => "={rax},{rdi},{rsi},{rdx},~{rcx},~{r11}",
+                .aarch64 => "={x0},{x0},{x1},{x2},~{x8}",
+                else => unreachable,
+            },
+            else => unreachable,
+        };
+        
+        // Create inline assembly type
+        var asm_param_types = [_]LLVM.LLVMTypeRef{ 
+            i64_type, // fd
+            i64_type, // offset
+            i64_type  // whence (SEEK_SET)
+        };
+        const asm_type = LLVM.LLVMFunctionType(
+            i64_type, // return type (new offset)
+            &asm_param_types,
+            3,
+            0,
+        );
+        
+        const asm_value = LLVM.LLVMGetInlineAsm(
+            asm_type,
+            @as([*c]const u8, @ptrCast(asm_str)),
+            asm_str.len,
+            @as([*c]const u8, @ptrCast(constraints)),
+            constraints.len,
+            1, // hasSideEffects
+            0, // isAlignStack
+            LLVM.LLVMInlineAsmDialectATT,
+            0, // canThrow
+        );
+        
+        const args = [_]LLVM.LLVMValueRef{ fd, offset, SEEK_SET };
+        _ = LLVM.LLVMBuildCall2(self.builder, asm_type, asm_value, @constCast(&args[0]), args.len, "lseek_result");
     }
 
     /// Generate an optimized GPU function call with explicit memory management
