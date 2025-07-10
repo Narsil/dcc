@@ -22,6 +22,8 @@ pub const TypeCheckError = error{
     UnusedVariable,
     UnusedFunction,
     MainMustBePublic,
+    InvalidEmbeddingIndex,
+    InvalidEmbeddingTensor,
 } || std.mem.Allocator.Error;
 
 pub const FunctionInfo = struct {
@@ -675,6 +677,71 @@ pub const TypeChecker = struct {
             return error.TargetMustBeTensor;
         }
 
+        // Special case: if we have a single index that's an existing tensor variable,
+        // this is an embedding operation
+        if (tensor_index.implicit_indices.len == 1) {
+            const index_name = tensor_index.implicit_indices[0];
+            if (self.variables.getPtr(index_name)) |var_info| {
+                // Check if the index is a tensor
+                if (var_info.type == .tensor) {
+                    // Mark the index variable as used
+                    var_info.used = true;
+                    // This is an embedding operation!
+                    // The index tensor must be 1D with integer elements
+                    const index_tensor = var_info.type.tensor;
+                    if (index_tensor.rank() != 1) {
+                        const pos = self.getNodePosition(tensor_index.tensor.*);
+                        std.debug.print("Error at line {}, column {}: Embedding index must be 1D tensor, got {}D\n", .{ pos.line, pos.column, index_tensor.rank() });
+                        self.printSourceContext(self.getNodeOffset(tensor_index.tensor.*));
+                        return error.InvalidEmbeddingIndex;
+                    }
+                    
+                    // Check that index tensor has integer type
+                    switch (index_tensor.element_type.*) {
+                        .u8, .u16, .u32, .u64, .i8, .i16, .i32, .i64 => {},
+                        else => {
+                            const pos = self.getNodePosition(tensor_index.tensor.*);
+                            std.debug.print("Error at line {}, column {}: Embedding index must have integer element type, got {}\n", .{ pos.line, pos.column, index_tensor.element_type.* });
+                            self.printSourceContext(self.getNodeOffset(tensor_index.tensor.*));
+                            return error.InvalidEmbeddingIndex;
+                        }
+                    }
+                    
+                    // The base tensor must be at least 2D
+                    if (tensor_type.tensor.rank() < 2) {
+                        const pos = self.getNodePosition(tensor_index.tensor.*);
+                        std.debug.print("Error at line {}, column {}: Embedding tensor must be at least 2D, got {}D\n", .{ pos.line, pos.column, tensor_type.tensor.rank() });
+                        self.printSourceContext(self.getNodeOffset(tensor_index.tensor.*));
+                        return error.InvalidEmbeddingTensor;
+                    }
+                    
+                    // Result type: [index_size, ...rest of base dimensions]
+                    const index_size = index_tensor.shape[0];
+                    var result_shape = try self.allocator.alloc(u32, tensor_type.tensor.rank());
+                    result_shape[0] = index_size;
+                    for (tensor_type.tensor.shape[1..], 1..) |dim, i| {
+                        result_shape[i] = dim;
+                    }
+                    
+                    const element_type_copy = try self.allocator.create(parser.Type);
+                    element_type_copy.* = tensor_type.tensor.element_type.*;
+                    
+                    const result = parser.Type{
+                        .tensor = parser.Type.TensorType{
+                            .shape = result_shape,
+                            .element_type = element_type_copy,
+                        },
+                    };
+                    
+                    // Track the allocated type for cleanup
+                    try self.allocated_types.append(result);
+                    
+                    return result;
+                }
+            }
+        }
+
+        // Regular implicit tensor indexing
         // Check for scope conflicts
         for (tensor_index.implicit_indices) |index_name| {
             if (self.verbose) {

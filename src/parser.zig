@@ -1249,6 +1249,8 @@ pub const Parser = struct {
 
         var has_implicit = false;
         var has_numeric = false;
+        var single_identifier: ?[]const u8 = null;
+        var single_identifier_offset: usize = 0;
 
         // Parse indices (can be numbers or identifiers)
         while (true) {
@@ -1274,7 +1276,7 @@ pub const Parser = struct {
                     },
                 });
             } else if (self.check(.identifier)) {
-                // Implicit index (identifier)
+                // Could be implicit index or embedding index
                 has_implicit = true;
                 if (has_numeric) {
                     self.reportError(self.peek().offset, "Cannot mix numeric and implicit indices");
@@ -1283,6 +1285,13 @@ pub const Parser = struct {
 
                 const index_token = try self.consume(.identifier, "Expected index");
                 const index_name = self.source[index_token.offset .. index_token.offset + index_token.getLength()];
+                
+                // Track if this is the first and only identifier
+                if (implicit_indices.items.len == 0 and !self.check(.comma)) {
+                    single_identifier = index_name;
+                    single_identifier_offset = index_token.offset;
+                }
+                
                 try implicit_indices.append(try self.allocator.dupe(u8, index_name));
             } else {
                 self.reportError(self.peek().offset, "Expected number or identifier for index");
@@ -1291,6 +1300,7 @@ pub const Parser = struct {
 
             if (self.check(.comma)) {
                 _ = self.advance(); // consume comma
+                single_identifier = null; // Multiple indices, not embedding
             } else {
                 break;
             }
@@ -1299,6 +1309,10 @@ pub const Parser = struct {
         _ = try self.consume(.right_bracket, "Expected ']'");
 
         if (has_implicit) {
+            // Check if this is a single identifier that could be an embedding operation
+            // For now, we'll treat all single identifiers as implicit indices
+            // The typechecker will determine if it's actually an embedding operation
+            
             // Create implicit tensor index with multiple indices
             const tensor_ptr = try self.allocator.create(ASTNode);
             tensor_ptr.* = base;

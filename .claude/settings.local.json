@@ -45,7 +45,17 @@
       "Bash(lldb:*)",
       "Bash(./verify_exit_code)",
       "Bash(./test_write_tensor)",
-      "Bash(od:*)"
+      "Bash(od:*)",
+      "Bash(./test_embedding)",
+      "Bash(./test_embedding_simple)",
+      "Bash(./debug_embedding)",
+      "Bash(./debug_embedding2)",
+      "Bash(./test_embedding_debug)",
+      "Bash(./test_emb_manual)",
+      "Bash(./llama_minimal)",
+      "Bash(./tensor_ops_possible)",
+      "Bash(./test_existing_partial_reduce:*)",
+      "Bash(./test_simple_assign)"
     ],
     "deny": []
   }
